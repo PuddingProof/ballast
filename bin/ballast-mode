@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Stable, cross-OS entry point for the statusline session-mode registry
+# (statusline/mode-state.py).
+#
+# This file lives in plugins/ballast/bin/, which Claude Code puts on PATH
+# for any Bash tool call while the ballast plugin is enabled. That makes
+# "ballast-mode" a bare, machine-independent literal -- both the freehand
+# and plan-handoff hooks' injected instructions and the ballast-allow.py
+# self-allow hook key off this exact name, so it must never be invoked
+# through a wrapper, alias, or path prefix (mirrors bin/ballast-extract's
+# same rule -- see its header and session-postmortem's SKILL.md).
+#
+# Extensionless + a bash shebang: Claude Code's plugin bin/ mechanism invokes
+# files here directly (no .sh/.py extension), and Git Bash (a Claude Code
+# prerequisite on Windows) resolves #!/usr/bin/env bash on every OS we target.
+
+set -euo pipefail
+
+# Resolve our own directory even if invoked via a relative path or symlink,
+# so the mode-state.py reference below is robust regardless of caller cwd.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Interpreter resolution: never assume `python` vs `python3` exists, and never trust a name on
+# PATH to be a real interpreter. Probe candidates in order and verify each ACTUALLY runs.
+#
+# "py -3" is a two-word candidate (the Windows py launcher with a version flag) -- kept as an array
+# element (not a single string) so it splits into ["py", "-3"] without eval or word-splitting hacks.
+#
+# The specific hazard: `.../AppData/Local/Microsoft/WindowsApps/python3` is a Windows
+# App-Execution-Alias. Executed non-interactively it does NOT exit non-zero -- it HANGS
+# INDEFINITELY, because the App Installer redirector blocks on a Microsoft Store UI that a headless
+# shell can never satisfy. A hang is strictly worse than a failure: it wedges the caller forever
+# instead of falling through, and it makes the "no interpreter found" path below unreachable.
+#
+# Two COMPLEMENTARY defenses -- neither is sufficient alone:
+#   1. TIMEOUT -- bounds every probe execution, so any hanging candidate loses the race instead of
+#      wedging us. `timeout` is coreutils: present in Git Bash and on Linux, absent on stock macOS
+#      or a stripped image. Where it is absent, defense 2 is what keeps the alias from ever being
+#      executed -- which is why these are complementary, not redundant.
+#   2. TWO-PASS path RESOLUTION -- pass 1 resolves each candidate to the first PATH hit that is NOT
+#      an alias and probes that absolute path; pass 2 retries by bare name only if nothing real
+#      resolved, so a genuine Store-installed Python still works. Resolving rather than skipping is
+#      the point: the common Windows PATH layout puts the alias AHEAD of a real install, so
+#      skipping the whole candidate on that signal would step over a working interpreter sitting
+#      directly behind the stub.
+if command -v timeout >/dev/null 2>&1; then PROBE=(timeout 5); else PROBE=(); fi
+
+PY=()
+for pass in skip-stubs allow-stubs; do
+  for candidate in "python3" "python" "py -3"; do
+    # Split the candidate on whitespace into an array via read (no eval).
+    read -r -a cand_parts <<<"$candidate"
+    if [ "$pass" = "skip-stubs" ]; then
+      # `type -aP` lists EVERY PATH hit, not just the first -- that's what lets us reach a real
+      # install shadowed by an alias. -i because Windows paths are case-insensitive and PATH
+      # echoes them as spelled.
+      real="$(type -aP "${cand_parts[0]}" 2>/dev/null | grep -iv windowsapps | head -1 || true)"
+      [ -z "$real" ] && continue
+      cand_parts[0]="$real"
+    fi
+    # ${PROBE[@]+...} so an empty PROBE array expands to nothing under `set -u`.
+    if ${PROBE[@]+"${PROBE[@]}"} "${cand_parts[@]}" -c 'import sys' >/dev/null 2>&1; then
+      PY=("${cand_parts[@]}")
+      break 2
+    fi
+  done
+done
+
+if [ "${#PY[@]}" -eq 0 ]; then
+  echo "ballast-mode: no working Python 3 found (tried python3, python, py -3)" >&2
+  exit 1
+fi
+
+# exec (not a subshell call) so this wrapper doesn't linger as an extra
+# process layer, and so mode-state.py's exit code / signals propagate untouched.
+exec "${PY[@]}" "$DIR/../statusline/mode-state.py" "$@"

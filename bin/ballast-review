@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Headless sidecar trampoline for native /code-review — restores autonomous review-before-commit
+# now that Claude Code 2.1.215 flipped /code-review (and /verify) to disable-model-invocation:true
+# (the model can no longer launch it as a Skill; only a user-typed slash command works). Rather than
+# forking the native reviewer (explicit user decision: no fork — Anthropic keeps improving it), this
+# shim shells out to a FRESH headless `claude -p` session and hands it the real slash command, so the
+# genuine native engine still runs, just via a sibling process instead of an in-session Skill call.
+#
+# This file lives in plugins/ballast/bin/, which Claude Code puts on PATH for any Bash tool call
+# while the ballast plugin is enabled. That makes "ballast-review" a bare, machine-independent
+# literal -- both the git-commit-guard nudge and the ballast-allow.py self-allow hook key off this
+# exact name, so it must never be invoked through a wrapper, alias, or path prefix (mirrors
+# bin/ballast-extract's / bin/ballast-mode's same rule -- see their headers).
+#
+# BLAST RADIUS (read before trusting the self-allow hook to auto-approve this): unlike
+# ballast-extract (read-only) or ballast-mode (bounded validated writes under
+# ~/.claude/ballast/modes/), this command spawns a full headless `claude` session on the user's own
+# account/credentials -- a real agent loop with network access and its own tool permissions. Two
+# things keep that bounded: (1) the prompt sent is always exactly `/code-review <shim args>` --
+# native `/code-review` is a REVIEW skill, it inspects the working tree and reports findings, it does
+# not itself take destructive action; (2) this shim refuses to forward `--fix` (see below), and the
+# headless session's own permission prompts (which cannot be answered non-interactively) act as a
+# backstop against any edit the review body might otherwise attempt. Read-only in intent AND in
+# practice.
+#
+# NO python-probe block here (contrast bin/ballast-mode): this shim execs the `claude` CLI directly,
+# it never invokes a bundled .py, so there is no interpreter to resolve.
+set -euo pipefail
+
+usage() {
+  echo "usage: ballast-review [--model <m>] [--effort <e>] <level> [target] [context words...]" >&2
+  echo "  --model/--effort: optional, forwarded to the claude CLI itself -- the sidecar SESSION's model and" >&2
+  echo "           reasoning effort (cost-scaling). Distinct from <level>, which is /code-review's own input" >&2
+  echo "           selecting the review job path and fanout size; the two are independent dials." >&2
+  echo "  level:   low|medium|high|xhigh|max (native /code-review handles unrecognized levels itself -- not validated here)" >&2
+  echo "  target:  optional PR number, branch name, file path, or commit range (e.g. abc123..HEAD)" >&2
+  echo "  context: free-form words appended so the fresh sidecar session knows what changed and why" >&2
+  echo "  everything after the flags is forwarded verbatim as native /code-review's own args" >&2
+  exit 1
+}
+
+# Optional LEADING pass-through flags: --model <m> / --effort <e> ride ahead of the level and go to
+# the `claude` CLI itself, NOT into the /code-review prompt -- so a caller can cost-scale a sidecar
+# (e.g. --model opus --effort medium during a usage crunch) instead of inheriting the account's
+# default session model. Only these two are recognized, and only before the first non-flag token;
+# anything else starts the /code-review args. A recognized flag with no value is a usage error, not
+# a silent drop. (A hostile value like `--model --fix` merely becomes a bogus model name the claude
+# CLI rejects -- it never reaches the prompt, so it cannot re-enable fixes.)
+claude_flags=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --model|--effort)
+      if [ "$#" -lt 2 ]; then
+        echo "ballast-review: $1 requires a value" >&2
+        exit 1
+      fi
+      claude_flags+=("$1" "$2")
+      shift 2
+      ;;
+    *) break ;;
+  esac
+done
+
+# No /code-review args at all (bare invocation, or flags only) -- nothing to review, nothing to
+# forward. Print usage and bail rather than let it silently launch a contextless review.
+[ "$#" -eq 0 ] && usage
+
+# Read-only invariant: the sidecar never applies fixes -- the PARENT session adjudicates findings
+# and edits the tree itself (avoids two sessions racing edits on one working copy, and keeps
+# judgement calls in the top-tier main thread rather than a fresh zero-context sidecar). Reject
+# `--fix` anywhere in the forwarded args rather than only as $1, since native /code-review accepts
+# it positioned after the level/target too.
+for arg in "$@"; do
+  if [ "$arg" = "--fix" ]; then
+    echo "ballast-review: sidecar reviews are read-only; the parent session applies fixes" >&2
+    exit 1
+  fi
+done
+
+# Fail fast with a friendly message rather than an exec failure once we're past argument validation.
+if ! command -v claude >/dev/null 2>&1; then
+  echo "ballast-review: 'claude' CLI not found on PATH -- cannot launch the sidecar review session" >&2
+  exit 1
+fi
+
+# Git Bash (a Claude Code prerequisite on Windows) rewrites any argument that LOOKS like a POSIX
+# path before the child process ever sees it -- so a leading "/code-review" gets silently mangled
+# into something like "C:/Program Files/Git/code-review" and the headless session receives garbage
+# instead of the native slash command (live-confirmed: the sidecar improvised a freehand review
+# from the mangled prompt instead of running the real skill).
+#
+# Suppress that with MSYS2_ARG_CONV_EXCL, NOT MSYS_NO_PATHCONV. Both are inherited by the whole
+# sidecar process tree, but NO_PATHCONV disables conversion GLOBALLY down there -- which bricked
+# the sidecar outright (live-confirmed: run.sh hands its python hook an MSYS-form /c/Users/...
+# path and relies on conversion; unconverted it became C:\c\Users\..., every hook errored, and
+# PreToolUse errors fail CLOSED, blocking all the sidecar's shell tools). ARG_CONV_EXCL is scoped
+# by CONTENT instead: only arguments starting with "/code-review" skip conversion, so inheriting
+# it is harmless -- no hook or reviewer command ever passes an argument with that prefix.
+export MSYS2_ARG_CONV_EXCL="/code-review"
+
+# Marks every hook process the headless sidecar spawns as running INSIDE a sidecar review. Without
+# this, the sidecar's own git-commit-guard hook fires its "run a review pass first" nudge on the
+# sidecar's OWN git diff/git log calls -- recursion-shaped (a review session told to launch a review
+# of itself) and observed firing 6x per sidecar in this session's smoke tests. git-commit-guard.sh
+# checks this var and exits silently when set; the principles/fanout injections still fire in the
+# sidecar (those are beneficial there, only the commit nudge is suppressed).
+export BALLAST_SIDECAR_REVIEW=1
+
+# Assemble the exact argv once, shared by the test seam and the real exec, so the seam can never
+# drift from what production actually runs. The ${arr[@]+...} expansion guard keeps `set -u` happy
+# on an empty flags array under old bash (macOS ships 3.2 -- cross-platform rule, root CLAUDE.md).
+argv=(claude ${claude_flags[@]+"${claude_flags[@]}"} -p "/code-review $*")
+
+# Test seam (hooks/CLAUDE.md convention, mirrors other hooks' *_FAKE / *_ECHO env seams): production
+# never sets this. Lets hooks/test_ballast_review.sh assert the exact command this shim would run
+# WITHOUT actually spawning a real headless claude session (slow, costs tokens, needs a live
+# account) on every test run. Space-joined for assertion simplicity; the prompt is a single argv
+# element in the real exec below.
+if [ "${BALLAST_REVIEW_ECHO:-}" = "1" ]; then
+  echo "${argv[*]}"
+  exit 0
+fi
+
+# exec (not a subshell call) so this wrapper doesn't linger as an extra process layer once the
+# headless session takes over, and so its exit code / signals propagate untouched.
+exec "${argv[@]}"

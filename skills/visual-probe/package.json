@@ -1,0 +1,13 @@
+{
+  "name": "visual-probe",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Bespoke on-demand visual-verification harness for Claude Code: pinned Playwright LIBRARY (no MCP server, no daemon). Drives system Edge headless across a fidelity matrix, captures native-resolution frames + nearest-neighbor crops, asserts on a page-state seam, then tears down.",
+  "bin": {
+    "visual-probe": "scripts/probe.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.61.1"
+  }
+}

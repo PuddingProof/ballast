@@ -1,0 +1,14 @@
+{
+  "name": "ballast",
+  "description": "Ballast — a verification-first agentic harness for Claude Code, packaged as one installable plugin (skills, agents, hooks, guards).",
+  "owner": {
+    "name": "PuddingProof"
+  },
+  "plugins": [
+    {
+      "name": "ballast",
+      "source": "./",
+      "description": "Verification-first agentic harness: docs discipline, session postmortems, plan-execution handoff, adversarial audits, secure-by-default guards."
+    }
+  ]
+}

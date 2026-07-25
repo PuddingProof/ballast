@@ -1,0 +1,14 @@
+# ballast is consumed on Windows, macOS, and Linux via git clone (plugin install).
+# Force LF everywhere: a shell script checked out with CRLF breaks POSIX shells
+# ("/usr/bin/env bash\r: not found"), and Git Bash on Windows, python, and node
+# all read LF fine — so LF is the only safe line ending for this repo.
+* text=auto eol=lf
+
+# Extensionless executables (bin/ wrappers) are bash scripts — force them too,
+# since text=auto's content sniffing is not guaranteed to classify them.
+bin/* text eol=lf
+
+# Binary assets (none yet; pattern kept so a future image can't be mangled).
+*.png binary
+*.jpg binary
+*.ico binary
