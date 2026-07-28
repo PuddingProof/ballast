@@ -14,11 +14,19 @@
 #
 # SID RESOLUTION, TWO-TIER: extract `.session_id` from the payload via $BALLAST_PYTHON first (same
 # extraction pattern as plan-handoff.sh / freehand-mode.sh: python -c, rc=1 on ANY parse failure).
-# If that fails (no python, bad JSON, missing field), fall back to the `CLAUDE_SESSION_ID` env var
-# — documented as set in every hook process (code.claude.com/docs/en/hooks -- Environment
-# Variables), so this hook degrades gracefully to a zero-dependency path instead of doing nothing
-# just because python was unavailable. Neither resolving is a legitimate outcome too (payload
-# unparseable AND env unset) -- silent no-op, not an error.
+# If that fails (no python, bad JSON, missing field), fall back to the `CLAUDE_CODE_SESSION_ID`
+# env var — the name the harness actually sets in hook processes — so this hook degrades gracefully
+# to a zero-dependency path instead of doing nothing just because python was unavailable. Neither
+# resolving is a legitimate outcome too (payload unparseable AND env unset) -- silent no-op, not an
+# error.
+# ENV NAME, corrected 2026-07-25: this read `CLAUDE_SESSION_ID`, which the harness has NEVER set in
+# a hook process (verified against the v2.1.220 binary's hook-child env builder and a live env dump
+# from a hook). Because this is the FALLBACK behind the payload extraction, the bug was invisible
+# on the happy path but silently no-op'd SessionEnd cleanup whenever the payload path was
+# unavailable — stranding the statusline mode chip until the renderer's TTL aged it out. The nested
+# `:-` keeps the legacy name as a harmless fallback if a future harness sets it. NOT related to the
+# `${CLAUDE_SESSION_ID}` substitution used in skill/agent bodies: that is a load-time plugin-loader
+# mechanism (docs/frontmatter.md), correct as-is, and never reaches a hook's environment.
 #
 # NO STDOUT, EVER: every other conditional-fire hook in this repo emits a systemMessage so a fire
 # is never silent (see hooks/CLAUDE.md's "every conditional fire is user-visible" rule) -- this
@@ -62,8 +70,8 @@ py_rc=$?
 
 if [ "$py_rc" -ne 0 ] || [ -z "$sid" ]; then
   # Python unavailable, payload unparseable, or session_id absent from the payload -- fall back to
-  # the CLAUDE_SESSION_ID env var (set in every hook process; see SID RESOLUTION above).
-  sid="${CLAUDE_SESSION_ID:-}"
+  # the CLAUDE_CODE_SESSION_ID env var (see SID RESOLUTION above for why the legacy name was wrong).
+  sid="${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}"
 fi
 
 if [ -n "$sid" ]; then

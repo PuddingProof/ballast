@@ -76,9 +76,11 @@ everything: plugin skills
 fingerprint of the session.
 
 **Subagent roster lines carry inline attribution** — append `— <model> · <tokens> tok · <calls> calls`
-(source: the bundle's `subagents.md`, the per-agent sidecar roster: agentType · model tier · token
-volume · tool calls). Close the roster with one **main-vs-subagent token-split line** (the fanout
-spend §7 breaks out as its subagent-aggregate line — the two reconcile, same transcript-native
+(source: the bundle's `subagents.md`, the per-agent sidecar roster: agentType · dispatch label ·
+model tier · token volume · tool calls, nested dispatches marked). The dispatch label is what
+disambiguates same-agentType rows (e.g. N× plan-executor) — fold it into the roster line's `<purpose>`
+slot rather than dropping it. Close the roster with one **main-vs-subagent token-split line** (the
+fanout spend §7 breaks out as its subagent-aggregate line — the two reconcile, same transcript-native
 source). Collapses to no attribution / no split line when no subagents ran (`subagents.md` says so).
 
 Then a **ballast-tooling** sub-block: the full ballast roster the session touched — skills, agents,

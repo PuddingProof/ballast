@@ -157,22 +157,41 @@ else
   fail "6 cleanup: payload session_id" "rc=$rc out=[$out] file_exists=$([ -f "$home/ballast/modes/$SID" ] && echo yes || echo no)"
 fi
 
-# --- 7: payload without sid + CLAUDE_SESSION_ID env set -> env fallback used --------------------
+# --- 7: payload without sid + CLAUDE_CODE_SESSION_ID env set -> env fallback used ---------------
+# ENV NAME (corrected 2026-07-25): this exported CLAUDE_SESSION_ID, which the harness never sets in
+# a hook process -- so it green-lit a fallback that could not fire in production, leaving SessionEnd
+# cleanup silently no-op whenever the payload path was unavailable (stranding the statusline mode
+# chip until TTL). Check 7b pins the precedence so a revert cannot pass silently.
 home="$(newtmp)"
 mkdir -p "$home/ballast/modes"
 printf 'exec confirmed 1700000000\n' > "$home/ballast/modes/$SID"
-out="$(printf '%s' '{}' | BALLAST_CLAUDE_HOME="$home" CLAUDE_SESSION_ID="$SID" bash "$CLEANUP_HOOK")"; rc=$?
+out="$(printf '%s' '{}' | BALLAST_CLAUDE_HOME="$home" CLAUDE_CODE_SESSION_ID="$SID" bash "$CLEANUP_HOOK")"; rc=$?
 if [ "$rc" = 0 ] && [ -z "$out" ] && [ ! -f "$home/ballast/modes/$SID" ]; then
-  pass "7 cleanup: env CLAUDE_SESSION_ID fallback used"
+  pass "7 cleanup: env CLAUDE_CODE_SESSION_ID fallback used"
 else
   fail "7 cleanup: env fallback" "rc=$rc out=[$out] file_exists=$([ -f "$home/ballast/modes/$SID" ] && echo yes || echo no)"
+fi
+
+# --- 7b: PRECEDENCE -- CLAUDE_CODE_SESSION_ID wins over the legacy CLAUDE_SESSION_ID -------------
+# Both names exported, pointing at DIFFERENT session files: only the CLAUDE_CODE_SESSION_ID one may
+# be deleted. A revert to reading the legacy name flips this to FAIL instead of passing quietly.
+home="$(newtmp)"
+mkdir -p "$home/ballast/modes"
+LEGACY_SID="legacy-0000-1111-2222-333344445555"
+printf 'exec confirmed 1700000000\n' > "$home/ballast/modes/$SID"
+printf 'exec confirmed 1700000000\n' > "$home/ballast/modes/$LEGACY_SID"
+out="$(printf '%s' '{}' | BALLAST_CLAUDE_HOME="$home" CLAUDE_CODE_SESSION_ID="$SID" CLAUDE_SESSION_ID="$LEGACY_SID" bash "$CLEANUP_HOOK")"; rc=$?
+if [ "$rc" = 0 ] && [ ! -f "$home/ballast/modes/$SID" ] && [ -f "$home/ballast/modes/$LEGACY_SID" ]; then
+  pass "7b cleanup: CLAUDE_CODE_SESSION_ID takes precedence over legacy name"
+else
+  fail "7b cleanup: precedence" "rc=$rc code_file=$([ -f "$home/ballast/modes/$SID" ] && echo present || echo deleted) legacy_file=$([ -f "$home/ballast/modes/$LEGACY_SID" ] && echo present || echo deleted)"
 fi
 
 # --- 8: neither payload sid nor env sid -> silent no-op, exit 0 ---------------------------------
 home="$(newtmp)"
 mkdir -p "$home/ballast/modes"
 printf 'exec confirmed 1700000000\n' > "$home/ballast/modes/$SID"
-out="$(printf '%s' '{}' | BALLAST_CLAUDE_HOME="$home" env -u CLAUDE_SESSION_ID bash "$CLEANUP_HOOK")"; rc=$?
+out="$(printf '%s' '{}' | BALLAST_CLAUDE_HOME="$home" env -u CLAUDE_SESSION_ID -u CLAUDE_CODE_SESSION_ID bash "$CLEANUP_HOOK")"; rc=$?
 if [ "$rc" = 0 ] && [ -z "$out" ] && [ -f "$home/ballast/modes/$SID" ]; then
   pass "8 cleanup: no sid anywhere -> silent no-op, exit 0, file untouched"
 else

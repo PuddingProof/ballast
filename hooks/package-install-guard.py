@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """
-PreToolUse guard (Bash|PowerShell): force an "ask" prompt on ANY package
-install or remote-execute verb found ANYWHERE in the command string.
+PreToolUse guard (Bash|PowerShell): gate ANY package install or remote-execute
+verb found ANYWHERE in the command string — "ask" in the main session, hard
+"deny" in a sub-agent.
 
 It closes two gaps the prefix-based permission matchers in settings.json miss:
 
@@ -14,13 +15,28 @@ It closes two gaps the prefix-based permission matchers in settings.json miss:
      start with `npm install`, so `Bash(npm install:*)` never matches it and it
      runs ungated. Scanning the whole command (not just the prefix) catches it.
 
-Behaviour:
-  - install verb anywhere  -> permissionDecision "ask" + a reason that nudges
-    --ignore-scripts for unfamiliar/brand-new packages (pre/post-install scripts
-    were wave-1's delivery vector).
-  - remote-execute verb     -> "ask" (typo-squat warning), UNLESS it's one of a
-    few known local dev tools the user runs constantly (allowlist below).
-  - anything else           -> silent pass-through (exit 0, no output).
+Behaviour, by CALLER (the install contract is an orchestrator responsibility —
+a leaf the user isn't watching must never be able to raise a prompt at them):
+  - MAIN SESSION, install verb    -> permissionDecision "ask" + a reason that
+    nudges --ignore-scripts for unfamiliar/brand-new packages (pre/post-install
+    scripts were wave-1's delivery vector).
+  - MAIN SESSION, remote-execute  -> "ask" (typo-squat warning), UNLESS it's one
+    of a few known local dev tools the user runs constantly (allowlist below).
+  - SUB-AGENT, either verb        -> "deny", with a reason that tells the leaf
+    what to do instead (report the missing tool as a scope note / blocked
+    verdict and finish with what exists). The allowlist still passes.
+  - anything else                 -> silent pass-through (exit 0, no output).
+
+Why deny and not ask for a leaf (the escalation is EARNED, per the enforcement-
+posture rule — a soft version was empirically defeated): the prompt a leaf
+raises arrives with no context the user can adjudicate from, and a leaf that
+can't resolve its own tooling keeps re-trying. Watched 2026-07-25: a
+visual-reviewer leaf spent an hour+ re-triggering the ask gate trying to stand
+up a dev server, burning tokens on every loop. Denying returns a fast, legible
+"you don't install — report the gap" instead of a stall. The prohibition is
+already stated in prose (global CLAUDE.md, the fanout injection, each agent
+body); this is its mechanism-level backstop, because prose alone was defeated
+twice.
 
 Design notes:
   - Verbs are matched on text with heredoc bodies AND quoted strings / $()
@@ -39,6 +55,15 @@ Design notes:
     try/except and can never itself change the exit code.
   - Treat this allowlist as pruneable: it only suppresses the prompt for these
     exact local dev-tool runs; every real install still asks.
+  - CALLER DISCRIMINATION is payload-only. There is no env-var discriminator on
+    the hook path, and `transcript_path` is always the PARENT session's, so the
+    only signals are the two payload fields verified against the binary
+    (v2.1.220): `agent_type` (the subagent_type string) and `agent_id` (absent
+    on the main loop, present on ANY nested agent at any depth). See
+    is_subagent() for the exact predicate and its caveats. Both are
+    harness-version-volatile by nature: if upstream renames them the predicate
+    goes False and this degrades to the pre-existing ask gate -- fail-open by
+    construction, and the prose prohibition remains the backstop.
 """
 
 import sys
@@ -121,36 +146,94 @@ ALLOW = re.compile(
 )
 
 
-def emit_ask(reason: str) -> None:
-    """Print the PreToolUse decision JSON that forces a permission prompt."""
+def is_subagent() -> bool:
+    """True when this Bash call originates anywhere other than the main loop.
+
+    Two payload fields carry the origin (binary-verified, CC v2.1.220):
+      - `agent_type` — the subagent_type string of a dispatched agent.
+      - `agent_id`   — ABSENT on the main loop, present on any nested agent,
+                       at any depth (a 3rd-layer leaf looks like a 1st).
+
+    Either one alone is enough here. The caveat matrix: both present = a real
+    Task sub-agent; agent_type only = a main-thread agent persona; agent_id
+    only = a forked query. All three are non-main-loop contexts the user isn't
+    watching, which is exactly the set that must not raise an install prompt --
+    so the predicate is deliberately the OR, not the AND.
+
+    Any parse surprise (a non-string field, a mangled payload) resolves False,
+    which degrades to the historical ask gate rather than denying the main
+    session -- fail-open in the direction that can't brick a session.
+    """
+    try:
+        return bool(
+            str(payload.get("agent_type") or "").strip()
+            or str(payload.get("agent_id") or "").strip()
+        )
+    except Exception:
+        return False
+
+
+def emit(decision: str, reason: str) -> None:
+    """Print the PreToolUse decision JSON ("ask" prompts the user; "deny" blocks).
+
+    `permissionDecision` must sit INSIDE hookSpecificOutput (a top-level copy is
+    inert), and on a deny the reason is delivered verbatim to the calling model
+    -- so it's written as an instruction to the leaf, not a note to the user.
+    """
+    banner = (
+        "⛔ ballast: package-install-guard — sub-agent install/exec denied (orchestrator-only)"
+        if decision == "deny"
+        else "📦 ballast: package-install-guard — install authorization contract engaged"
+    )
     print(json.dumps({
-        "systemMessage": "📦 ballast: package-install-guard — install authorization contract engaged",
+        "systemMessage": banner,
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "permissionDecision": "ask",
+            "permissionDecision": decision,
             "permissionDecisionReason": reason,
         }
     }))
 
 
+# The leaf-facing half of every deny reason: what to do INSTEAD. Without a stated
+# escape hatch a blocked leaf improvises one (retry with a different manager, a
+# different flag) and spins -- the exact loop this guard exists to end.
+LEAF_ESCAPE = (
+    "Sub-agents never install packages or fetch tooling — that is the main-session "
+    "orchestrator's call, made once, with the user. Do NOT retry, reword, or route "
+    "around this (a different package manager, --yes, a download+run) — every form is "
+    "denied. Instead: finish with the tooling that already exists, and report the "
+    "missing tool as a named coverage gap or a blocked verdict so the orchestrator "
+    "can install it and re-dispatch you."
+)
+
 inst = INSTALL.search(s)
 exe = EXEC.search(s)
+leaf = is_subagent()
 
 if inst:
     tok = inst.group(0).strip()
-    emit_ask(
-        f"Package install detected ('{tok}'). Verify the package name and source "
-        "before approving. For an unfamiliar or brand-new package, consider adding "
-        "--ignore-scripts (blocks pre/post-install scripts, the wave-1 vector) or "
-        "waiting a few days for it to be vetted."
-    )
+    if leaf:
+        emit("deny", f"Package install ('{tok}') blocked: this is a sub-agent. {LEAF_ESCAPE}")
+    else:
+        emit("ask",
+             f"Package install detected ('{tok}'). Verify the package name and source "
+             "before approving. For an unfamiliar or brand-new package, consider adding "
+             "--ignore-scripts (blocks pre/post-install scripts, the wave-1 vector) or "
+             "waiting a few days for it to be vetted.")
 elif exe and not ALLOW.search(s):
     tok = exe.group(0).strip()
-    emit_ask(
-        f"Remote package execution detected ('{tok}'). npx/dlx/bunx downloads and "
-        "RUNS registry code that no install gate sees. Confirm the package name is "
-        "exact (typo-squat risk) before approving."
-    )
+    if leaf:
+        # npx/dlx/bunx downloads BEFORE it answers, so even `<tool> --version` is
+        # remote code execution, not a probe -- denied for a leaf like any install.
+        emit("deny",
+             f"Remote package execution ('{tok}') blocked: this is a sub-agent. npx/dlx/bunx "
+             f"downloads and RUNS registry code, so even a --version probe is a fetch. {LEAF_ESCAPE}")
+    else:
+        emit("ask",
+             f"Remote package execution detected ('{tok}'). npx/dlx/bunx downloads and "
+             "RUNS registry code that no install gate sees. Confirm the package name is "
+             "exact (typo-squat risk) before approving.")
 
 # else: silent pass-through
 sys.exit(0)

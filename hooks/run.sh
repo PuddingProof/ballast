@@ -68,6 +68,24 @@ esac
 
 target="$DIR/$file"
 
+# Ballast's per-user state directory, resolved ONCE for every consumer in this script (the
+# interpreter cache immediately below, and the fire ledger further down). Factored into one helper
+# so the two can never drift on WHERE state lives: BALLAST_CLAUDE_HOME (hermetic-test override,
+# mirroring commit-review-gate.py) -> $HOME/.claude (production) -> empty (HOME unset: every caller
+# treats an empty value as "no state dir" and skips silently -- under `set -u` a bare $HOME
+# reference would ABORT this script and eat the dispatched child's exit code, e.g. converting an
+# exit-2 hard block into a dead guard).
+# NEVER the plugin dir: it is replaced wholesale on plugin update (standing repo rule).
+# Sets a global rather than printing, deliberately: a `$(...)` capture would fork a subshell on
+# EVERY hook fire, and cutting per-fire forks is the entire point of the caching work below.
+BALLAST_HOME_DIR=""
+resolve_ballast_home() {
+  BALLAST_HOME_DIR="${BALLAST_CLAUDE_HOME:-}"
+  [ -z "$BALLAST_HOME_DIR" ] && BALLAST_HOME_DIR="${HOME:+$HOME/.claude}"
+  return 0   # the [ -z ] test above is the last command; without this a set home would "fail"
+}
+resolve_ballast_home
+
 # Does this hook need a Python interpreter? Every .py hook does (it IS Python), and six .sh hooks
 # shell out to Python internally: git-commit-guard.sh (JSON-emit step), ballast-principles.sh
 # (JSON escaping of the injected text), freehand-mode.sh (.prompt extraction for the
@@ -92,6 +110,58 @@ case "$file" in *.py) needs_python=1 ;; esac
 case "$name" in git-commit-guard|ballast-principles|freehand-mode|harness-sweep-nudge|plan-handoff|mode-state-cleanup) needs_python=1 ;; esac
 
 if [ "$needs_python" -eq 1 ]; then
+  # ===== THREE-TIER INTERPRETER RESOLUTION (fast paths in front of the cold probe) ==============
+  # WHY: the cold probe below is expensive -- up to three candidate EXECUTIONS, each a process
+  # start, plus `type -aP`/`grep`/`head` forks per candidate. Measured at ~1.5s of a 2.4s hook fire
+  # under load, and re-derived IDENTICALLY four times per Bash tool call (four hooks share the
+  # `Bash|PowerShell` matcher). That per-fire waste is what turns a normal multi-session load spike
+  # into 5s hook timeouts, so the fix is to stop re-deriving a constant -- not to chase a slow hook.
+  # Tiers, cheapest first: (1) an interpreter already exported into this process tree, (2) the
+  # on-disk cache written by a previous cold probe, (3) the cold probe itself (unchanged).
+  #
+  # VALIDITY TEST IS `[ -x ]` ONLY -- no TTL, no `stat`, no `date`. Three reasons, all load-bearing:
+  #   - `[ -x ]` is a shell BUILTIN: zero forks. A mtime/TTL check would cost the very fork this
+  #     change exists to eliminate, and would buy nothing the points below don't already cover.
+  #   - The cache can only ever hold a probe-VERIFIED interpreter (tier 3 writes it after the
+  #     `-c "import sys"` execution succeeds), so a Windows Store alias-stub can never be cached.
+  #   - A moved or uninstalled interpreter SELF-HEALS: it fails `[ -x ]`, falls through to the cold
+  #     probe, and the probe rewrites the file.
+  # ACCEPTED RESIDUAL, by name: an interpreter that still EXISTS at the cached path but has been
+  # BROKEN IN PLACE (a bad in-place upgrade) keeps being served from cache, because `[ -x ]` still
+  # passes. Recovery is deleting <ballast-home>/ballast-python. Judged acceptable against paying a
+  # second of probe cost on every single hook fire -- do not "fix" this with a TTL or a re-probe.
+  #
+  # FAIL OPEN THROUGHOUT: every cache read/write is best-effort and degrades to the cold probe. A
+  # missing, read-only, or unwritable home directory must never abort dispatch.
+  # TRUST BOUNDARY: the cached value is later EXECUTED, so anyone who can write this file chooses
+  # the interpreter every hook runs. That is not a new privilege -- the same ~/.claude tree already
+  # holds settings.json, which can name arbitrary hook commands outright -- so the cache adds no
+  # reach an attacker at that boundary lacks. It does mean the file must stay inside ballast's own
+  # user-home state dir and never move somewhere world-writable.
+  PY=""
+
+  # --- TIER 1: inherited env. A re-entrant fire (a hook that itself triggers hooks, or any parent
+  # that already resolved one) used to re-probe from scratch because this value was ignored. Test
+  # the FIRST WORD only -- BALLAST_PYTHON may carry args ("<path>/py.exe -3").
+  if [ -n "${BALLAST_PYTHON:-}" ] && [ -x "${BALLAST_PYTHON%% *}" ]; then
+    PY="${BALLAST_PYTHON}"
+  fi
+
+  # --- TIER 2: on-disk cache, in ballast's per-user home (never the plugin dir -- replaced on
+  # update). Read with the `read` BUILTIN, not `head`, so the warm path stays fork-free.
+  py_cache=""
+  [ -n "$BALLAST_HOME_DIR" ] && py_cache="$BALLAST_HOME_DIR/ballast-python"
+  if [ -z "$PY" ] && [ -n "$py_cache" ] && [ -f "$py_cache" ]; then
+    cached=""
+    # `|| true`: `read` returns non-zero on a last line with no trailing newline (and on an
+    # unreadable file) -- neither is an error here, the value is validated below regardless.
+    { read -r cached < "$py_cache"; } 2>/dev/null || true
+    if [ -n "$cached" ] && [ -x "${cached%% *}" ]; then PY="$cached"; fi
+  fi
+
+  # --- TIER 3: the cold probe (unchanged behavior). Only reached when neither fast path yielded a
+  # still-executable interpreter; its result is written back to the cache below.
+  if [ -z "$PY" ]; then
   # Resolve a WORKING Python 3, not just a Python-shaped name on PATH. `python3`, `python`, and
   # `py -3` all exist as bare names on some OS/installer combination, but a name existing is not
   # proof it runs -- notably Windows ships a `python3`/`python` App-Execution-Alias that resolves
@@ -109,8 +179,17 @@ if [ "$needs_python" -eq 1 ]; then
   #      real resolved, so a genuine Store-installed Python still works. Resolving rather than
   #      skipping matters: the common Windows PATH layout puts the alias AHEAD of a real install,
   #      so skipping the candidate outright would step over a working interpreter behind it.
-  if command -v timeout >/dev/null 2>&1; then PROBE="timeout 5"; else PROBE=""; fi
-  PY=""
+  #
+  # PROBE BOUND vs HOOK BUDGET: the bound must sit strictly BELOW the hooks.json timeout of the
+  # group this dispatcher runs inside (5s for the Bash|PowerShell hooks). At an EQUAL bound -- what
+  # this was -- a single hanging candidate (the Store alias that hangs on exec, the real 2026-07-20
+  # failure) deterministically consumes the ENTIRE hook budget before the child hook is even
+  # dispatched, so the fail-open path below never gets to run. A real interpreter starts in well
+  # under 700ms even on a saturated box, so 2s keeps ample headroom and leaves the rest of the
+  # budget for the actual hook. Re-check this bound if the hooks.json timeout ever drops.
+  if command -v timeout >/dev/null 2>&1; then PROBE="timeout 2"; else PROBE=""; fi
+  # No `PY=""` reset here: tier 3 is entered only when PY is already empty (see the [ -z "$PY" ]
+  # guard above), and re-clearing it would read as though the tiers above could be clobbered.
   for pass in skip-stubs allow-stubs; do
     for c in python3 python "py -3"; do
       run="$c"
@@ -128,6 +207,33 @@ if [ "$needs_python" -eq 1 ]; then
       if $PROBE $run -c "import sys" >/dev/null 2>&1; then PY="$run"; break 2; fi
     done
   done
+    # Cache the probe result so the NEXT fire takes tier 2 and never pays for this again. ATOMIC:
+    # write a temp file in the SAME directory (same filesystem, so `mv` is a rename, not a copy)
+    # then rename over the target -- a concurrent fire reads either the old value or the new one,
+    # never a half-written line. `$$` scopes the temp name to this process so parallel fires (four
+    # hooks share the Bash|PowerShell matcher) cannot collide on it.
+    # Only a SUCCESSFUL probe is ever written: caching a failure would mean caching an unverified
+    # candidate, and tier 2's `[ -x ]` test cannot tell a Store stub from a real interpreter -- the
+    # probe-verified-only invariant is what makes that cheap test safe.
+    # FAIL OPEN: the whole block is best-effort (`2>/dev/null || true`, exit status discarded) --
+    # an absent, read-only, or unwritable home degrades to "probe every time", never aborts dispatch.
+    # PATH-VALUED RESULTS ONLY. The skip-stubs pass resolves candidates to an absolute path, but the
+    # allow-stubs pass leaves them as BARE names ("python3", "py -3"). Tier 2 validates with
+    # `[ -x ]`, which tests a filesystem path and can never accept a bare name -- so caching one
+    # would produce a file that is rejected on every read, meaning: cold probe every fire AND a
+    # temp-write + rename every fire, strictly worse than not caching at all, on exactly the
+    # Store-Python boxes this probe exists for. Skip the write instead (they keep today's behavior,
+    # minus the pointless I/O). Deliberately NOT solved by letting tier 2 accept bare names via
+    # `command -v`: PATH can change between fires, so a name that probed clean once could later
+    # resolve to the hanging Store alias -- the exact failure the two-pass probe was built to dodge.
+    case "${PY%% *}" in */*) py_cacheable=1 ;; *) py_cacheable=0 ;; esac
+    if [ -n "$PY" ] && [ -n "$py_cache" ] && [ "$py_cacheable" -eq 1 ]; then
+      { [ -d "$BALLAST_HOME_DIR" ] || mkdir -p "$BALLAST_HOME_DIR"
+        py_tmp="$py_cache.$$.tmp"
+        printf '%s\n' "$PY" > "$py_tmp" && mv -f "$py_tmp" "$py_cache" || rm -f "$py_tmp"
+      } 2>/dev/null || true
+    fi
+  fi
   # Export for BOTH dispatch branches. If none resolved, leave BALLAST_PYTHON unset: a .py hook then
   # fails open (exit 0 below), and a .sh hook falls back to its own bare-`python` default -- either
   # way the session is never bricked over a missing interpreter.
@@ -148,11 +254,22 @@ fi
 # greppers of the rc=/out= prefix keep working): proj= (basename of
 # CLAUDE_PROJECT_DIR, stripped via pure parameter expansion -- no fork -- of
 # both / and \ so it resolves correctly on Windows-native paths too) and sid=
-# (CLAUDE_SESSION_ID verbatim -- the full UUID, which IS the transcript
-# filename under ~/.claude/projects/<slug>/). Both env vars are documented as
-# set in hook processes (code.claude.com/docs/en/hooks -- Environment
-# Variables); the `:-` fallbacks keep `set -u` safe and simply log empty
-# fields on older harness versions that don't set them.
+# (the session UUID verbatim, which IS the transcript filename under
+# ~/.claude/projects/<slug>/).
+# SID ENV NAME -- corrected 2026-07-25 after this field logged EMPTY in
+# 5,439/5,439 lines for 15 days: the harness sets CLAUDE_CODE_SESSION_ID in
+# hook processes, NOT CLAUDE_SESSION_ID. Verified two ways: the v2.1.220
+# binary's hook-child env builder sets CLAUDE_CODE_SESSION_ID, and a live env
+# dump from a hook process shows CLAUDE_SESSION_ID absent. Do NOT "restore" the
+# old name -- the `${CLAUDE_SESSION_ID}` seen in skill/agent bodies is a
+# DIFFERENT mechanism (plugin-loader substitution at content-LOAD time, see
+# docs/frontmatter.md), is correct there, and never reaches a hook's env.
+# The nested `:-` default keeps the legacy name as a harmless fallback should a
+# future harness set it, and both `:-` layers keep `set -u` safe -- pure
+# parameter expansion, no fork.
+# CLAUDE_PROJECT_DIR is documented as set in hook processes
+# (code.claude.com/docs/en/hooks -- Environment Variables); its `:-` fallback
+# logs an empty field on older harness versions that don't set it.
 # One-generation size rollover keeps the log bounded: once it exceeds ~5MB
 # (years of fires at observed rates) the current file is moved to
 # ballast-hook-fires.log.old (a single prior generation, not a numbered
@@ -160,8 +277,10 @@ fi
 # record of legal weight.
 # $1 = rc, $2 = out tag (yes / no / skip-no-python).
 ledger() {
-  local dir="${BALLAST_CLAUDE_HOME:-}"
-  [ -z "$dir" ] && dir="${HOME:+$HOME/.claude}"
+  # Home resolution is shared with the interpreter cache via resolve_ballast_home() above -- see
+  # that helper for the BALLAST_CLAUDE_HOME -> $HOME/.claude -> empty ladder and the set -u
+  # rationale. An empty value means "no state dir": return early rather than writing anywhere.
+  local dir="$BALLAST_HOME_DIR"
   [ -n "$dir" ] || return 0
   local log="$dir/ballast-hook-fires.log"
   local proj="${CLAUDE_PROJECT_DIR:-}"
@@ -169,7 +288,7 @@ ledger() {
   { [ -d "$dir" ] || mkdir -p "$dir"     # [ -d ] is a builtin: no fork on the common already-exists path
     [ -f "$log" ] && [ "$(wc -c < "$log")" -gt 5242880 ] && mv -f "$log" "$log.old"
     printf '%s %s rc=%s out=%s proj=%s sid=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$name" "$1" "$2" \
-      "$proj" "${CLAUDE_SESSION_ID:-}" >> "$log"; } 2>/dev/null || true
+      "$proj" "${CLAUDE_CODE_SESSION_ID:-${CLAUDE_SESSION_ID:-}}" >> "$log"; } 2>/dev/null || true
 }
 
 out=""

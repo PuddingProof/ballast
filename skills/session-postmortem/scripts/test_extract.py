@@ -1016,6 +1016,156 @@ class SubagentToolingTest(unittest.TestCase):
         finally:
             shutil.rmtree(d, ignore_errors=True)
 
+    # --- dispatch label (`description`) + nested-depth (`spawnDepth`) surfacing ---
+
+    def test_sanitize_label_collapses_whitespace_and_pipes(self):
+        raw = 'Extract   rain-proof\n07-23 | reports A'
+        self.assertEqual(extract._sanitize_label(raw), 'Extract rain-proof 07-23 / reports A')
+
+    def test_sanitize_label_truncates_at_60_chars(self):
+        out = extract._sanitize_label('x' * 80)
+        self.assertEqual(out, 'x' * 60 + '…', '60 chars kept plus a trailing ellipsis marker')
+
+    def test_dispatch_label_rendered_in_roster(self):
+        import shutil
+        d = tempfile.mkdtemp()
+        try:
+            main = os.path.join(d, 'sess.jsonl')
+            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
+            side = os.path.join(d, 'sess', 'subagents')
+            os.makedirs(side)
+            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
+                json.dump({'agentType': 'ballast:harness-sweep-extractor',
+                           'description': 'Extract rain-proof 07-23 reports A'}, f)
+            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
+                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
+            out = capture(extract.subagents, main)
+            self.assertIn('Dispatch label', out, 'roster header carries the new column')
+            self.assertIn('Extract rain-proof 07-23 reports A', out)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_dispatch_label_missing_renders_dash(self):
+        import shutil
+        d = tempfile.mkdtemp()
+        try:
+            main = os.path.join(d, 'sess.jsonl')
+            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
+            side = os.path.join(d, 'sess', 'subagents')
+            os.makedirs(side)
+            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
+                json.dump({'agentType': 'Explore'}, f)   # no description key
+            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
+                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
+            out = capture(extract.subagents, main)
+            self.assertIn('| Explore | — |', out, 'no description -> em-dash placeholder cell')
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_dispatch_label_long_description_truncated_in_roster(self):
+        import shutil
+        d = tempfile.mkdtemp()
+        try:
+            main = os.path.join(d, 'sess.jsonl')
+            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
+            side = os.path.join(d, 'sess', 'subagents')
+            os.makedirs(side)
+            long_desc = 'A' * 80
+            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
+                json.dump({'agentType': 'Explore', 'description': long_desc}, f)
+            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
+                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
+            out = capture(extract.subagents, main)
+            self.assertIn('A' * 60 + '…', out, 'long description truncated to 60 chars + ellipsis')
+            self.assertNotIn('A' * 61, out, 'the untruncated 61st char must not appear')
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_dispatch_label_pipe_and_newline_do_not_break_table(self):
+        import shutil
+        d = tempfile.mkdtemp()
+        try:
+            main = os.path.join(d, 'sess.jsonl')
+            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
+            side = os.path.join(d, 'sess', 'subagents')
+            os.makedirs(side)
+            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
+                json.dump({'agentType': 'Explore', 'description': 'weird | label\nwith a newline'}, f)
+            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
+                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
+            out = capture(extract.subagents, main)
+            row = next(l for l in out.splitlines() if l.startswith('| Explore |'))
+            self.assertEqual(row.count('|'), 7, 'sanitized label must not introduce extra table columns')
+            self.assertIn('weird / label with a newline', out)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_spawn_depth_2_marked_nested_in_roster(self):
+        import shutil
+        d = tempfile.mkdtemp()
+        try:
+            main = os.path.join(d, 'sess.jsonl')
+            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
+            side = os.path.join(d, 'sess', 'subagents')
+            os.makedirs(side)
+            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
+                json.dump({'agentType': 'Explore', 'spawnDepth': 2}, f)
+            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
+                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
+            out = capture(extract.subagents, main)
+            self.assertIn('↳ Explore (depth 2)', out, 'a nested dispatch is marked inline')
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_spawn_depth_absent_or_garbage_defaults_to_1_not_nested(self):
+        import shutil
+        d = tempfile.mkdtemp()
+        try:
+            main = os.path.join(d, 'sess.jsonl')
+            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
+            side = os.path.join(d, 'sess', 'subagents')
+            os.makedirs(side)
+            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
+                json.dump({'agentType': 'Good'}, f)   # no spawnDepth key
+            with open(os.path.join(side, 'agent-1.meta.json'), 'w', encoding='utf-8') as f:
+                json.dump({'agentType': 'Bad', 'spawnDepth': 'garbage'}, f)   # non-int garbage
+            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
+                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
+            _write_jsonl(os.path.join(side, 'agent-1.jsonl'),
+                         [asst_usage_line('a1', 'claude-sonnet-4-6', inp=40)])
+            out = capture(extract.subagents, main)
+            self.assertNotIn('↳', out, 'absent/garbage spawnDepth defaults to depth 1 -> not nested')
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_label_and_depth_do_not_affect_counts_or_token_split(self):
+        # Adding description/spawnDepth must not perturb the dispatched count, by_type tally, or the
+        # main-vs-subagent token split — those stay computed exactly as before this change (mirrors
+        # test_subagents_roster_split_and_journal_ignored with description/spawnDepth added).
+        import shutil
+        d = tempfile.mkdtemp()
+        try:
+            main = os.path.join(d, 'sess.jsonl')
+            _write_jsonl(main, [asst_usage_line('m_main', 'claude-opus-4-8', inp=1000, out=100,
+                                                tools=[('toolu_m', 'Read')])])
+            side = os.path.join(d, 'sess', 'subagents')
+            os.makedirs(side)
+            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
+                json.dump({'agentType': 'Explore',
+                           'description': 'Extract rain-proof 07-23 reports A',
+                           'spawnDepth': 2}, f)
+            _write_jsonl(os.path.join(side, 'agent-0.jsonl'), [
+                asst_usage_line('a0', 'claude-sonnet-4-6', inp=200, out=100,
+                                tools=[('toolu_x', 'Grep'), ('toolu_y', 'Read')])])
+            out = capture(extract.subagents, main)
+            self.assertIn('Subagents dispatched:** 1', out)
+            self.assertIn('1× Explore', out)
+            self.assertIn('main 1,100 + subagents 300 = 1,400', out)
+            tb = capture(extract.tool_breakdown, main)
+            self.assertIn('1 main + 2 across subagents', tb)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
     # --- ENG-3: forked/resumed-UUID sidecar merge ---
 
     def test_session_uuid_chain_collects_fork_uuids(self):

@@ -43,7 +43,7 @@ BALLAST PRINCIPLES -- standing philosophy of this harness. Session guidance, not
 
 **User rules win.** A user's or project's standing instructions, preferences, and permission gates are never fought or routed around: automation that meets an explicit deny/ask or a standing rule backs off and surfaces the tension instead of overriding it.
 
-**Code.** Make each change fit the architecture cleanly -- restructure-for-fit over shoved-in edits, while keeping the smallest clean change. Comment generously: explain functionality and design decisions inline. In review, nits are worth fixing; "pre-existing" and "non-exploitable" are deprioritization inputs, never standing reasons to skip a correct, cheap fix.
+**Code.** Make each change fit the architecture cleanly -- restructure-for-fit over shoved-in edits, while keeping the smallest clean change. In review, nits are worth fixing; "pre-existing" and "non-exploitable" are deprioritization inputs, never standing reasons to skip a correct, cheap fix.
 
 **Communication.** Lead with the conclusion (BLUF). When asking the user to choose, lead with an explicit recommendation. Prefer iterative Q&A over long speculative documents.
 

@@ -35,6 +35,24 @@
 
 payload="$(cat)"
 
+# FAST-PATH PREFILTER (performance, not semantics): if the raw payload contains no `git` substring
+# at all, nothing downstream can possibly match, so exit before paying for extraction. WHY IT
+# MATTERS: the jq-absent branch below starts a whole PYTHON INTERPRETER, and this hook fires on
+# EVERY Bash/PowerShell call -- the vast majority of which never mention git. That per-call
+# interpreter start made this the #1 timeout hook (12 of 21 timeouts in an observed 83-minute
+# window). The `case`/`exit` below is a shell builtin: zero forks.
+# STRICTLY CONSERVATIVE, and this is the load-bearing argument: it tests the RAW payload, which is
+# a SUPERSET of every string any downstream check inspects -- the extracted command is a substring
+# of the payload, and the line-57 fallback already scans this same raw payload verbatim. So no
+# payload that could have matched downstream is skipped here, and no new over-match class is
+# introduced (a `git` mention in a `description` field merely reaches the existing logic, exactly
+# as before). Matching bare `git` rather than `git ` on purpose: wider than any downstream pattern,
+# keeping the superset property intact even if a check is later loosened.
+case "$payload" in
+  *git*) ;;
+  *) exit 0 ;;
+esac
+
 # Extract tool_input.command (present for Bash and PowerShell tools) so a `description`
 # mentioning git can't cause a false reminder. Prefer jq; else the dispatcher-verified Python
 # (BALLAST_PYTHON, exported by run.sh -- a working Python 3, never the Windows Store stub). If

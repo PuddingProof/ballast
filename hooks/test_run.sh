@@ -138,26 +138,65 @@ else
   fail "6 BALLAST_CLAUDE_HOME respected" "rc=$rc var_log=[$(ledger_text "$log_var")] home_log=[$(ledger_text "$log_env")]"
 fi
 
-# --- 7: proj=/sid= fields populated from CLAUDE_PROJECT_DIR / CLAUDE_SESSION_ID -----------------
+# --- 7: proj=/sid= fields populated from CLAUDE_PROJECT_DIR / CLAUDE_CODE_SESSION_ID ------------
 # A Windows-native backslash path proves the proj basename expansion
 # ("${proj##*[/\\]}") strips both / and \, not just POSIX /.
+# ENV NAME (corrected 2026-07-25): this check used to export CLAUDE_SESSION_ID -- a name the
+# harness NEVER sets in a hook process. It therefore validated the plumbing against a name
+# production never receives: self-confirming, green for 15 days while the real ledger's sid= field
+# was empty in 5,439/5,439 lines. A test that supplies its own wrong premise cannot fail. The
+# discrimination is pinned by check 8b below, which is the part that makes this one meaningful.
 home="$(newtmp)"
-out="$(printf '%s' '{"prompt":"autopilot on"}' | env BALLAST_CLAUDE_HOME="$home" CLAUDE_PROJECT_DIR='C:\fake\proj\ballast-test' CLAUDE_SESSION_ID='abcd1234-5678-90ab-cdef-1234567890ab' bash "$RUN" freehand-mode)"; rc=$?
+out="$(printf '%s' '{"prompt":"autopilot on"}' | env BALLAST_CLAUDE_HOME="$home" CLAUDE_PROJECT_DIR='C:\fake\proj\ballast-test' CLAUDE_CODE_SESSION_ID='abcd1234-5678-90ab-cdef-1234567890ab' bash "$RUN" freehand-mode)"; rc=$?
 log="$home/ballast-hook-fires.log"
 if [ "$rc" = 0 ] && contains "$(ledger_text "$log")" "proj=ballast-test sid=abcd1234-5678-90ab-cdef-1234567890ab"; then
-  pass "7 proj=/sid= populated (Windows-native backslash basename)"
+  pass "7 proj=/sid= populated from CLAUDE_CODE_SESSION_ID (Windows-native backslash basename)"
 else
   fail "7 proj=/sid= populated" "rc=$rc log=[$(ledger_text "$log")]"
 fi
 
 # --- 8: proj=/sid= fields present-but-empty when unset, no crash under set -u -------------------
+# BOTH session-id names unset, so the nested `:-` default chain bottoms out empty rather than
+# aborting under `set -u`.
 home="$(newtmp)"
-out="$(printf '%s' '{"prompt":"autopilot on"}' | env -u CLAUDE_PROJECT_DIR -u CLAUDE_SESSION_ID BALLAST_CLAUDE_HOME="$home" bash "$RUN" freehand-mode)"; rc=$?
+out="$(printf '%s' '{"prompt":"autopilot on"}' | env -u CLAUDE_PROJECT_DIR -u CLAUDE_SESSION_ID -u CLAUDE_CODE_SESSION_ID BALLAST_CLAUDE_HOME="$home" bash "$RUN" freehand-mode)"; rc=$?
 log="$home/ballast-hook-fires.log"
 if [ "$rc" = 0 ] && contains "$(ledger_text "$log")" "proj= sid="; then
   pass "8 proj=/sid= empty when unset, no crash"
 else
   fail "8 proj=/sid= empty when unset" "rc=$rc log=[$(ledger_text "$log")]"
+fi
+
+# --- 8b: PRECEDENCE -- CLAUDE_CODE_SESSION_ID wins over the legacy CLAUDE_SESSION_ID ------------
+# This is the check that makes the rename non-silent, and it exists because of the 15-day
+# empty-sid bug: check 7 alone would go green again if the code reverted to reading ONLY the legacy
+# name (the test would simply export whatever the code reads). Here BOTH names are exported with
+# DISTINCT values, so the ledger line proves WHICH one the code consulted -- a revert to the legacy
+# name flips this to FAIL immediately.
+# Note the deliberate asymmetry with the original spec, which asked that a legacy-only environment
+# log an EMPTY sid: that is unreachable by construction once run.sh keeps the legacy name as a
+# nested `:-` fallback (adjudicated 2026-07-25). Precedence is the assertion that actually pins the
+# regression class the empty-check was aiming at.
+home="$(newtmp)"
+out="$(printf '%s' '{"prompt":"autopilot on"}' | env BALLAST_CLAUDE_HOME="$home" CLAUDE_CODE_SESSION_ID='real-11111111-1111-1111-1111-111111111111' CLAUDE_SESSION_ID='legacy-22222222-2222-2222-2222-222222222222' bash "$RUN" freehand-mode)"; rc=$?
+log="$home/ballast-hook-fires.log"
+if [ "$rc" = 0 ] && contains "$(ledger_text "$log")" "sid=real-11111111-1111-1111-1111-111111111111" \
+   && ! contains "$(ledger_text "$log")" "legacy-22222222"; then
+  pass "8b sid= precedence: CLAUDE_CODE_SESSION_ID wins over legacy CLAUDE_SESSION_ID"
+else
+  fail "8b sid= precedence" "rc=$rc log=[$(ledger_text "$log")]"
+fi
+
+# --- 8c: legacy-only environment still resolves via the documented fallback ---------------------
+# Complements 8b: the nested `:-` default is deliberate (a future harness setting only the old name
+# should still ledger a usable sid), so pin that it works rather than leaving it untested.
+home="$(newtmp)"
+out="$(printf '%s' '{"prompt":"autopilot on"}' | env -u CLAUDE_CODE_SESSION_ID BALLAST_CLAUDE_HOME="$home" CLAUDE_SESSION_ID='legacy-33333333-3333-3333-3333-333333333333' bash "$RUN" freehand-mode)"; rc=$?
+log="$home/ballast-hook-fires.log"
+if [ "$rc" = 0 ] && contains "$(ledger_text "$log")" "sid=legacy-33333333-3333-3333-3333-333333333333"; then
+  pass "8c sid= legacy-name fallback still resolves"
+else
+  fail "8c sid= legacy fallback" "rc=$rc log=[$(ledger_text "$log")]"
 fi
 
 # --- 9: one-generation size rollover -- oversized log moved to .old, fresh line only ------------
@@ -203,6 +242,104 @@ if [ "$rc" = 0 ] && [ -z "$out" ] && [ ! -s "$log" ]; then
   pass "11 mode-state-cleanup dispatch: silent by design, rc=0, no ledger line"
 else
   fail "11 mode-state-cleanup dispatch" "rc=$rc out=[$out] log=[$(ledger_text "$log")]"
+fi
+
+# =================================================================================================
+# INTERPRETER CACHE (12-16) -- run.sh's three-tier BALLAST_PYTHON resolution.
+#
+# WHY: the cold probe EXECUTES up to three candidates plus per-candidate `type -aP`/`grep`/`head`
+# forks, measured at ~1.5s of a 2.4s hook fire under load and re-derived identically four times per
+# Bash tool call. Tier 1 (inherited env) and tier 2 (on-disk cache at <home>/ballast-python) exist
+# to skip it; these cases pin that the fast paths are taken, that an INVALID cached value can never
+# be served, and that every cache failure mode degrades to a working dispatch rather than breaking
+# the session.
+#
+# HERMETIC, TWICE OVER: BALLAST_CLAUDE_HOME points the cache at a temp dir (never the real
+# ~/.claude), and each case runs with `env -u BALLAST_PYTHON` because THIS SUITE exports
+# BALLAST_PYTHON at the top -- without the unset, tier 1 would short-circuit every run and these
+# cases would silently test nothing at all. (Case 15 is the deliberate exception: it tests tier 1.)
+CACHE_PAYLOAD='{"prompt":"autopilot on"}'
+cache_file_of() { printf '%s' "$1/ballast-python"; }
+
+# --- 12: COLD run writes the cache file with a usable interpreter -------------------------------
+home="$(newtmp)"
+cache="$(cache_file_of "$home")"
+out="$(printf '%s' "$CACHE_PAYLOAD" | env -u BALLAST_PYTHON BALLAST_CLAUDE_HOME="$home" bash "$RUN" freehand-mode)"; rc=$?
+cached_val=""
+[ -f "$cache" ] && { read -r cached_val < "$cache"; } 2>/dev/null
+if [ "$rc" = 0 ] && contains "$out" '"additionalContext"' \
+   && [ -n "$cached_val" ] && [ -x "${cached_val%% *}" ]; then
+  pass "12 cold run writes cache file with an executable interpreter"
+else
+  fail "12 cold run writes cache" "rc=$rc cached=[$cached_val] out_len=${#out}"
+fi
+
+# --- 13: WARM run with a valid cached value still dispatches correctly --------------------------
+# Pre-seed the cache with the suite's own verified interpreter so tier 2 is what serves this run.
+home="$(newtmp)"
+cache="$(cache_file_of "$home")"
+printf '%s\n' "$BALLAST_PYTHON" > "$cache"
+out="$(printf '%s' "$CACHE_PAYLOAD" | env -u BALLAST_PYTHON BALLAST_CLAUDE_HOME="$home" bash "$RUN" freehand-mode)"; rc=$?
+log="$home/ballast-hook-fires.log"
+if [ "$rc" = 0 ] && contains "$out" '"additionalContext"' \
+   && contains "$(ledger_text "$log")" "freehand-mode rc=0 out=yes"; then
+  pass "13 warm run with valid cached value dispatches correctly"
+else
+  fail "13 warm run dispatches" "rc=$rc out=[$out] log=[$(ledger_text "$log")]"
+fi
+
+# --- 14: STALE cache (nonexistent path) is rejected, run succeeds, value is replaced ------------
+# The self-heal path: `[ -x ]` fails on a moved/uninstalled interpreter, tier 3 re-probes, and the
+# probe's write-back overwrites the bad line. Without this, a stale cache would wedge every hook.
+home="$(newtmp)"
+cache="$(cache_file_of "$home")"
+printf '%s\n' "/definitely/not/a/real/python-$$" > "$cache"
+out="$(printf '%s' "$CACHE_PAYLOAD" | env -u BALLAST_PYTHON BALLAST_CLAUDE_HOME="$home" bash "$RUN" freehand-mode)"; rc=$?
+cached_val=""
+[ -f "$cache" ] && { read -r cached_val < "$cache"; } 2>/dev/null
+if [ "$rc" = 0 ] && contains "$out" '"additionalContext"' \
+   && [ -n "$cached_val" ] && [ -x "${cached_val%% *}" ] \
+   && ! contains "$cached_val" "/definitely/not/a/real/python"; then
+  pass "14 stale cache rejected, dispatch succeeds, stale value replaced"
+else
+  fail "14 stale cache rejected" "rc=$rc cached=[$cached_val] out_len=${#out}"
+fi
+
+# --- 15: a pre-exported VALID BALLAST_PYTHON is honored (tier 1) --------------------------------
+# Discriminating assertion: tier 1 must short-circuit BEFORE the cache, so no cache file is written
+# at all. If the tiers were ever reordered (or tier 1 dropped), this run would cold-probe and leave
+# a cache file behind -- flipping this check to FAIL.
+home="$(newtmp)"
+cache="$(cache_file_of "$home")"
+out="$(printf '%s' "$CACHE_PAYLOAD" | env BALLAST_CLAUDE_HOME="$home" BALLAST_PYTHON="$BALLAST_PYTHON" bash "$RUN" freehand-mode)"; rc=$?
+if [ "$rc" = 0 ] && contains "$out" '"additionalContext"' && [ ! -f "$cache" ]; then
+  pass "15 pre-exported BALLAST_PYTHON honored (tier 1, no cache write)"
+else
+  fail "15 tier-1 inherited env honored" "rc=$rc cache_exists=$([ -f "$cache" ] && echo yes || echo no) out_len=${#out}"
+fi
+
+# --- 16: an UNWRITABLE ledger home never breaks dispatch (fail-open) ----------------------------
+# BALLAST_CLAUDE_HOME points at a regular FILE, so both `mkdir -p` and the cache write must fail.
+# The hook still has to resolve an interpreter and dispatch normally -- a broken cache location is
+# a performance regression at worst, never a dead hook.
+home_parent="$(newtmp)"
+notadir="$home_parent/i-am-a-file"
+printf 'not a directory\n' > "$notadir"
+out="$(printf '%s' "$CACHE_PAYLOAD" | env -u BALLAST_PYTHON BALLAST_CLAUDE_HOME="$notadir" bash "$RUN" freehand-mode)"; rc=$?
+if [ "$rc" = 0 ] && contains "$out" '"additionalContext"'; then
+  pass "16 unwritable ledger home: dispatch still succeeds (fail-open)"
+else
+  fail "16 unwritable ledger home" "rc=$rc out=[$out]"
+fi
+
+# --- 16b: NO home at all (HOME and BALLAST_CLAUDE_HOME both unset) still dispatches --------------
+# The other half of fail-open: with no state dir resolvable the cache is skipped entirely and the
+# cold probe must still run. Pairs with check 5, which pins the same condition for the ledger.
+out="$(printf '%s' "$CACHE_PAYLOAD" | env -u BALLAST_PYTHON -u HOME -u BALLAST_CLAUDE_HOME bash "$RUN" freehand-mode)"; rc=$?
+if [ "$rc" = 0 ] && contains "$out" '"additionalContext"'; then
+  pass "16b no resolvable home: cache skipped, dispatch still succeeds"
+else
+  fail "16b no resolvable home" "rc=$rc out=[$out]"
 fi
 
 echo

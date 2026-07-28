@@ -6,8 +6,10 @@ subprocess with the current interpreter, feeds a PreToolUse JSON payload on
 stdin, and asserts on the emitted decision:
 
   - an install / remote-exec verb in REAL command position -> permissionDecision "ask"
+  - the same verb from a SUB-AGENT payload (agent_type and/or agent_id present)
+    -> permissionDecision "deny"
   - a verb inside quoted text OR a heredoc body -> silent pass (no output)
-  - allowlisted local dev-tool runs -> silent pass
+  - allowlisted local dev-tool runs -> silent pass (both callers)
   - a malformed payload -> silent pass, exit 0 (fail open)
 
 The heredoc cases pin R2 (2026-07-08): a `git commit -F - <<'EOF' ... EOF`
@@ -25,8 +27,12 @@ import unittest
 HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "package-install-guard.py")
 
 
-def _run(command):
-    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+def _run(command, **caller):
+    """Invoke the hook. Extra kwargs (agent_type / agent_id) become payload fields —
+    absent = the main loop, present = a sub-agent, mirroring the live payload shape."""
+    payload = json.dumps(dict(
+        {"tool_name": "Bash", "tool_input": {"command": command}}, **caller
+    ))
     return subprocess.run(
         [sys.executable, HOOK], input=payload, capture_output=True, text=True
     )
@@ -61,6 +67,49 @@ class RemoteExecFires(unittest.TestCase):
 
     def test_allowlisted_npx_silent(self):
         self.assertIsNone(_decision(_run("npx playwright test")))
+
+
+class SubagentGetsDeniedNotAsked(unittest.TestCase):
+    """A leaf never raises an install prompt at a user who can't see its context —
+    the ask gate is main-session-only. Both discriminator fields are pinned
+    independently: either alone must be sufficient (they arrive in different
+    combinations — Task leaf, main-thread persona, forked query)."""
+
+    def test_install_from_task_subagent(self):
+        self.assertEqual(
+            _decision(_run("npm install vite", agent_type="visual-reviewer", agent_id="ag_123")),
+            "deny",
+        )
+
+    def test_install_with_agent_type_only(self):
+        self.assertEqual(_decision(_run("pip install requests", agent_type="general-purpose")), "deny")
+
+    def test_install_with_agent_id_only(self):
+        # a forked query — still not the main loop, still can't own an install
+        self.assertEqual(_decision(_run("pip install requests", agent_id="ag_456")), "deny")
+
+    def test_remote_exec_from_subagent(self):
+        self.assertEqual(_decision(_run("npx tsx --version", agent_type="visual-reviewer")), "deny")
+
+    def test_deny_reason_names_the_escape_hatch(self):
+        # a blocked leaf with no stated alternative improvises one and spins — the
+        # reason text reaching the model must carry the report-the-gap instruction
+        out = json.loads(_run("npm install vite", agent_type="visual-reviewer").stdout)
+        reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("coverage gap", reason)
+        self.assertIn("Do NOT retry", reason)
+
+    def test_allowlisted_npx_still_silent_for_subagent(self):
+        # the allowlist is caller-independent: these are local binaries the leaf
+        # is expected to drive, not a fetch
+        self.assertIsNone(_decision(_run("npx playwright test", agent_type="visual-reviewer")))
+
+    def test_benign_subagent_command_silent(self):
+        self.assertIsNone(_decision(_run("ls -la", agent_type="visual-reviewer")))
+
+    def test_empty_agent_fields_read_as_main_loop(self):
+        # empty strings are not a sub-agent signal — degrade to ask, never deny
+        self.assertEqual(_decision(_run("pip install requests", agent_type="", agent_id="")), "ask")
 
 
 class NeutralizedTextDoesNotFire(unittest.TestCase):

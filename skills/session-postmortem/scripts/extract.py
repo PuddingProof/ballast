@@ -20,8 +20,9 @@ Subcommands:
     invocations         Print Skill/Agent/Workflow tool invocations with their results
     edits               Print Edit/Write/MultiEdit tool calls (timestamp, type, basename)
     assistant-text      Print assistant text blocks chronologically
-    subagents           Per-subagent roster (agentType/model/tokens/tools) + main-vs-subagent token
-                        split, from the <uuid>/subagents/ sidecars (pass the LIVE transcript)
+    subagents           Per-subagent roster (agentType/dispatch label/model/tokens/tools, nested
+                        dispatches marked) + main-vs-subagent token split, from the
+                        <uuid>/subagents/ sidecars (pass the LIVE transcript)
     tool-breakdown      Tool fingerprint: main-vs-subagent call split + MCP-server table (LIVE transcript)
     topic-slug          Derive a topic slug from edit footprint (basename + folder analysis);
                         optional argv[3]: newline-separated git diff --name-only list used as a
@@ -1164,28 +1165,64 @@ def _short_model(m):
     return m.replace('claude-', '').split('[')[0]
 
 
-def _collect_subagents(sidedir):
-    """Walk a subagents/ dir -> per-agent dicts {agent_type, model, tokens, tool_count, tools}.
+def _sanitize_label(desc):
+    """Collapse a raw `description` string into one safe markdown-table cell.
 
-    Each agent is an `agent-*.meta.json` (carrying ONLY `agentType` — read that, never the
-    `description`/prompt, matching cc-dashboard's allow-list discipline) paired with its
-    `agent-*.jsonl` transcript, at any depth (incl. `workflows/wf_*/`). `journal.jsonl` and other
-    non-agent files have no meta.json and are skipped. The meta is size-capped at 64 KB (parse.rs
-    parity). The walk REFUSES to follow reparse points (symlinks / junctions) via `_walk_sidecar_files`,
-    and re-checks the DERIVED `.jsonl` sibling before opening it, so a planted link can't redirect a
-    read outside the trusted ~/.claude/projects tree (parse.rs no-follow parity). Returns ALL agents
-    UNCAPPED — the display cap (`_AGENT_SAMPLE_CAP`) is applied in `subagents()` so the dispatched
-    count + token split stay exact.
+    Whitespace/newlines collapse to single spaces (a multi-line description would otherwise break
+    the table's one-row-per-line shape); `|` is replaced with `/` rather than backslash-escaped —
+    the label is a short 3-5 word dispatch phrase, not prose where a literal pipe is meaningful, so
+    a clean substitution reads better than escape noise. Truncated to 60 chars with a trailing `…`
+    so one long label can't blow out the table's width.
+    """
+    s = re.sub(r'\s+', ' ', desc).strip().replace('|', '/')
+    if len(s) > 60:
+        s = s[:60].rstrip() + '…'
+    return s
+
+
+def _collect_subagents(sidedir):
+    """Walk a subagents/ dir -> per-agent dicts {agent_type, model, tokens, tool_count, tools,
+    label, depth}.
+
+    Each agent is an `agent-*.meta.json` paired with its `agent-*.jsonl` transcript, at any depth
+    (incl. `workflows/wf_*/`). Reads `agentType`, `description`, and `spawnDepth` from the meta.
+    `description` is the ORCHESTRATOR's own 3-5 word dispatch label (e.g. "Extract rain-proof 07-23
+    reports A") — NOT the agent's prompt or first-user-turn body, which stay unread; that half of
+    cc-dashboard's allow-list discipline (never read what the DISPATCHED agent said or was told to
+    do beyond this label) is unchanged. The label is deliberately surfaced despite the previous
+    stricter posture: a roster keyed on agentType alone made a real cost diagnosis impossible (12×
+    plan-executor rows were indistinguishable), the label is orchestrator-authored metadata rather
+    than user content or file content, and a postmortem report already quotes the session's own
+    turns verbatim — so the marginal disclosure is nil against the diagnostic value of finally being
+    able to tell dispatches apart. `journal.jsonl` and other non-agent files have no meta.json and
+    are skipped. The meta is size-capped at 64 KB (parse.rs parity). The walk REFUSES to follow
+    reparse points (symlinks / junctions) via `_walk_sidecar_files`, and re-checks the DERIVED
+    `.jsonl` sibling before opening it, so a planted link can't redirect a read outside the trusted
+    ~/.claude/projects tree (parse.rs no-follow parity). Returns ALL agents UNCAPPED — the display
+    cap (`_AGENT_SAMPLE_CAP`) is applied in `subagents()` so the dispatched count + token split stay
+    exact.
     """
     agents = []
     for meta_path in _walk_sidecar_files(sidedir, '.meta.json'):
         agent_type = 'agent'
+        label = ''
+        depth = 1
         try:
             if os.path.getsize(meta_path) <= 65536:
                 with open(meta_path, encoding='utf-8') as f:
                     m = json.load(f)
-                if isinstance(m, dict) and isinstance(m.get('agentType'), str) and m['agentType'].strip():
-                    agent_type = m['agentType'].strip()
+                if isinstance(m, dict):
+                    if isinstance(m.get('agentType'), str) and m['agentType'].strip():
+                        agent_type = m['agentType'].strip()
+                    desc = m.get('description')
+                    if isinstance(desc, str) and desc.strip():
+                        label = _sanitize_label(desc)
+                    # bool is an int subclass in Python — exclude it explicitly so `"spawnDepth":
+                    # true` doesn't silently pass the isinstance check. Absent/garbage (missing key,
+                    # non-int, <=0) falls back to depth 1 (top-level dispatch).
+                    sd = m.get('spawnDepth')
+                    if isinstance(sd, int) and not isinstance(sd, bool) and sd > 0:
+                        depth = sd
         except (OSError, json.JSONDecodeError):
             pass
         jsonl = meta_path[:-len('.meta.json')] + '.jsonl'
@@ -1196,7 +1233,7 @@ def _collect_subagents(sidedir):
             tokens = _usage_tokens(jsonl)
             tools = _tool_histogram(jsonl)
             model = _first_assistant_model(jsonl)
-        agents.append({'agent_type': agent_type, 'model': model,
+        agents.append({'agent_type': agent_type, 'model': model, 'label': label, 'depth': depth,
                        'tokens': tokens['total'], 'tool_count': sum(tools.values()), 'tools': tools})
     return agents
 
@@ -1211,9 +1248,12 @@ def _split_mcp(name):
 
 
 def subagents(path):
-    """Print the per-subagent roster (agentType, model, tokens, tool calls) + the main-vs-subagent
-    token split — the fanout spend §7's main-thread token table breaks out via its subagent-aggregate
-    line. Pass the LIVE transcript (sidecars live beside it). Merges every sidecar dir in the session's resume chain
+    """Print the per-subagent roster (agentType, dispatch label, model, tokens, tool calls) + the
+    main-vs-subagent token split — the fanout spend §7's main-thread token table breaks out via its
+    subagent-aggregate line. The dispatch label (from meta's `description`, see `_collect_subagents`)
+    disambiguates rows that would otherwise all share the same agentType (e.g. N× plan-executor); a
+    nested dispatch (`spawnDepth` > 1) is marked inline on the agent-type cell. Pass the LIVE
+    transcript (sidecars live beside it). Merges every sidecar dir in the session's resume chain
     (`_subagent_dirs`, ENG-3) so a forked/resumed UUID doesn't under-count agents, and caps the
     DISPLAYED roster at `_AGENT_SAMPLE_CAP` (ENG-6) while the count + token split stay exact. Prints
     a one-liner when the session dispatched none."""
@@ -1246,15 +1286,20 @@ def subagents(path):
         print(f'_Merged subagent sidecars from {len(dirs)} resume-chain UUIDs: {merged} '
               '(session forked/resumed its UUID mid-run)._')
     print()
-    print('| Agent type | Model | Tokens | Tool calls | Top tools |')
-    print('|---|---|---:|---:|---|')
+    print('| Agent type | Dispatch label | Model | Tokens | Tool calls | Top tools |')
+    print('|---|---|---|---:|---:|---|')
     # ENG-6: cap the DISPLAYED roster at _AGENT_SAMPLE_CAP rows (top-N by token spend; `agents` is
     # already sorted desc) — matches cc-dashboard's agent_sample_cap. The dispatched count, by_type
     # tally, and token split above all stay computed over ALL agents; only the table is sampled, and
     # only when the roster actually exceeds the cap.
     for a in agents[:_AGENT_SAMPLE_CAP]:
         top = ', '.join(f'{n}×{c}' for n, c in a['tools'].most_common(4)) or '—'
-        print(f"| {a['agent_type']} | {_short_model(a['model'])} | {a['tokens']:,} | {a['tool_count']} | {top} |")
+        # A nested dispatch (an agent spawned BY a subagent, not directly by the orchestrator) is
+        # otherwise invisible in this roster — mark it inline on the agent-type cell (↳ + depth)
+        # rather than adding a whole extra column, to keep the table narrow.
+        agent_col = f"↳ {a['agent_type']} (depth {a['depth']})" if a['depth'] > 1 else a['agent_type']
+        label = a['label'] or '—'
+        print(f"| {agent_col} | {label} | {_short_model(a['model'])} | {a['tokens']:,} | {a['tool_count']} | {top} |")
     if len(agents) > _AGENT_SAMPLE_CAP:
         print(f'_(showing top {_AGENT_SAMPLE_CAP} of {len(agents)} by token spend; '
               f'the count + token split above cover all.)_')

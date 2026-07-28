@@ -84,11 +84,15 @@
 #     mode is legitimately on can't silently revoke the standing grant (the
 #     silent-grant-loss seam the fix wave closed). sid is embedded LITERALLY into
 #     that clear instruction (never left for the model to fill in from its own
-#     environment) because CLAUDE_SESSION_ID is documented as present in HOOK
-#     processes but is ABSENT from the model's own Bash-tool-typed environment —
-#     there is no other way for the model to recover it later in the turn. (The
-#     skill side has no such problem: its `${CLAUDE_SESSION_ID}` substitutes at
-#     content-load time inside the plugin loader, not in a model-typed shell.)
+#     environment) because NO session-id env var is available to the model's own
+#     Bash-tool-typed shell — there is no other way for the model to recover it
+#     later in the turn. (Rationale corrected 2026-07-25: this used to claim
+#     `CLAUDE_SESSION_ID` is present in hook processes. It is not, and never has
+#     been — the harness sets `CLAUDE_CODE_SESSION_ID` there. The CODE here was
+#     always right, since it extracts sid from the PAYLOAD and depends on no env
+#     var at all; only this justification was wrong. The skill side is a third,
+#     unrelated mechanism: its `${CLAUDE_SESSION_ID}` substitutes at content-LOAD
+#     time inside the plugin loader — see docs/frontmatter.md — not in any shell.)
 # dim/pending is the visual cue for "not yet judged," the same way the stub's
 # ADJUDICATE FIRST gate is the textual cue. The chip goes live a beat before the
 # judgment that decides whether it should have fired at all. If it is never
