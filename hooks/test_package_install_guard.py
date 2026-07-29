@@ -112,6 +112,30 @@ class SubagentGetsDeniedNotAsked(unittest.TestCase):
         self.assertEqual(_decision(_run("pip install requests", agent_type="", agent_id="")), "ask")
 
 
+class ShellWrapperDoesNotLaunderTheVerb(unittest.TestCase):
+    """A wrapper's quoted body IS command text, so it must survive the quote stripper.
+
+    Back-ported from process-lifecycle-guard.py, which hit this class first: without the UNWRAP
+    step the whole body is erased as a quoted literal and the install verb never reaches INSTALL.
+    """
+
+    def test_bash_c_install(self):
+        self.assertEqual(_decision(_run('bash -c "npm install evil-pkg"')), "ask")
+
+    def test_sh_c_pip_install(self):
+        self.assertEqual(_decision(_run("sh -c 'pip install evil-pkg'")), "ask")
+
+    def test_powershell_command_remote_exec(self):
+        self.assertEqual(_decision(_run('powershell -Command "npx some-tool"')), "ask")
+
+    def test_bash_c_install_from_subagent_is_denied(self):
+        self.assertEqual(
+            _decision(_run('bash -c "npm install evil-pkg"', agent_type="general-purpose")), "deny")
+
+    def test_wrapper_body_that_only_mentions_an_install_still_silent(self):
+        self.assertIsNone(_decision(_run('bash -c "echo \'npm install foo\'"')))
+
+
 class NeutralizedTextDoesNotFire(unittest.TestCase):
     def test_quoted_commit_message(self):
         self.assertIsNone(_decision(_run('git commit -m "note: npm install stuff earlier"')))

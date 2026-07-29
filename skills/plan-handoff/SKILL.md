@@ -41,7 +41,7 @@ The division of labor: cheaper models take execution, editing, and large-file re
 
 ## What never delegates
 
-- Open-ended verification — live-driving the app, exploratory visual checks, co-drive — stays with the orchestrator + user. An executor told to "verify it works" builds ad-hoc harnesses and chases non-bugs; verification is judgement. One structured exception: the adversarial before-done visual verdict dispatches to the visual-reviewer agent (via the visual-verification-gate skill) — a purpose-built reviewer leaf, not an executor improvising verification.
+- Open-ended verification — live-driving the app, exploratory visual checks, co-drive — stays with the orchestrator + user. An executor told to "verify it works" builds ad-hoc harnesses and chases non-bugs; verification is judgement. One structured exception: visual work runs through the `visual-verification-gate` skill end-to-end — loaded at implementation START, not at done-time — which picks the ladder rung itself (glance by default); not an executor improvising verification.
 - Review adjudication: executors and finders propose, the top-tier thread (or the user) disposes. A finder's plausible "defensive" fix can silently undo the change under review — re-measure before accepting.
 
 ## Companion gates
@@ -49,7 +49,7 @@ The division of labor: cheaper models take execution, editing, and large-file re
 - Plan shoving edits into an awkward structural fit? That's a plan revision, not an executor improvisation — raise `/refactor-fit` (propose-then-build) before dispatching.
 - Multi-executor build about to be called done? That's exactly `/integration-gate`'s trigger — per-leaf checks passing says nothing about the seams.
 - Complex implementation → run either gate as its own Opus dispatch (the evaluation/read churn stays out of the main window); simple diff → in-line by the orchestrator is fine.
-- Independent gates run concurrently, not as a serial pipeline: once the diff is frozen, a visual-reviewer pass, a `/code-review` fanout, and an integration-gate dispatch read the same tree and don't feed each other — launch them in one wave and adjudicate the merged findings. Chain only where one gate's input IS another's output (a delta re-verify after fixes).
+- Independent gates run concurrently, not as a serial pipeline: once the diff is frozen, a visual review dispatch (via `visual-verification-gate`), a `/code-review` fanout, and an integration-gate dispatch read the same tree and don't feed each other — launch them in one wave and adjudicate the merged findings. Chain only where one gate's input IS another's output (a delta re-verify after fixes).
 
 ## Tier & effort per leaf
 

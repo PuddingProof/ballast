@@ -72,11 +72,13 @@ Usage:
   node probe.mjs preflight
   node probe.mjs doctor
   node probe.mjs selftest
-  node probe.mjs shot <url|path> [--matrix M] [--crop SEL] [--magnify N] [--out DIR] [--allow-remote]
+  node probe.mjs shot <url|path> [--matrix M] [--crop SEL] [--magnify N] [--out DIR] [--allow-remote] [--settle MS]
   node probe.mjs run  <scenario.mjs> [--url <url>] [--matrix M] [--crop SEL] [--magnify N] [--out DIR]
-                      [--baseline CELL] [--diff-threshold T] [--headed] [--allow-remote] [--cdp WS] [--timeout MS]
+                      [--baseline CELL] [--diff-threshold T] [--headed] [--allow-remote] [--cdp WS] [--timeout MS] [--settle MS]
   VISUAL_STATES=/abs/visual-states.json node probe.mjs run scenarios/states-from-manifest.mjs [--url <url>]
                       (drives every state in a project's state-forcing contract manifest; see below)
+  node probe.mjs compose <out-dir> [--group RE] [--crop-content] [--tile-height N] [--max-side N]
+                      (contact-sheet mosaic of a finished capture dir; re-screenshotted by this harness)
   node probe.mjs serve start <dir> [--port N]                      (detached ISOLATED static server — loopback, no-store, GET/HEAD-only; port auto-picked)
   node probe.mjs serve status | stop                               (find / kill it; 'start' reaps a stale one itself)
   node probe.mjs session start [url] [--port N] [--allow-remote]   (open the shared headed window)
@@ -99,7 +101,15 @@ Commands:
            ./.claude/visual-states.json. It drives every enumerated state (one-hot + an all-worst
            composed state per overlay flag — one per route when no overlay axis) and asserts each state's marker held via
            h.snapshotForced before capturing. VISUAL_STATES_FULL=1 runs the full axis cross-product
-           instead of the default one-hot + composed-worst slice.
+           instead of the default one-hot + composed-worst slice. --skip-drive-hooks (leaf mode)
+           never imports a manifest drive hook; states needing one are reported as coverageHoles.
+  compose  slice every frame in an out-dir into viewport-height segments and lay them out as one
+           contact sheet, re-screenshotted by this same harness (no image dependency). Sheets stay
+           under --max-side (default 1568 — the agent image-Read downscale ceiling); frames that
+           don't fit produce MORE sheets, never a bigger one. --group RE splits sheets by the first
+           capture group of RE against "<label> · <cell>" (e.g. --group "(light|dark)"), and
+           --crop-content trims empty side margins. The mosaic is an overflow ROUTER: per tile,
+           clear or escalate — read an escalated cell at full resolution before any verdict.
   serve    bundled isolated static server — the ONLY origin a co-drive should load (never the user's
            live dev server: the app's own lifecycle beacons can arm its shutdown). Hazard-proof by
            construction: no /api (beacon POST -> inert 405), Cache-Control: no-store (no stale CSS/JS),
@@ -117,8 +127,16 @@ Flags:
   --baseline CELL     divergence baseline cell label                                   [default: first cell]
   --diff-threshold T  aHash Hamming distance above which a cell is flagged divergent    [default: 6]
   --timeout MS        per-action timeout                              [default: 30000 run/shot; 4000 session do]
+  --settle MS         post-ready dwell before each shutter — for a project animation/crossfade that
+                      completes AFTER load / readySignal. Per capture (per state), not per run  [default: 0]
+  --suppressions F    JSON file of rung-0 suppressions (a bare array, or a state manifest carrying
+                      a top-level "suppressions": [{assert, selector, reason}])
+  --no-rung0          skip the in-page geometry assertions (on by default; findings are advisory)
 
-Output: read manifest.json FIRST, then read ONLY the .xN.png magnified crops of cells flagged diverges:true.`;
+Output: read manifest.json FIRST, then read ONLY the .xN.png magnified crops of cells flagged diverges:true.
+manifest.rung0 carries deterministic geometry findings (overlap / overflow / contrast / broken-image /
+offscreen / misalignment) that pre-locate defects before any image read — SHADOW-LOGGED advisory data:
+it never affects \`pass\` or the exit code.`;
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];

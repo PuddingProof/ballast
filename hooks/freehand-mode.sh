@@ -74,8 +74,8 @@
 #   - Genuine grant: the freehand skill's `on` path runs `ballast-mode confirm`,
 #     promoting the chip to solid. The confirm instruction is therefore NOT
 #     carried in the stub text — it lives in the skill, which recovers the
-#     session id from `${CLAUDE_SESSION_ID}` (load-time substitution; see
-#     docs/frontmatter.md), not from a model-typed shell.
+#     session id from `${CLAUDE_SESSION_ID}` (load-time substitution), not from
+#     a model-typed shell.
 #   - Mere mention: the stub asks the model to clear the pending chip itself via
 #     `ballast-mode clear <mode> --pending-only --session <sid>`. The
 #     `--pending-only` guard is load-bearing: it lets that clear remove ONLY this
@@ -92,7 +92,7 @@
 #     always right, since it extracts sid from the PAYLOAD and depends on no env
 #     var at all; only this justification was wrong. The skill side is a third,
 #     unrelated mechanism: its `${CLAUDE_SESSION_ID}` substitutes at content-LOAD
-#     time inside the plugin loader — see docs/frontmatter.md — not in any shell.)
+#     time inside the plugin loader, not in any shell.)
 # dim/pending is the visual cue for "not yet judged," the same way the stub's
 # ADJUDICATE FIRST gate is the textual cue. The chip goes live a beat before the
 # judgment that decides whether it should have fired at all. If it is never

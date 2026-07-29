@@ -9,12 +9,21 @@
 import { captureFrame } from './capture.mjs';
 import { guardUrl } from './urlguard.mjs';
 import { readStructure } from './read.mjs';
+import { RUNG0_PAGE_FN } from './assertions.mjs';
 
-export function makeHelper({ page, cell, url, allowRemote, collector }) {
+// `rung0`: {enabled, suppressions()} — the suppression list is pulled through a FUNCTION, not a
+// snapshot of the array, because a scenario may only learn its project's suppressions once it has
+// loaded the state manifest (i.e. after the harness built this helper).
+export function makeHelper({ page, cell, url, allowRemote, collector, rung0, settle = 0 }) {
   const h = {
     url,                 // the resolved --url (may be undefined; scenario can pass an explicit target)
     page,                // the live Playwright Page — full API available for arbitrary drive logic
     cell: cell.label,
+    settle,              // --settle MS, handed through so a scenario can honor it per state
+
+    // The post-ready dwell (--settle). A no-op at the default 0, so callers place it unconditionally
+    // after "ready" and before the shutter rather than branching on the flag.
+    async dwell(ms = settle) { if (ms > 0) await page.waitForTimeout(ms); },
 
     // Navigate (defaults to --url). Routed through the fail-closed local-origin guard.
     async goto(target = url) {
@@ -38,6 +47,18 @@ export function makeHelper({ page, cell, url, allowRemote, collector }) {
       try { await page.evaluate(async () => { await document.fonts?.ready; }); } catch { /* fonts API absent */ }
       const buf = await captureFrame(page, opts);
       collector.addSnapshot({ label, cell, buf, opts });
+
+      // RUNG 0 at the shutter — same instant as the frame, so a finding is tied to the state that
+      // was actually on screen. SHADOW-LOGGED: findings are data only; they never fail a run, so a
+      // broken evaluate must never fail one either (warn, drop, keep capturing).
+      if (rung0?.enabled && collector.addRung0) {
+        try {
+          const result = await page.evaluate(RUNG0_PAGE_FN, { suppressions: rung0.suppressions ? rung0.suppressions() : [] });
+          collector.addRung0({ label, cell: cell.label, result });
+        } catch (e) {
+          console.error('[visual-probe] rung-0 assertions failed for', `${label}/${cell.label}`, '-', e.message);
+        }
+      }
     },
 
     // Assert on a value the scenario reads. Records pass/fail; ANY failure → non-zero process exit
@@ -57,12 +78,18 @@ export function makeHelper({ page, cell, url, allowRemote, collector }) {
     // through untouched. This is what closes the "screenshot fired after the overlay closed"
     // false-pass: a marker that never holds is a failed assert, and a failed assert is a non-zero
     // process exit (the collector already wires that — nothing extra to plumb here).
-    async snapshotForced(label, { marker, ...snapshotOpts } = {}) {
+    //
+    // `settle` (ms) is the post-marker dwell: the marker says the state EXISTS, not that it has
+    // finished animating into place, so a caller that knows the project's transition window passes
+    // it here and the shutter waits that long after the marker holds. Omitted → h.dwell's default,
+    // i.e. the run's --settle.
+    async snapshotForced(label, { marker, settle: settleMs, ...snapshotOpts } = {}) {
       const held = await h.expect(
         () => page.waitForSelector(marker, { state: 'visible' }).then(() => true),
         (v) => v === true,
         `marker held: ${marker}`,
       );
+      await h.dwell(settleMs);
       await h.snapshot(label, snapshotOpts);
       return held;
     },

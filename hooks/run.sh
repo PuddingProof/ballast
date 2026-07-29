@@ -60,6 +60,9 @@ case "$name" in
   harness-sweep-nudge)              file="harness-sweep-nudge.sh" ;;
   inline-churn-nudge)               file="inline-churn-nudge.py" ;;
   dev-process-nudge)                file="dev-process-nudge.py" ;;
+  process-lifecycle-guard)          file="process-lifecycle-guard.py" ;;
+  origin-sweep)                     file="origin-sweep.py" ;;
+  visual-arm)                       file="visual-arm.py" ;;
   *)
     # Unknown hook name -- fail open silently (see contract above).
     exit 0
@@ -262,8 +265,8 @@ fi
 # binary's hook-child env builder sets CLAUDE_CODE_SESSION_ID, and a live env
 # dump from a hook process shows CLAUDE_SESSION_ID absent. Do NOT "restore" the
 # old name -- the `${CLAUDE_SESSION_ID}` seen in skill/agent bodies is a
-# DIFFERENT mechanism (plugin-loader substitution at content-LOAD time, see
-# docs/frontmatter.md), is correct there, and never reaches a hook's env.
+# DIFFERENT mechanism (plugin-loader substitution at content-LOAD time), is
+# correct there, and never reaches a hook's env.
 # The nested `:-` default keeps the legacy name as a harmless fallback should a
 # future harness set it, and both `:-` layers keep `set -u` safe -- pure
 # parameter expansion, no fork.

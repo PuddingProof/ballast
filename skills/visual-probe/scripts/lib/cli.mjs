@@ -9,6 +9,8 @@ import { parseMatrix, cellObj } from './matrix.mjs';
 import { guardUrl } from './urlguard.mjs';
 import { magnify, aHash, hamming, DEFAULT_OUT } from './capture.mjs';
 import { makeHelper } from './helpers.mjs';
+import { aggregateRung0, readSuppressionsFile } from './assertions.mjs';
+import { pngSize, planSheets, sheetHtml, measureContentBox } from './mosaic.mjs';
 import { startSession, lookSession, readSession, doSession, stopSession, firstRealPage } from './session.mjs';
 import { runServeChild, startServe, statusServe, stopServe } from './serve.mjs';
 import { runSelfTest } from './selftest.mjs';
@@ -36,7 +38,29 @@ export async function main(argv) {
   const TIMEOUT = +(opts.timeout || 30000);
   const THRESHOLD = +(opts['diff-threshold'] || 6);
 
+  // --settle MS: a dwell between "the page is ready" and the shutter, for a project whose entrance
+  // animation / theme crossfade completes AFTER load (shot) or after the state's readySignal
+  // (manifest scenario). PER capture/state, not once per invocation — every cell pays it, because
+  // each cell renders the transition again in a fresh context. Validated rather than coerced: a
+  // bare `--settle` (no value) parses as `true` above, and a silent 0 would look like the flag
+  // worked while capturing mid-transition — exactly the false-pass the flag exists to close.
+  const SETTLE = (() => {
+    if (opts.settle === undefined) return 0;
+    const n = Number(opts.settle);
+    if (opts.settle === true || !Number.isFinite(n) || n < 0) {
+      throw new Error(`--settle expects a non-negative integer of milliseconds (got ${opts.settle === true ? '(no value)' : opts.settle})`);
+    }
+    return Math.round(n);
+  })();
+
   const log = (...a) => console.error('[visual-probe]', ...a); // stderr; stdout reserved for the manifest path
+
+  // Rung-0 geometry assertions run on by default (they are ~free and SHADOW-LOGGED — see
+  // lib/assertions.mjs). `--suppressions <file>` takes the bare array or a state manifest with a
+  // top-level `suppressions` key; a scenario may declare its own on top (merged, flag first).
+  const RUNG0_ON = !opts['no-rung0'];
+  const flagSuppressions = opts.suppressions && opts.suppressions !== true
+    ? readSuppressionsFile(fs, path.resolve(opts.suppressions)) : [];
 
   // A bare target may be a URL or a filesystem path → normalize a path to a file:// URL.
   function resolveTarget(t) {
@@ -77,7 +101,7 @@ export async function main(argv) {
   }
 
   // ---------- core runner ----------
-  async function runCells({ scenario, target, matrix, crop }) {
+  async function runCells({ scenario, scenarioModule, target, matrix, crop }) {
     fs.mkdirSync(OUT, { recursive: true });
     const cells = matrix.map(cellObj);
     let effectiveCells = cells; // CDP attach mode uses a single live cell, not the matrix
@@ -85,7 +109,19 @@ export async function main(argv) {
 
     const snapshots = []; // {label, cell, buf, opts}
     const asserts = [];   // {cell, msg, value, pass}
-    const collector = { addSnapshot: (s) => snapshots.push(s), addAssert: (a) => asserts.push(a) };
+    const rung0Records = []; // {label, cell, result} — one per captured state × cell
+    const collector = {
+      addSnapshot: (s) => snapshots.push(s),
+      addAssert: (a) => asserts.push(a),
+      addRung0: (r) => rung0Records.push(r),
+    };
+    // Live view of the suppression list: a scenario (states-from-manifest) only learns its
+    // project's suppressions once it has read the manifest, i.e. after the first cell starts.
+    const suppressionsNow = () => [
+      ...flagSuppressions,
+      ...(Array.isArray(scenarioModule?.suppressions) ? scenarioModule.suppressions : []),
+    ];
+    const rung0 = { enabled: RUNG0_ON, suppressions: suppressionsNow };
 
     // Drive browser: either launch system Edge, or attach to a live app over CDP (Tier-1).
     const usingCdp = !!opts.cdp;
@@ -103,9 +139,9 @@ export async function main(argv) {
         page.setDefaultTimeout(TIMEOUT);
         const cell = { label: 'cdp-live', width: 0, height: 0, dsf: 0 };
         effectiveCells = [cell];
-        const h = makeHelper({ page, cell, url: target, allowRemote: opts['allow-remote'], collector });
+        const h = makeHelper({ page, cell, url: target, allowRemote: opts['allow-remote'], collector, rung0, settle: SETTLE });
         if (scenario) await scenario(page, h);
-        else { await page.goto(target ?? page.url(), { waitUntil: 'load' }); await h.snapshot('shot', { crop }); }
+        else { await page.goto(target ?? page.url(), { waitUntil: 'load' }); await h.dwell(); await h.snapshot('shot', { crop }); }
       } else {
         // Matrix mode: a FRESH in-memory context per cell at its {viewport, deviceScaleFactor}.
         // Fresh context per cell also defeats the headless file:// paint-cache trap.
@@ -116,34 +152,44 @@ export async function main(argv) {
           });
           const page = await ctx.newPage();
           page.setDefaultTimeout(TIMEOUT);
-          const h = makeHelper({ page, cell, url: target, allowRemote: opts['allow-remote'], collector });
+          const h = makeHelper({ page, cell, url: target, allowRemote: opts['allow-remote'], collector, rung0, settle: SETTLE });
           try {
             if (scenario) await scenario(page, h);
-            else { await page.goto(target, { waitUntil: 'load' }); await h.snapshot('shot', { crop }); }
+            else { await page.goto(target, { waitUntil: 'load' }); await h.dwell(); await h.snapshot('shot', { crop }); }
           } finally { await ctx.close(); }
         }
       }
 
-      await flush({ snapshots, asserts, cells: effectiveCells, baselineLabel, target });
+      await flush({ snapshots, asserts, rung0Records, suppressions: suppressionsNow(), cells: effectiveCells, baselineLabel, target, scenarioModule });
     } finally {
       await browser.close(); // for connectOverCDP this detaches without killing the live app
     }
   }
 
   // ---------- flush: write frames, magnify cropped ones, hash, score divergence, emit manifest ----------
-  async function flush({ snapshots, asserts, cells, baselineLabel, target }) {
+  async function flush({ snapshots, asserts, rung0Records = [], suppressions = [], cells, baselineLabel, target, scenarioModule }) {
     // A dedicated ephemeral Edge for image post-processing — keeps magnify/hash off any CDP-attached app.
     const imgBrowser = await chromium.launch(EDGE);
     try {
       const byLabel = {};
       for (const s of snapshots) (byLabel[s.label] ||= []).push(s);
 
+      // A scenario declares states it could not force by exporting `coverageHoles` — surfaced here
+      // as manifest data (never stderr-only), because a hole absorbed silently reads as a pass.
+      const coverageHoles = Array.isArray(scenarioModule?.coverageHoles) ? scenarioModule.coverageHoles : [];
+
+      // Rung-0 geometry findings — always present, never gating (see lib/assertions.mjs).
+      const { findings: rung0, unusedSuppressions } = aggregateRung0(rung0Records, suppressions);
+
       const manifest = {
         target, generatedBy: 'visual-probe',
         cells: cells.map((c) => c.label),
+        // Per-cell viewport geometry: what `compose` needs to slice a full-page frame into true
+        // viewport screenfuls (the cell LABEL is not a parseable source for preset matrices).
+        cellGeometry: cells.map((c) => ({ label: c.label, width: c.width, height: c.height, dsf: c.dsf })),
         magnify: MAGNIFY, divergenceThreshold: THRESHOLD,
-        snapshots: [], asserts, pass: true,
-        note: 'READ manifest first, then read ONLY the .xN.png magnified crops of cells flagged `diverges:true` — never the inline full-frame thumbnails (the agent Read path downscales and hides sub-pixel defects).',
+        snapshots: [], asserts, coverageHoles, rung0, rung0UnusedSuppressions: unusedSuppressions, pass: true,
+        note: 'READ manifest first, then read ONLY the .xN.png magnified crops of cells flagged `diverges:true` — never the inline full-frame thumbnails (the agent Read path downscales and hides sub-pixel defects). `coverageHoles` lists states this run could not force: they are not asserts and do not affect `pass`, but they block a clean verdict. `rung0` lists deterministic geometry findings (overlap / overflow / contrast / broken-image / offscreen / misalignment) per `<label>__<cell>`: SHADOW-LOGGED advisory data — it does not affect `pass` — pre-locating where to look; entries with `suppressed:true` were declared intended by the project. `rung0UnusedSuppressions` lists declared suppressions that matched nothing (stale, or malformed).',
       };
 
       for (const [label, snaps] of Object.entries(byLabel)) {
@@ -184,6 +230,16 @@ export async function main(argv) {
       const diverged = manifest.snapshots.flatMap((s) =>
         s.entries.filter((e) => e.diverges).map((e) => `${s.label}:${e.cell}(Δ${e.divergenceVsBaseline})`));
       log(`cells=${cells.length} snapshots=${manifest.snapshots.length} asserts=${asserts.length} pass=${manifest.pass}`);
+      if (coverageHoles.length) log(`COVERAGE HOLES (${coverageHoles.length}) — unforced states, see manifest.coverageHoles:`,
+        coverageHoles.map((c) => `${c.label} [${c.kind}]`).join(', '));
+      if (RUNG0_ON) {
+        const live = rung0.filter((f) => !f.suppressed);
+        const byCheck = {};
+        for (const f of live) byCheck[f.check] = (byCheck[f.check] || 0) + 1;
+        log(`rung0: ${live.length} finding(s)${rung0.length - live.length ? ` (+${rung0.length - live.length} suppressed)` : ''} — advisory, does not affect pass`,
+          live.length ? `— ${Object.entries(byCheck).map(([k, v]) => `${k}×${v}`).join(', ')}` : '');
+        if (unusedSuppressions.length) log(`rung0: ${unusedSuppressions.length} declared suppression(s) matched nothing — see manifest.rung0UnusedSuppressions`);
+      }
       if (diverged.length) log('DIVERGENT cells — inspect their .x' + MAGNIFY + '.png crops:', diverged.join(', '));
       const failed = asserts.filter((a) => !a.pass);
       if (failed.length) log('FAILED asserts:', failed.map((a) => `[${a.cell}] ${a.msg} (got ${JSON.stringify(a.value)})`).join(' | '));
@@ -192,6 +248,90 @@ export async function main(argv) {
     } finally {
       await imgBrowser.close();
     }
+  }
+
+  // ---------- compose: contact-sheet mosaic over an out-dir ----------
+  // Reads a finished capture dir (manifest.json + native PNGs), slices every frame into viewport
+  // segments (lib/mosaic.mjs) and re-screenshots the sheet with THIS harness — one rendering path,
+  // no image dependency. Sheets are sized under the vision pipeline's downscale ceiling; a set that
+  // does not fit yields more sheets, never a bigger one.
+  async function compose() {
+    const dir = path.resolve(positional[0] || OUT);
+    const manifestFile = path.join(dir, 'manifest.json');
+    if (!fs.existsSync(manifestFile)) throw new Error(`no manifest.json in ${dir} — compose reads a finished capture out-dir`);
+    const m = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+    const tileH = +(opts['tile-height'] || 400);
+    const maxSide = +(opts['max-side'] || 1568);
+    const groupRe = opts.group && opts.group !== true ? new RegExp(opts.group) : null;
+    const geo = new Map((m.cellGeometry || []).map((c) => [c.label, c]));
+
+    const sources = [];
+    const skipped = [];
+    for (const snap of m.snapshots || []) {
+      for (const e of snap.entries || []) {
+        const name = `${snap.label} · ${e.cell}`;
+        const file = path.isAbsolute(e.file) ? e.file : path.join(dir, e.file);
+        if (!fs.existsSync(file)) { skipped.push({ name, reason: `frame not on disk: ${file}` }); continue; }
+        // Cell geometry: the manifest's own record first, then a WxH@DSF label (inline matrices),
+        // then give up loudly — a guessed aspect would silently mis-slice every segment.
+        let g = geo.get(e.cell);
+        if (!g) { const mm = /(\d+)x(\d+)@([\d.]+)/.exec(e.cell); if (mm) g = { width: +mm[1], height: +mm[2], dsf: +mm[3] }; }
+        if (!g || !(g.width > 0) || !(g.height > 0)) {
+          skipped.push({ name, reason: `no viewport geometry for cell "${e.cell}" (no cellGeometry in the manifest and the label is not WxH@DSF)` });
+          continue;
+        }
+        const dims = pngSize(fs.readFileSync(file));
+        const hit = groupRe ? groupRe.exec(name) : null;
+        sources.push({
+          group: groupRe ? (hit ? (hit[1] ?? hit[0]) : 'ungrouped') : '',
+          name, file, href: encodeURI(path.relative(dir, file).split(path.sep).join('/')),
+          pngW: dims.width, pngH: dims.height, vw: g.width, vh: g.height, dsf: g.dsf || 1,
+        });
+      }
+    }
+    if (!sources.length) throw new Error(`no composable frames in ${dir}${skipped.length ? ` — ${skipped.length} skipped: ${skipped[0].reason}` : ''}`);
+
+    const browser = await chromium.launch(EDGE);
+    const out = [];
+    try {
+      if (opts['crop-content']) {
+        for (const s of sources) {
+          try {
+            const box = await measureContentBox(browser, fs.readFileSync(s.file));
+            if (box) s.crop = box;
+          } catch (e) { log('content-crop measure failed for', s.name, '-', e.message); }
+        }
+      }
+      for (const grp of [...new Set(sources.map((s) => s.group))]) {
+        const sheets = planSheets(sources.filter((s) => s.group === grp), { tileH, maxSide, group: grp });
+        for (const sheet of sheets) {
+          const stem = ['mosaic', grp, sheets.length > 1 ? String(sheet.index + 1) : '']
+            .filter(Boolean).join('-').replace(/[^\w.@-]/g, '_');
+          const htmlFile = path.join(dir, `${stem}.html`);
+          fs.writeFileSync(htmlFile, sheetHtml(sheet, { title: stem }));
+          const ctx = await browser.newContext({ viewport: { width: sheet.width, height: sheet.height }, deviceScaleFactor: 1 });
+          try {
+            const page = await ctx.newPage();
+            page.setDefaultTimeout(TIMEOUT);
+            await page.goto(pathToFileURL(htmlFile).href, { waitUntil: 'load' });
+            // The tiles paint from CSS backgrounds, which give no per-image handle; the sheet
+            // carries hidden <img> preloads of the same sources purely so this wait is real.
+            await page.evaluate(async () => {
+              await Promise.all(Array.from(document.images).map((i) => (i.complete ? null : new Promise((r) => { i.onload = i.onerror = r; }))));
+            });
+            const pngFile = path.join(dir, `${stem}.png`);
+            fs.writeFileSync(pngFile, await page.screenshot({ clip: { x: 0, y: 0, width: sheet.width, height: sheet.height } }));
+            out.push({ group: grp || null, sheet: sheet.index + 1, of: sheets.length, file: pngFile, html: htmlFile,
+              width: sheet.width, height: sheet.height, tiles: sheet.tiles.length });
+          } finally { await ctx.close(); }
+        }
+      }
+    } finally { await browser.close(); }
+
+    for (const s of out) log(`sheet ${s.file} — ${s.width}×${s.height}, ${s.tiles} tile(s)${s.group ? ` [${s.group}]` : ''}`);
+    for (const s of skipped) log('SKIPPED', s.name, '-', s.reason);
+    log('the mosaic is a ROUTER, not a verdict: per tile clear-or-escalate, and read the escalated cell at full resolution before any verdict.');
+    console.log(JSON.stringify({ sheets: out, skipped }, null, 2));
   }
 
   try {
@@ -207,10 +347,15 @@ export async function main(argv) {
       await runCells({ scenario: null, target, matrix: parseMatrix(opts.matrix), crop: opts.crop });
     } else if (cmd === 'run') {
       if (!positional[0]) throw new Error('run requires a scenario file: probe.mjs run <scenario.mjs> --url <target>');
+      // Leaf mode: normalize the flag into the env the bundled manifest scenario already reads its
+      // config from (VISUAL_STATES*), so the flag and the env var are one switch, not two.
+      if (opts['skip-drive-hooks']) process.env.VISUAL_STATES_SKIP_DRIVE_HOOKS = '1';
       const mod = await import(pathToFileURL(path.resolve(positional[0])).href);
       if (typeof mod.default !== 'function') throw new Error('scenario must default-export  async (page, h) => {}');
       const target = opts.url ? guardUrl(resolveTarget(opts.url), opts['allow-remote']) : undefined;
-      await runCells({ scenario: mod.default, target, matrix: parseMatrix(opts.matrix), crop: opts.crop });
+      await runCells({ scenario: mod.default, scenarioModule: mod, target, matrix: parseMatrix(opts.matrix), crop: opts.crop });
+    } else if (cmd === 'compose') {
+      await compose();
     } else if (cmd === '__serve-child') {
       // hidden: the detached server process spawned by `serve start` (see lib/serve.mjs)
       runServeChild({ root: positional[0], port: +positional[1] });
@@ -262,7 +407,7 @@ export async function main(argv) {
         process.exit(2);
       }
     } else {
-      log('usage: probe.mjs <doctor | shot <url> | run <scenario.mjs> | serve … | session …> [flags] — see file header or --help');
+      log('usage: probe.mjs <doctor | shot <url> | run <scenario.mjs> | compose <out-dir> | serve … | session …> [flags] — see file header or --help');
       process.exit(2);
     }
   } catch (e) {

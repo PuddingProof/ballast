@@ -74,6 +74,9 @@ contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
 # The distinctive sentence both the dynamic and static paths must share verbatim (case 5).
 DISTINCTIVE='Dispatch the mechanical build steps to `plan-executor` subagents'
+# The frontend/visual pointer clause (2026-07-28 visual-stack redesign): points plan-touches at
+# the workflow skill by name, at implementation START -- not the reviewer agent, not done-time.
+VISUAL_CLAUSE='load `visual-verification-gate` now, at implementation start'
 
 SID="abc123def456"
 
@@ -134,6 +137,13 @@ if contains "$dynamic_out" "$DISTINCTIVE" && contains "$static_out" "$DISTINCTIV
   pass "5 anti-drift: distinctive sentence present in both dynamic and static outputs"
 else
   fail "5 anti-drift" "dynamic=[$dynamic_out] static=[$static_out]"
+fi
+
+# --- 5b: visual-stack redesign -- frontend/visual pointer clause present in both paths ----------
+if contains "$dynamic_out" "$VISUAL_CLAUSE" && contains "$static_out" "$VISUAL_CLAUSE"; then
+  pass "5b visual pointer: frontend/visual clause present in both dynamic and static outputs"
+else
+  fail "5b visual pointer" "dynamic=[$dynamic_out] static=[$static_out]"
 fi
 
 echo

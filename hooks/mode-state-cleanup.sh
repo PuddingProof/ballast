@@ -26,7 +26,7 @@
 # unavailable — stranding the statusline mode chip until the renderer's TTL aged it out. The nested
 # `:-` keeps the legacy name as a harmless fallback if a future harness sets it. NOT related to the
 # `${CLAUDE_SESSION_ID}` substitution used in skill/agent bodies: that is a load-time plugin-loader
-# mechanism (docs/frontmatter.md), correct as-is, and never reaches a hook's environment.
+# mechanism, correct as-is, and never reaches a hook's environment.
 #
 # NO STDOUT, EVER: every other conditional-fire hook in this repo emits a systemMessage so a fire
 # is never silent (see hooks/CLAUDE.md's "every conditional fire is user-visible" rule) -- this

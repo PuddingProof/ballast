@@ -20,6 +20,12 @@
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" dev-process-nudge",
             "timeout": 15,
             "statusMessage": "Checking for leftover project processes..."
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" origin-sweep",
+            "timeout": 20,
+            "statusMessage": "Reaping orphaned visual origins..."
           }
         ]
       }
@@ -55,6 +61,12 @@
       {
         "matcher": "Bash|PowerShell",
         "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" process-lifecycle-guard",
+            "timeout": 5,
+            "statusMessage": "Checking sub-agent process lifecycle..."
+          },
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" package-install-guard",
@@ -108,6 +120,12 @@
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" plan-authoring",
             "timeout": 5,
             "statusMessage": "Checking for plan-file authoring..."
+          },
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" visual-arm",
+            "timeout": 5,
+            "statusMessage": "Checking for frontend touch (visual arming)..."
           }
         ]
       },

@@ -1,77 +1,105 @@
 ---
 name: visual-verification-gate
 description: >-
-  Use right before calling frontend work done — fires when completion language ("done", "ship
-  it", "hand it back", "looks good", "that's everything", "ready for you") meets a
-  frontend-file signal: the session touched .tsx/.jsx/.svelte/.vue/.css/.scss/.html or any
-  component/style/template file.
+  The end-to-end workflow for any session with visual changes: arming, the one session origin the
+  main session owns, the in-loop see-and-fix reflex, the two-rung done gate (a cheap glance by
+  default, the deep instrument only on named triggers), verdict semantics, the leaf dispatch brief,
+  and close-out. Load it EARLY — at the first frontend touch, not at "done".
 when_to_use: >-
-  Use even when the change seems small or purely cosmetic — a one-line style tweak ships a
-  visual defect as easily as a rebuild — and even when tests, type checks, and code review are
-  all green. Arms ONLY on the frontend signal: a session that touched no frontend files never
-  pays for this. Not integration-gate (that owns the seams of a multi-part diff) and not
-  visual-probe (that owns how to drive and capture the browser); this skill owns the moment
-  visual work is about to be declared done.
+  Load the moment a session acquires visual work: an arming injection says "frontend touched — load
+  the visual workflow skill now"; you are about to edit or plan a component/style/template change;
+  you are about to dispatch anything that will look at a UI; or you are about to call frontend work
+  done. Also on the tell — you are typing a hedged caveat onto a frontend completion ("worth a quick
+  visual check on your end"), which IS this gate firing. A main-session skill: it decides which
+  check runs, who starts what, and what a verdict obliges. Not visual-probe (that owns driving and
+  capturing a browser, and a dispatched leaf never loads it), not integration-gate (the seams of a
+  multi-part diff). Armed only by frontend work — a session that touches none never pays for this,
+  and a load with no visual work in sight is a mis-fire: say so in a line and move on.
 ---
 
 # Visual Verification Gate
 
-Frontend work is not done until the rendered pixels have been seen — in their worst states — by an eye that wants to find defects. Every proxy in between certifies something else: types certify shapes, tests certify behavior, code review certifies source. None of them ever looks at a frame. The watched failure is exact: rigorous sessions with green tests, code review sweeps, and even real capture matrices still shipped contrast failures, overlapping elements, and clipped text — because for visual work the competence loop (write → run → **read result** → correct) is open by default, and when it closes it runs on self-selected happy-path states while a green proxy check launders into "verified."
+Frontend work is not done until the rendered pixels have been seen, in their worst states, by an eye that wants to find defects. Types certify shapes, tests certify behavior, code review certifies source — none of them ever looks at a frame.
 
-**The gate:** two tiers, both mandatory once the session has touched frontend files. Tier 1 is a reflex you run while building; Tier 2 is an independent verdict you obtain before "done." Passing Tier 1 does not waive Tier 2 — in the watched failures the builder *looked* and still shipped, because a builder's own look is confirmation-biased by construction.
+## 1. Arm — you are here early, on purpose
 
-## When it arms and fires
+You load at the *first frontend touch*, not at "done" — everything below assumes edits are still ahead of you. Loaded late? Skip to the done gate, running setup first if no origin exists. What never waits: catching yourself writing "worth a quick visual check on your end" means you have located an unlooked-at surface and are about to ship it to the user's eyes instead of yours. Look now. Same tell, no hedge: a completion written with zero captures taken this turn and no verdict to cite — the UI described in the future tense, from the source you edited rather than from a frame.
 
-- **Arms** only on the frontend signal: the session touched `.tsx`/`.jsx`/`.svelte`/`.vue`/`.css`/`.scss`/`.html` or component/style/template files. Backend and CLI sessions pay nothing — if it didn't arm, stop reading.
-- **Fires** when an armed session reaches completion language: done, ship it, hand it back, looks good, that's everything.
-- **The tell — treat this as the gate firing:** you are typing a hedged caveat onto a frontend completion ("worth a quick visual check on your end", "you may want to eyeball the dark theme"). That sentence means you have located an unlooked-at surface and are about to ship it to the user's eyes instead of yours. Run the gate on it now.
+## 2. Setup — one origin, main session, once
 
-## Why everything short of the gate is blind — by construction
+Lazily, at first need, and never again: **one origin per session, started here**. A dispatched leaf is hard-denied process lifecycle at the root — it starts, backgrounds, and kills nothing — so an origin it wasn't handed is a `blocked` verdict, not its problem to solve.
 
-**Host-side gates cannot see runtime.** Type checks, unit tests, and static code review — at any fan-out size — reason about source, and a visual defect is a property of the *rendered frame*: composited layers, computed styles, actual font metrics, real content widths. A static review of rendering code, however many reviewers you throw at it, examines a different artifact than the one the user sees; a 21-agent static review passed a one-property rendering bug that a single live screenshot caught. The corollary is directional: when a change touches a rendering mechanism, it goes to the live visual gate *fast* — growing the static review is adding blind readers, not coverage.
+- **Start it.** Static target → the probe skill's bundled isolated server (`serve` mode). A real app → the project's OWN dev-server script, from its existing tooling. Never point at the user's live dev server; probe's serve body owns that hazard and the reach-it recipe per frontend type.
+- **Record it** the moment it is up, so close-out and the dead-session sweep can both find it: `ballast-visual-origin record --session-key ${CLAUDE_SESSION_ID} --url <url> --out-dir <dir> --pid <pid>`
+- **Session-scope the out-dir.** A shared temp dir is how one session's teardown wipes a concurrent session's evidence.
+- **Clear preflight before the first dispatch** (probe's `preflight`), and fold every tooling/server permission into **at most one** authorization ask, attended, here — an unattended leaf cannot answer an interactive gate and must never try. OS-level dialogs (firewall, per-command prompts) are an accepted residual.
 
-**The builder's own look cannot gate itself.** It runs on states the builder chose — the ones expected to work — so functional coverage masquerades as visual coverage (a script *opened* every overlay, but the screenshot fired *after they closed*: driven, never seen), and coverage is silently capped by forceability (a state with no seam to force it never appears in any frame, for builder or reviewer — see the state contract in the visual-probe skill's references). The builder's look is necessary hygiene; it is not evidence.
+## 3. Build loop — capture, look, fix
 
-## Tier 1 — the in-loop see-and-fix reflex
+At loop boundaries — not per keystroke, not once at the end — force the state you just touched: worst content, both themes, any overlay over it, **composed together** rather than one axis at a time (probe's `shot` and state-contract bodies own the how). Then *look at the capture* and fix objective defects in the same turn: overlap, clipping, contrast, bad wrap. A visual edit you never rendered is an edit you made blind — and your own look is hygiene, not evidence: it runs on the states you expected to work, so it never stands in for the gate below.
 
-While building, close the loop on every visual change *in the same turn you make it*: force the state you just touched — worst content, both themes, any overlay that sits over it, composed together rather than one at a time (the visual-probe skill's "Plan the capture matrix" section owns the how; its state contract owns the forcing vocabulary) — then **look at the capture**, and fix objective defects on the spot: overlap, clipping, contrast, bad wrap. Mid-turn, before the user ever sees them. A visual edit you never rendered is an edit you made blind.
+## 4. Done gate — the ladder
 
-## Tier 2 — the independent gate
+**Default: the glance.** Dispatch the visual-glance agent — a small worst-case cell set, bounded reads, minutes. That is the check for ordinary visual work: a tweak, a component, a fix, a re-verify. **Escalate to the instrument** (the visual-reviewer agent) only on a named trigger: **new surface, redesign, audit, a measured-AA question, state-matrix/DSF coverage, or a glance that returns `escalate`.** No trigger matches → no instrument run. Both rungs get the dispatch brief below, and a re-verify is the same rung again, carrying the prior findings.
 
-Before declaring done, dispatch the visual-reviewer agent with the target, the intent, and any states you know matter — it derives its own adversarial matrix on top of them, which is the point: fresh eyes over states *you didn't pick*. When design intent or tokens exist — from the frontend-design plugin or any spec — pass them as the reviewer's INTENT input: taste authors the tokens, the reviewer enforces them. The reviewer is a long-running leaf that consumes no other gate's output: when other close-out gates are pending on the same frozen diff (a code-review fanout, an integration-gate dispatch), launch it alongside them in one wave and adjudicate the merged findings — queuing it after them buys nothing but wall-clock.
+### Verdicts — canonical here
 
-**Size the dispatch to the change — the reviewer's mode input, and yours to set.** A scoped change to one component, drawer, or flyout dispatches a **targeted** review naming that surface (the reviewer composes its worst corner plus a couple of full-window regression cells — a handful of cells, not a 30-permutation sweep); a new surface, redesign, or first contract adoption dispatches **full**; a re-verify after fixes dispatches **delta** with the prior findings. Sizing down is not skipping: a targeted review still composes the worst corner for the surface it covers. The reviewer may escalate scope on evidence (shared token, global style) — never pre-shrink a full-sized change to dodge the cost.
+Glance emits `pass | needs_work | escalate | blocked`; the instrument emits `pass | pass_partial | needs_work | needs_fixture | blocked`. An unforceable state the glance finds rides its `escalate`/`blocked` reason. The agent bodies carry only their per-verdict *earning criteria*; what a verdict obliges **you** lives here alone:
 
-**Fanout — full reviews only, capped at 3.** A full review over multiple routes or a broad checklist may split across 2–3 parallel reviewer dispatches, each assigned a disjoint facet (a route subset, or checklist facets like layout/overflow vs contrast/a11y vs interaction) with the same target and intent. You own the shared origin: start one review-dedicated server (or `probe serve`), pass its URL as each reviewer's Origin input, stop it after they all return — parallel reviewers must never each boot their own. Merge by worst-verdict-governs; concatenate scope lines and union the blind spots — a facet nobody was assigned is a hole, not a pass. Never split a targeted or delta review: dispatch overhead exceeds the win.
-
-Then refuse "done" until the verdict allows it:
-
-- **`pass`** — declare done.
-- **`pass_partial`** — declare done only with the verdict's named scope carried **verbatim** into your handoff. A pass over a reduced scope silently widened into "verified" is the false pass this gate exists to kill.
-- **`needs_work`** — the authoring split governs: the reviewer owns the evidence-backed findings; you own triage, the fixes, and the done-call. Fix, then **re-dispatch the reviewer for a delta review** — never self-certify your own fix visually, for the same confirmation-bias reason the gate exists.
-- **`needs_fixture`** — not a failure to bury and not a pass to round up. It means the project lacks a seam: a state nobody — builder or reviewer — can force into a frame. The missing fixture or marker is *work*: surface it in the handoff as such, citing the state contract (`${CLAUDE_PLUGIN_ROOT}/skills/visual-probe/references/state-contract.md`).
-- **`blocked`** — a harness problem. Fix the environment and re-dispatch; a blocked review is not a review.
-
-## Rationalizations — and why each is wrong
-
-Each excuse below is a watched class — said by an agent that then shipped a visual defect.
-
-| The excuse | Why it doesn't hold |
+| Verdict | Your response |
 |---|---|
-| "Shipped and verified" (off a happy-path capture matrix) | The matrix enumerated the states expected to work. Defects live in the composed corners it never included — a matrix's greenness is capped by its worst-covered cell, not its cell count. |
-| "Worth a quick visual check on your end." | You are shipping the risk and outsourcing the look to the user. If you can name the check, you owe the look — that hedge IS the gate firing. |
-| "The probe / the tests passed." | Functional green certifies what was *driven*, not what was *seen*. A script opened every overlay and screenshotted after they closed — every assertion passed, no overlay was ever in a frame. |
-| "I reviewed the code paths for the styling change." | Static review examines source; the defect lives in the rendered frame. A 21-agent static review passed a one-property rendering bug a single live screenshot caught. Rendering change → live gate, fast. |
-| "The matrix covered 8 states × 3 sizes." | One-hot coverage — each axis varied alone. The shipped defects sat in the composed cells (overlay × opposite theme × worst content × small viewport) the matrix never contained. |
-| "It rendered fine when I opened it." | Default state, default theme, happy content — the single least likely cell to break. Everything the gate exists for lives in the states you didn't force. |
-| "A full review is overkill for this one-line tweak." | Correct — that's what the targeted mode is for. The gate scales down to a handful of worst-corner cells on the touched surface; it never scales to zero. |
+| `pass` | Declare done. |
+| `pass_partial` | Declare done only with the verdict's named scope carried **verbatim** into your handoff. A reduced scope silently widened into "verified" is the false pass this workflow exists to kill. |
+| `needs_work` | Fix, then delta re-verify — never self-certify. |
+| `needs_fixture` | The project lacks a seam — a state nobody, builder or reviewer, can force into a frame. Surface the missing fixture or marker as *work*, citing the probe skill's state contract. |
+| `blocked` | An environment problem (no usable origin, failed preflight, missing tooling). Fix the environment and re-dispatch — a blocked run is not a review. |
+| `escalate` | **You adjudicate**, against the trigger list above. Authorize the instrument run out loud, naming its cost — an orchestrator decision, neither a silent default nor a mandatory user ping. No trigger matches → act on the evidence the glance already gave you and say so. |
 
-## Red flags — you're about to skip the gate
+Parallel instrument facets (full mode only, cap 3, all sharing the one origin): worst verdict governs, scope lines concatenate, blind spots union — never split targeted/delta runs.
 
-- You're declaring frontend work done with **zero captures in the turn**.
-- You're describing what the UI "should look like" — future tense, from source — instead of what a capture shows.
-- You're writing a verdictless completion: "the changes are complete," with no reviewer verdict behind it.
-- You're treating your own green forced-state run over states *you* chose as if it were the reviewer's derived coverage. Same tool, different matrix — the reviewer composes the worst corner; you enumerated your expectations.
-- You're postponing the look to the user's live test. Their first render must not be the first render.
+**Diagnosing a verdict is leaf work.** A finding that needs interrogation — a re-capture under other conditions, deterministic color sampling, native-density crops — goes to a bounded follow-up leaf carrying the frames, the expectation, and the method; you adjudicate its report. Run in-line, that churn multiplies main-loop turns against a full context window — the workflow's dominant observed cost. A check of a command or two stays in-line; there, dispatch ceremony costs more than it saves.
 
-The meta-test, if you're tempted to negotiate: a frontend change nobody adversarial has seen rendered has not been verified — it has been compiled, tested, and *imagined*. The reviewer's verdict is the first time anyone looks at what you built in the states you didn't pick.
+## 5. Close-out
+
+Before the postmortem is committed: `ballast-visual-origin teardown --session-key ${CLAUDE_SESSION_ID}` (`list` first to see what this session owns) — it kills only fingerprint-verified entries this session recorded, then clears the ledger. Stop any co-drive/probe session you opened too. A dead-session sweep reaps what a crashed session left behind: a backstop, never your reason to skip teardown.
+
+## When a defect escapes — the ratchet
+
+A defect that shipped, or one a review missed, earns a **machine-checkable artifact, never another prose bullet** — prose is exactly what already failed to move the defect rate. Take the first shape that expresses it:
+
+1. **Fixture row** — a worst-case row in the project's state manifest: the cell nobody thought to force.
+2. **Rung-0 assertion** — the defect is geometry, contrast, or a missing asset.
+3. **Matrix cell** — the matrix is cost-budgeted, so adding one means justifying it or evicting one.
+4. **Per-fixture checklist line** — taste-class findings only, loaded when that fixture is captured. Quota'd: each must say why no shape above expresses it.
+
+A new prose *rule* is legal only for a genuinely new failure **class**, through the durable-docs gate. Every artifact names its provenance (the postmortem report id), so the prose it subsumes can later be **deleted** — instruction surface has to go net-negative, not just flat.
+
+## The dispatch brief
+
+Every visual dispatch carries this. Fill the angle-bracket fields; change nothing else.
+
+```
+Origin (REQUIRED): <url> — already running and main-session-owned. Use it. Start, stop, and signal
+  nothing; leave it running at close-out. No usable origin → return `blocked` naming it, and stop.
+Out-dir: <abs path> — pass `--out <that dir>` so the frames survive for me.
+Target + intent: <routes / surface> — <one line of what it must be>. Small-text color questions are
+  not full-frame-adjudicable: answer them from a native-density crop or deterministic sampling, or
+  report them indeterminate.
+Settle: <ms> (optional — project post-ready animation/crossfade window; pass `--settle <ms>`)
+Harness: node ${CLAUDE_PLUGIN_ROOT}/skills/visual-probe/scripts/probe.mjs — run `preflight` first
+  (exit 1 → `blocked` with its output verbatim). Manifest-driven capture MUST pass
+  `--skip-drive-hooks`; states skipped that way land in manifest.json's `coverageHoles` as
+  `drive-hook-skipped` — read manifest.json before any frame, and carry every hole in your verdict
+  rather than absorbing it. Do not load the visual-probe skill; this brief is your contract.
+You never install anything (no npm/pip/npx/dlx/bunx — the download precedes the answer) and never
+  start, background, or kill a process. Missing tooling/service/origin = `blocked` or a named
+  coverage gap: report it and finish with what exists.
+```
+
+A leaf reporting a lifecycle-guard false positive is reporting, not asking — it is denied every route around the guard on purpose. If its report holds up, the attended main session may `touch <home>/.cache/ballast-lifecycle/valve-<session-key>` and re-dispatch it; a leaf never creates that valve.
+
+## Three rationalizations, all watched
+
+- *"The tests / the probe passed."* Functional green certifies what was **driven**, not what was **seen** — a script can open every overlay and screenshot after they close.
+- *"I reviewed the code paths for the styling change."* Static review examines source; the defect is a property of the rendered frame. More static readers is more blind readers.
+- *"A full review is overkill for this one-line tweak."* Correct — that is what the glance is for. The ladder scales down to a handful of cells; it never scales to zero.

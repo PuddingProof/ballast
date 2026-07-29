@@ -1,26 +1,48 @@
 # Changelog
 
-Consumer-visible changes to the ballast plugin. Changes land under **[Unreleased]** in the same commit that makes them; a release rotates the section into a dated version heading (versions = `.claude-plugin/plugin.json`). Internal dev churn is not tracked here.
+Consumer-visible changes to the ballast plugin. Changes land under **[Unreleased]** in the same commit that makes them; a release rotates the section into a dated version heading (versions = `.claude-plugin/plugin.json`). Internal dev churn is not tracked here. **Bullets are terse one-liners — what changed, not why; rationale lives in the commit message** (style anchor: Claude Code's own CHANGELOG).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-07-29
+
+Visual-stack redesign: a two-rung review ladder with a cheap default, root-enforced process-lifecycle hygiene, orchestrator-owned origins, and one workflow skill as source of truth.
+
+- Added `visual-glance` agent: cheap code-blind default rung, hard-capped (≤10 image reads / ≤20 tool calls / ≤10 min wall-clock), origin required; `visual-reviewer` becomes the opt-in escalation rung
+- Rebuilt `visual-verification-gate` as the workflow owner: loads at the first frontend touch (not at "done"), five stages, canonical verdict table, copy-paste leaf dispatch brief
+- Added `process-lifecycle-guard` hook: sub-agents are hard-denied process detachment, standing-service launches, and all signalling, with a main-session release valve
+- Added visual-origin ledger + `origin-sweep` SessionStart hook: sessions record the origins they start; the sweep reaps only fingerprint-verified orphans of verifiably dead sessions
+- Added `visual-arm` PostToolUse hook: the first frontend-file touch injects a one-line load prompt for the workflow skill (main loop only, once per session)
+- Added rung-0 deterministic in-page geometry assertions (shadow-logged), with a manifest `suppressions` channel
+- Added `probe.mjs compose`: contact-sheet compositor — the glance's overflow router
+- Added `--settle MS` capture flag: post-ready dwell for animations/crossfades that finish after load/readySignal
+- Added `--skip-drive-hooks` (mandatory in leaf briefs): project drive hooks are never imported; skipped states report in the always-present `coverageHoles`
+- Restructured visual-probe SKILL.md into per-mode paths (`shot | drive | states | serve | co-drive | doctor`); deleted every self-serve-origin instruction
+- visual-reviewer: Origin and out-dir are now required inputs; dropped "Use PROACTIVELY"; matrix doctrine deduped to `state-contract.md`
+- visual-glance: small-text ink color is never adjudicated from a full-frame read — crop or report indeterminate (stated at the dispatch-brief level too)
+- visual-verification-gate: diagnosing a verdict (re-capture, sampling, crops) is dispatched leaf work, not in-line churn
+- Fixed package-install-guard: quoted shell-wrapper bodies (`bash -c "npm install …"`) no longer evade the gate
+- Fixed process-lifecycle-guard: grouping punctuation (`(kill -9 …)`, `{ pkill … }`) no longer hides the verb
+- Defect-to-invariant ratchet (shadow-first): an escaped visual defect earns a machine-checkable artifact, never another prose bullet; harness-sweep logs `WOULD-REJECT (ratchet shadow)` on prose-only visual recs
+- skill-forge: live iteration loop for pipeline skills (`references/live-iteration.md`)
+- Conciseness pass across the redesigned stack (bodies −3%, hook-injected texts −5–29%); pointer sync in plan-handoff, subagent-fanout, README
+- Fixed visual-glance/visual-reviewer frontmatter: an unquoted `: ` broke the YAML parse, so both agents loaded with empty metadata (model/effort pins silently dropped)
+
 ## [0.8.4] — 2026-07-28
 
-- Code-comment guidance withdrawn pending a conventions rework: the principles block no longer tells agents to comment generously, plan-executor no longer pins comment density to the surrounding file, and durable-docs no longer routes guard provenance into code comments. Deliberately leaving the question unstated — the executor rule on comment *content* (carry the given why; no fabricated rationale, diff restatement, or step-by-step narration) is unchanged.
-
-- plan-executor ladder restructured around Opus 5: the default `plan-executor` is now Opus at medium effort (was Sonnet high); `plan-executor-light` (Sonnet medium) replaces `-medium`; `plan-executor-hard` (Opus high) replaces `-opus`.
-- Hook dispatcher: the resolved Python interpreter is now cached in the user home instead of re-probed on every fire. The probe measured ~1.5 s of a 2.4 s hook fire under load and was re-derived identically four times per Bash tool call — the amplifier behind observed 5 s hook timeouts. The probe's own bound also drops below the hook budget it runs inside, so a hanging candidate can no longer consume the whole budget before the hook is dispatched.
-- git-commit-guard: fast-path prefilter — a Bash/PowerShell call that never mentions git no longer starts a Python interpreter just to find that out.
-- Fire ledger: the `sid=` field populates again. It logged empty in every line for 15 days — the harness sets `CLAUDE_CODE_SESSION_ID` in hook processes, not `CLAUDE_SESSION_ID`. The same wrong name silently disabled SessionEnd mode-chip cleanup's fallback path, which is fixed with it.
-
-- package-install-guard: installs and remote-execs from a **sub-agent** are now hard-denied instead of prompting — the install contract is the main session's alone, and the deny reason tells the leaf to report the missing tool as a coverage gap rather than retry. Main-session behaviour and the local dev-tool allowlist are unchanged; unknown caller ⇒ ask, as before.
-- visual-reviewer: effort high → medium; hard no-install boundary (report the gap, never fetch tooling — even `--version` probes); dev-server startup steered to the project's existing scripts/binaries; bespoke pixel-metrics require a known-positive control frame before their verdict counts; caller wall-clock caps are hard budgets. Checklist B gains two flex-sizing detection cues: a replaced child's synthesized baseline as a cause of alignment drift, and row over-subscription from a `min-width` floor plus `justify-content` going inert once any sibling grows.
-- subagent-fanout injection: new NO INSTALLS IN LEAVES and SPEND CHECKPOINT bullets.
-- plan-handoff: dispatch bullet on budgeting a wave — an explicit wall-clock/scope cap for any long-running or exploratory leaf, plus a take-stock checkpoint when the first wave lands.
-- durable-docs: gate 6 now checks the target dir's own conventions file, not just the global gate.
-- skill-forge: new AMBIENT-ABLATION ship check (cut skill lines the ambient stack already injects).
-- session-postmortem: the subagent roster now carries each dispatch's own orchestrator-authored label, plus a nested-dispatch marker, so same-agentType rows are finally distinguishable.
-- session-postmortem: a session shipping owner-facing work (visual/aesthetic, wording, taste calls) that the owner hasn't adjudicated now carries a pending-owner-verdict annotation on the gauge instead of reading clean.
+- Withdrew code-comment guidance pending a conventions rework (the comment-*content* rule is unchanged)
+- Restructured the plan-executor ladder around Opus 5: default = Opus medium; `-light` (Sonnet medium) replaces `-medium`; `-hard` (Opus high) replaces `-opus`
+- Hook dispatcher: the resolved Python interpreter is cached instead of re-probed per fire — fixes the observed 5 s hook timeouts
+- git-commit-guard: fast-path prefilter — non-git commands no longer start a Python interpreter
+- Fixed the fire ledger's empty `sid=` field (wrong env-var name); the same fix restores SessionEnd mode-chip cleanup's fallback
+- package-install-guard: installs/remote-execs from a sub-agent are hard-denied instead of prompting (main-session behaviour unchanged)
+- visual-reviewer: effort high → medium; hard no-install boundary; dev-server startup steered to project scripts; pixel-metrics require a known-positive control frame; two new flex-sizing detection cues
+- subagent-fanout injection: new NO INSTALLS IN LEAVES and SPEND CHECKPOINT bullets
+- plan-handoff: wave budgeting — wall-clock/scope caps for long-running leaves plus a first-wave checkpoint
+- durable-docs: gate 6 also checks the target dir's own conventions file
+- skill-forge: new AMBIENT-ABLATION ship check
+- session-postmortem: subagent roster rows carry the orchestrator's own dispatch labels + a nested-dispatch marker
+- session-postmortem: owner-facing work the owner hasn't adjudicated gets a pending-owner-verdict annotation instead of reading clean
 
 ## [0.8.3] — 2026-07-24
 

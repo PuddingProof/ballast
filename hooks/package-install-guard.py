@@ -92,6 +92,16 @@ if not cmd.strip():
 # --- strip heredoc bodies + quoted strings + $() subshells so verbs inside
 #     literals / message bodies don't fire -----------------------------------
 s = cmd
+# Shell wrappers whose quoted body IS the real command, unwrapped BEFORE the quote strippers
+# below -- otherwise `bash -c "npm install evil-pkg"` has its whole body erased as a quoted
+# literal and the install verb never reaches INSTALL/EXEC.  Back-ported from
+# process-lifecycle-guard.py, which hit this laundering class first for its own verb set.
+UNWRAP = re.compile(
+    r"\b(?:bash|sh|zsh|dash|pwsh|powershell(?:\.exe)?|cmd(?:\.exe)?)\b"
+    r"[^'\"]{0,40}?\s(?:-c|-Command|/c|/C)\s+(['\"])(.*?)\1",
+    re.IGNORECASE | re.DOTALL,
+)
+s = UNWRAP.sub(lambda m: " " + m.group(2) + " ", s)
 # Heredoc bodies (<<DELIM ... DELIM, incl. <<'DELIM' / <<"DELIM" / <<-DELIM) are
 # raw text, not command -- a `git commit -F - <<'EOF' ... EOF` message that only
 # DESCRIBES an install must not fire the gate. Strip them FIRST: a quoted

@@ -16,8 +16,15 @@
 //   VISUAL_STATES=/abs/path/to/visual-states.json node scripts/probe.mjs run scenarios/states-from-manifest.mjs [--url http://origin] [--matrix M]
 //   (or cd to the project root and omit VISUAL_STATES if .claude/visual-states.json lives there)
 //
-// `--url` (h.url) overrides the manifest's advisory `baseUrl` — the invoker owns the origin
-// (`probe.mjs serve start`, or its own dev instance; never the user's live server).
+// `--url` (h.url) overrides the manifest's advisory `baseUrl` — the origin is handed in by the
+// caller that owns it (the orchestrator's session origin), never resolved here.
+//
+// Leaf mode — `--skip-drive-hooks` (or `VISUAL_STATES_SKIP_DRIVE_HOOKS=1`): a manifest `drive` hook
+// is PROJECT-authored code this scenario would dynamically import and run inside the probe's own
+// node process — an arbitrary-code entry point on the default capture path. With the flag set the
+// hook is never imported, every state that needs one is SKIPPED (capturing it unforced would
+// capture the wrong state and launder it into a green cell), and each skipped state is reported as
+// an unforceable coverage hole — see `coverageHoles` below.
 //
 // Enumeration policy (default, per route): the "param axes" are every manifest axis EXCEPT
 // `overlay` (the flag axis, enumerated separately below) and any `outOfBand` axis like viewport
@@ -32,6 +39,10 @@
 // (every param axis's values crossed × {no overlay, each overlay flag in turn}) only behind
 // `VISUAL_STATES_FULL=1` — still one overlay at a time, never multiple overlays composed
 // simultaneously (not evidenced anywhere in the contract).
+//
+// A manifest's top-level `suppressions` array ({assert, selector, reason}) is forwarded to the
+// harness's rung-0 geometry assertions, which flag the matching findings as intended rather than
+// dropping them (see scripts/lib/assertions.mjs).
 //
 // `cannotForce` entries ({axis,value,reason}) are authoritative holes: any generated state that
 // would force one of them is skipped and named on stderr — never silently attempted, never
@@ -234,13 +245,47 @@ function enumerateStates(axes, readySignal, full) {
 // Exported for tests (test_states_enum.sh); the default export below is the scenario itself.
 export { enumerateStates, overlayFlags };
 
+// Coverage holes this run could not force. The harness (lib/cli.mjs) copies this array into
+// manifest.json's `coverageHoles`, so a hole is DATA in the output a reader already reads first —
+// not a stderr line they can miss. Entries: {label, kind: 'cannotForce'|'drive-hook-skipped',
+// reason}. Module-level because the scenario runs once per matrix cell; addHole dedupes by
+// label+kind so a hole is reported once per run, not once per cell.
+export const coverageHoles = [];
+
+// Rung-0 suppressions declared by the project manifest (frozen schema: a top-level
+// `suppressions: [{assert, selector, reason}]`). Module-level and repopulated at the start of every
+// run for the same reason coverageHoles is module-level — the harness holds a LIVE reference to
+// this array and reads it at shutter time, after this scenario has loaded the manifest. Declare
+// suppressions in the manifest, never mid-run: a rule appended after the first capture cannot
+// suppress the findings that capture already produced.
+export const suppressions = [];
+
+const holeKeys = new Set();
+function addHole(hole) {
+  const key = `${hole.label}|${hole.kind}`;
+  if (holeKeys.has(key)) return;
+  holeKeys.add(key);
+  coverageHoles.push(hole);
+}
+
 export default async (page, h) => {
   const { manifest, manifestDir } = loadManifest();
   const full = process.env.VISUAL_STATES_FULL === '1';
   const base = h.url || manifest.baseUrl;
   if (!base) throw new Error('no origin to probe — pass --url or set "baseUrl" in the manifest');
 
-  const cannotForce = new Set((manifest.cannotForce || []).map((e) => `${e.axis}:${e.value}`));
+  // Both output channels reset per run, for the same reason: production imports this module once
+  // per process, but anything that invokes it twice (a batch mode, a test harness reusing the
+  // import) would otherwise carry a prior manifest's holes into this run's manifest.json as
+  // findings nothing in this run produced.
+  suppressions.length = 0;
+  for (const s of manifest.suppressions || []) suppressions.push(s);
+  coverageHoles.length = 0;
+  holeKeys.clear();
+
+  const skipDriveHooks = process.env.VISUAL_STATES_SKIP_DRIVE_HOOKS === '1';
+  const cannotForceList = manifest.cannotForce || [];
+  const cannotForce = new Set(cannotForceList.map((e) => `${e.axis}:${e.value}`));
   const driveCache = new Map();
   async function resolveDrive(spec) {
     if (driveCache.has(spec)) return driveCache.get(spec);
@@ -253,30 +298,53 @@ export default async (page, h) => {
   }
 
   const skipped = [];
+  const driveSkipped = [];
   // Route-independent, so enumerate once — not per route.
   const states = enumerateStates(manifest.axes || {}, manifest.readySignal, full);
   for (const [routeName, routePath] of Object.entries(manifest.routes)) {
     for (const state of states) {
+      const label = [routeName, ...state.labelParts].join('__');
+
       const blocked = state.forces.find((f) => cannotForce.has(`${f.axis}:${f.value}`));
       if (blocked) {
-        const label = [routeName, ...state.labelParts].join('__');
         skipped.push({ label, axis: blocked.axis, value: blocked.value });
+        const declared = cannotForceList.find((e) => e.axis === blocked.axis && e.value === blocked.value);
+        addHole({
+          label, kind: 'cannotForce',
+          reason: `${blocked.axis}:${blocked.value} — ${declared?.reason || 'declared unforceable'}`,
+        });
         continue;
       }
 
-      const label = [routeName, ...state.labelParts].join('__');
+      if (skipDriveHooks && state.driveCalls.length) {
+        const specs = [...new Set(state.driveCalls.map((dc) => dc.spec))].join(', ');
+        driveSkipped.push({ label, specs });
+        addHole({
+          label, kind: 'drive-hook-skipped',
+          reason: `needs manifest drive hook(s) ${specs} — not imported (--skip-drive-hooks)`,
+        });
+        continue;
+      }
+
       const target = buildUrl(base, routePath, state.urlParts);
       await h.goto(target);
       for (const dc of state.driveCalls) {
         const fn = await resolveDrive(dc.spec);
         await fn(page, h, dc.stateName);
       }
-      await h.snapshotForced(label, { marker: state.marker });
+      // `settle` (the run's --settle, 0 by default) rides through to the shutter: the marker proves
+      // the state exists, but a project whose entrance animation or theme crossfade completes after
+      // readySignal would otherwise be captured mid-transition. Per state, not once per run.
+      await h.snapshotForced(label, { marker: state.marker, settle: h.settle });
     }
   }
 
   if (skipped.length) {
     log(`skipped ${skipped.length} cannotForce state(s):`,
       skipped.map((s) => `${s.label} (${s.axis}:${s.value})`).join(', '));
+  }
+  if (driveSkipped.length) {
+    log(`--skip-drive-hooks: skipped ${driveSkipped.length} drive-hook state(s):`,
+      driveSkipped.map((s) => `${s.label} (${s.specs})`).join(', '));
   }
 };

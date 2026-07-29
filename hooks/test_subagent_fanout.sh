@@ -100,6 +100,11 @@ check "keyword-free, no fire"          '{"prompt":"please fix the typo on line 1
 check "spaced keyword form fires"      '{"prompt":"fan out the subagents to cover this"}' \
                                         yes "tier calibration"
 
+# (7) tier-neutral wording (2026-07-28 visual-stack redesign): the injected text must not name
+# visual-reviewer as THE visual check -- the ladder (glance by default) picks the rung.
+check "tier-neutral visual wording"    '{"prompt":"run a code-review on this diff"}' \
+                                        yes "visual review dispatch"
+
 echo
 [ "$fails" = 0 ] && echo "ALL subagent-fanout TESTS PASS" || echo "$fails FAILURES"
 exit "$fails"
