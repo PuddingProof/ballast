@@ -8,7 +8,7 @@ real caller (bin/ballast-mode, or a hook shelling to $BALLAST_PYTHON) would.
 
 Every test sets BALLAST_CLAUDE_HOME to a fresh tempdir so this suite never
 reads or writes the developer's real ~/.claude state (mirrors the hermetic
-convention in hooks/test_commit_review_gate.py).
+convention in hooks/tests/test_commit_review_gate.py).
 """
 
 import os

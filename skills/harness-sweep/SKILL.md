@@ -15,132 +15,111 @@ when_to_use: >-
   not adversarial-audit (codebase audits). Fan-out expense — invoke on explicit request or the
   nudge, never on a passing mention.
 argument-hint: "[--focus <topic|project|report-path>] [--deep <last N days | range>]"
-allowed-tools: Read, Glob, Grep, Bash, Write, Edit, Task, AskUserQuestion
+model: fable
+effort: medium
+context: fork
+background: true
 ---
 
-# harness-sweep
+# harness-sweep — one bundle, one judgment pass, one digest
 
-**Digest, then stop.** The sweep discovers, extracts, and reconciles postmortem signal against the ledgers; adjudication, ledger dispositions, and fixes belong to the invoking session and the user. The sweep advances the watermark — it never flips a HARNESS-RECS row, never registers a drift shape, never ships a fix. This seam is the design: extraction is mechanical and cheap, adjudication needs the full top-tier context of whoever invoked you.
+The job: *"take a look at these postmortem reports and develop the durable principles and high-altitude ideas that improve my effectiveness with claude-code."* One script pass turns the whole corpus into a pre-compressed bundle — enumeration, parsing, chain-stitching, ledger inlining, appendix tables. You do the part it can't: adjudicate. Quality of adjudicated findings outranks runtime here.
 
-## State & registry
-
-`<state-home>/postmortem/SWEEP-STATE.md`, where `<state-home>` = `$BALLAST_CLAUDE_HOME` if set, else `~/.claude`. Prose header, one `swept: <ISO-timestamp>` line, then one registry line per project:
-
-```
-<name> · <absolute-postmortem-dir> · last=<report-basename|NONE>
-```
-
-Paths are absolute with forward slashes (drive-letter form on Windows, e.g. `C:/Users/you/Projects/app/.claude/postmortem`); normalize backslashes when writing. Lines without ` · ` are ignored, so the file stays hand-editable. Candidate reports = files matching the `YYYY-MM-DD-*.md` date-prefix pattern — this excludes the ledgers and SWEEP-STATE itself where they share the hub dir.
-
-Newness is deliberately asymmetric between the hook and this skill: the harness-sweep-nudge hook counts strictly-greater basenames (cheap; a missed same-day nudge is harmless), while the sweep includes every report whose 10-char date prefix is ≥ the watermark's date. Re-reading an already-swept same-day file is safe — ledger-first reconciliation makes re-extraction idempotent — and the over-inclusion is bounded to one day. Reports renamed or backfilled with older dates escape the default mode; accepted, because topic focus and `--deep` are watermark-free — nothing is permanently invisible (suspect backfill → run those).
-
-Watermark duty: seeding initializes the `swept:` line when it writes the file; after that, only the default mode advances each swept project's `last=` and `swept:`, at digest-write time — never earlier, and never in a `--focus` or `--deep` run. (`swept:` is informational; the nudge hook derives newness from the `last=` lines.)
-
-## First run — seeding the registry (interactive; never dispatch unattended)
-
-No SWEEP-STATE? Seed it in-session, whatever mode was invoked — the seed write (registry lines + initial `swept:`) is registry initialization, not a sweep, so it doesn't breach the watermark-free modes' no-write rule. Seeding requires AskUserQuestion — put "(Recommended)" in the recommended option's LABEL, not only its description (ballast's askuserquestion-recommend hook exit-2s a bare label) — so a background or executor leaf would stall silently; surface this before any unattended dispatch.
-
-1. Dispatch the scout to gather candidates: the state-home's own `postmortem/` dir (the hub — include it if it holds date-prefixed reports), the current project's `.claude/postmortem/`, and siblings via `<parent-of-project-root>/*/.claude/postmortem` globbing.
-2. AskUserQuestion: confirm, prune, or add projects.
-3. AskUserQuestion: initial watermark posture — (Recommended) backlog = the last 7 days / sweep everything (`last=NONE`) / start from now.
-4. Write the file, then proceed with the invoked mode.
+**Digest, then stop.** You propose; the invoking session and the user dispose. The sweep advances the watermark and nothing else — it never flips a HARNESS-RECS row, never registers a drift shape, never ships a fix. That seam is the design: adjudication needs the invoking session's full context, and sweeps that fix things are how ledger-closed chains get re-fixed.
 
 ## Modes
 
-Two orthogonal flags — a bare argument is an implicit `--focus`. `--focus` narrows WHICH reports; its value resolves in order: an existing file → single-report digest; a name matching a SWEEP-STATE registry line → project scope; anything else → topic. `--deep` widens HOW FAR: every report whose date prefix falls in the range enters, swept or not, and the full adjudication pipeline runs. Topic focus is corpus-wide by nature (grep is the filter — cheap, extraction only touches hits); project focus is watermark-based like the default.
+`--focus` narrows WHICH reports; its value resolves in order: an existing file path → single-report digest; a name matching a registry line → project scope; anything else → topic grep across every registered dir. `--deep <range>` widens HOW FAR: every in-range report enters, swept or not. Flags combine; a bare argument is an implicit `--focus`. Only the default mode advances watermarks — whatever the other modes cover simply re-enters the next incremental sweep (re-extraction is idempotent).
 
-| Invocation | Mode | Corpus | Output |
+| Invocation | Script call | Corpus | Output |
 |---|---|---|---|
-| *(no argument)* | Incremental sweep | Reports past each project's watermark, plus the DRIFT-SIGHTINGS inbox | Triage digest → **stop**; advance watermarks |
-| `--focus <topic>` | Targeted dossier | Whole registered corpus — grep-first, extract hits only | Focused dossier on one surface/topic |
-| `--focus <project>` | Project-scoped sweep | That project's unseen reports only | Scoped triage digest; watermarks untouched |
-| `--focus <report-path>` | Single-report digest | That one report | Reconciled blocks in-chat; no digest file, no watermark touch |
-| `--deep [<range>]` | Full audit pipeline | Every report in the range, swept or not; undated → quote budget options first | Adjudicated theme digest; fixes land later via the plan-handoff protocol |
-| `--deep <range> --focus <X>` | Scoped deep audit | The focused slice within the range | Full pipeline over the slice |
+| *(no argument)* | `digest` | Reports past each project's watermark + the drift inbox | Triage digest → **stop**; then `advance` |
+| `--focus <topic>` | `digest --focus X [--variant …]` | Whole registered corpus, grep hits only | Dossier on one surface; no advance |
+| `--focus <project>` | `digest --focus <name>` | That project's unseen reports | Scoped triage digest; no advance |
+| `--focus <report-path>` | `digest --focus <path>` | That one report | Reconciled blocks in-chat; no file, no commit, no advance |
+| `--deep <range>` | `digest --deep <range>` | Every in-range report, swept or not | Adjudicated theme digest (pipeline below) |
+| `--deep <range> --focus <X>` | both flags | The focused slice within the range | Same pipeline over the slice |
 
-Watermark writes belong to the default alone — no `--focus` or `--deep` run advances `last=` or `swept:`; whatever they cover simply re-enters the next incremental sweep (re-extraction is idempotent).
+## 1. Bundle (script, ~seconds)
 
-## Shared spine (every mode)
+`ballast-sweep digest [--focus <val> [--variant <v> …]] [--deep <range>]`
 
-- **Ledger-first.** Read `<state-home>/postmortem/HARNESS-RECS.md` and `DRIFT-SIGHTINGS.md` BEFORE dispatching any leaf. A chain the ledger records as CLOSED / SUPERSEDED / PARKED is reported as such (cite the row) — never re-surfaced as open work.
-- **A carried chain is ONE finding with high n**, never n findings. Join chains via the extractors' CHAIN-STITCHES blocks; count carries as weight.
-- **Extraction leaves are the harness-sweep-extractor agent** (Sonnet; Read/Glob/Grep only — it cannot trip permission prompts mid-fanout). Everything judgment-shaped — clustering, placement, skepticism, ranking, adjudication — stays with you, top-tier.
-- **Corpus retrieval is the harness-sweep-scout agent** (Haiku; Read/Glob/Grep only, same no-prompt posture) — watermark enumeration, topic greps, and seeding candidate gathering dispatch to it and return as compact lists, keeping raw glob/grep output off the main window. Neither leaf ever reads the ledgers.
-- **Visual findings follow the defect-to-invariant ratchet** (dispositions in the visual-verification-gate skill): the artifact — fixture row, rung-0 assertion, matrix cell, per-fixture checklist line — IS the rec, not a prose bullet. Shadow-first: a prose-only visual rec is still reported, marked `WOULD-REJECT (ratchet shadow): no artifact shape`. Nothing is rejected yet — the shadow window exists to measure what fraction of real findings are expressible before enforcing.
-- **A cross-repo artifact becomes a ratchet ticket.** Fixture rows and matrix cells live in the *target* project's manifest, and this repo never authors another project's rows — so the digest carries a dated ticket instead (target project · the escape's report id · the artifact to add, concrete enough for that project's next session to land unedited). Only rung-0 assertions and this repo's own rows are local work. Delivery and any ledger row are the invoking session's, per the propose-only seam.
-- **Output = a digest file + an in-chat BLUF (≤10 lines).** Digest home: the plugin source repo's `.claude/harness-sweep/<YYYY-MM-DD>-harness-sweep[-<topic>|-deep].md` (git-tracked meta-eval corpus, sibling to `.claude/postmortem/`; it will contain project names and source-machine paths, so it belongs in a scrub-exempt session-output area, never in shipped content). Invoked away from the source repo → write to `<state-home>/postmortem/` instead and say so.
+Bare `ballast-sweep` from the Bash tool (the shim resolves python itself). It prints the bundle path and a counts summary; the bundle holds per-report blocks, the chain graph, both ledgers inlined verbatim, the drift inbox, the gist table, and parse health. State home is `$BALLAST_CLAUDE_HOME` if set, else `~/.claude`. Newness is inclusive of the watermark's date — deliberately wider than the nudge hook's strict `>`, and safe because ledger-first reconciliation makes a same-day re-read idempotent.
 
-## Workflow — incremental sweep (default)
+- **Exit 3** (undated `--deep`): the script printed a per-range count table. Return it in-chat with a one-line recommendation and **stop** — the user re-invokes with an explicit range. Undated deep never runs unattended.
+- **Exit 4** (no SWEEP-STATE): seeding, below.
+- Any other failure: report what broke, in-chat, and stop. Never hand-assemble a bundle by globbing reports yourself — model-side enumeration transcribes dates wrong and silently pulls stale reports in; removing that class is why the script exists.
+- Topic variants are judgment, not retrieval: name the spellings and aliases yourself and pass each as `--variant`.
 
-1. Resolve SWEEP-STATE (seed if absent). Dispatch the scout to enumerate new reports per project (inclusive date rule). Spot-check the returned basenames before dispatching extractors — every one must resolve on disk (Glob any that look odd); a transcription-mangled date silently pulls stale, already-swept reports into the corpus.
-2. Read both ledgers yourself — this is reconciliation context the leaves must not duplicate.
-3. Dispatch one harness-sweep-extractor per new report (batch 2-3 per leaf if the backlog is large).
-4. Reconcile: join carried chains (CHAIN-STITCHES), drop ledger-closed chains (cite the row), collect ballast-handoff recs, ESCALATED items, and unregistered drift sightings.
-5. Write the digest: open chains ranked by escalation weight → new ballast handoffs → unregistered drift shapes → ledger rows that need a disposition → one-line gists of swept sessions.
-6. Advance watermarks + `swept:`, emit the BLUF, and **stop** — adjudication is the invoking session's next move, not this skill's.
+## 2. Read the bundle — once
 
-`--focus <project>` runs this same workflow restricted to that project's registry line, minus step 6's watermark/`swept:` advance (the default mode's alone) — its reports simply re-enter the next full sweep.
+One Read call. Don't re-read it per section, and don't open source reports the bundle already parsed. Entries the parser couldn't handle carry `UNPARSED` plus a trimmed raw excerpt — judge what parsed and surface the parse-health lines in the digest. A partial bundle is a working bundle.
 
-## Workflow — targeted dossier (`--focus <topic>`)
+## 3. Judge — the altitude mandate
 
-1. Name the topic's spelling/name variants yourself (that's judgment), then dispatch the scout to grep them across every registered postmortem dir; check the topic against the ledgers you already read. No watermark.
-2. Dispatch extractors over hit reports only, passing the topic; leaves return topic-scoped blocks plus TOPIC-MISSES near-misses.
-3. Dossier shape: chain timeline (oldest → newest, with n-counts and 🔴 markers) → ledger dispositions already recorded → open residuals → the plugin surfaces to read next (files, hooks, skills). Zero hits → say so plainly and suggest spelling/name variants; do not pad.
+Postmortems are overfit by design: n=1 snapshots of one session's friction. The sweep de-overfits. The finding is the class, never the incident.
 
-## Workflow — single-report digest (`--focus <report-path>`)
+- **Prefer subtraction, generalization, and root-cause principles over added mechanism.** Layering mechanism onto mechanism — patches on patches of harness bloat — is the live failure mode this pass exists to reverse. An additive rec must state why removal or simplification can't do the job; if it can't state that, it isn't a rec yet.
+- **Reconcile against the inlined ledgers before ranking.** A chain the ledger records as CLOSED / SUPERSEDED / PARKED is reported as such with the row quoted verbatim (rows have no stable IDs — never cite by row number), never re-surfaced as open work.
+- **A carried chain is ONE finding with high n**, never n findings. Rank by n and escalation weight, not by recency or bullet count.
+- Keep the bundle's uncertainty visible — `UNRESOLVED-HANDLE`, out-of-corpus chain members, `STALE-DIR` entries are reported, never smoothed; and its `handoff=maybe` lines are candidates, not verdicts (the script applies no relevance judgment, so filtering them is your work).
+- **Visual findings follow the defect-to-invariant ratchet** (dispositions in the visual-verification-gate skill): the artifact — fixture row, rung-0 assertion, matrix cell, checklist line — IS the rec, not a prose bullet. A prose-only visual rec is still reported, marked `WOULD-REJECT (ratchet shadow): no artifact shape`; nothing is rejected yet, the shadow window is measuring.
+- **A cross-repo artifact becomes a dated ratchet ticket** — target project · the escaping report's id · the artifact to add, concrete enough to land unedited in that project's next session. This repo never authors another project's rows; only rung-0 assertions and this repo's own rows are local work.
+- **Fan-out is a valve, not a default.** Single-context is the posture at any corpus ≤ ~30 reports — the bundle is pre-compressed for exactly that. Above it you MAY fan out (per-project pre-rank leaves, or parallel chain judgment) and fold the returns yourself: a measured lever for a corpus that genuinely won't fit one pass, never a thoroughness reflex. Record the count in the stat line either way; `dispatches 0` is the expected default.
 
-The "a concurrent session just closed and its report landed mid-session" shape: the argument resolves to one existing report file, so grepping the corpus for it as a topic would be a misroute.
+## 4. Write the digest — model core ≤ ~60 lines
 
-1. Read both ledgers yourself — even one report needs disposition context (the first live run's lead rec was already ledger-CLOSED).
-2. Dispatch ONE extractor with the report path, no topic.
-3. Return the reconciled blocks in-chat — ledger-recorded chains cited as such — and stop. No digest file, no watermark or `swept:` touch; a registered project's report still enters the next incremental sweep normally (re-extraction is idempotent).
+Path: `.claude/harness-sweep/<YYYY-MM-DD>-harness-sweep[-<topic>|-deep].md` in the plugin source repo (git-tracked meta-eval corpus, sibling to `.claude/postmortem/`; it carries project names and source-machine paths, so it belongs in a scrub-exempt session-output area, never in shipped content). Invoked away from that repo → write to `<state-home>/postmortem/` instead and say so.
 
-## Workflow — deep audit (`--deep [<range>]`)
+Model-authored core, in order and hard-capped: **ranked open chains** (n, members, ledger status) → **new ballast handoffs** → **unregistered drift shapes** → **ledger rows needing a disposition**. Density is the quality bar — adjudication-grade content, not coverage padding.
 
-The heavyweight periodic form. The date range IS the corpus bound and the cost lever: every report whose date prefix falls in the range enters, swept or not. No range given → have the scout count reports per candidate range, then AskUserQuestion with 2-3 quoted options — finder count ≈ ceil(reports ÷ 4); calibration anchor (measured, 2026-07-11 live run): 103 reports ≈ 53 agents ≈ ~23M tokens end-to-end. That question also means an undated `--deep` can never run unattended — surface it before any background dispatch. Combined with `--focus`, the same pipeline runs over only the focused slice within the range (topic grep or project filter first). Corpus size sets the fan-out, never thoroughness reflex.
+Run `date -u +%FT%TZ` *immediately before* the Write (any earlier under-reports the span) and head the file with:
 
-1. **Ledger probe first** (named stage, before any theme exists): every chain with a CLOSED / SUPERSEDED / PARKED row is verify-only downstream — never re-fixed.
-2. Extractors over the in-range corpus (the scout enumerates the roster), ~4 reports per leaf.
-3. One top-tier clusterer: findings → themes (each ESCALATED finding-id must land in exactly one theme). Cluster inline, or dispatch a FRESH agent with the extractor blocks serialized into its prompt — never a `fork`, which inherits your context and can echo your narration instead of clustering (watched: 477K tokens, zero output).
-4. Per theme, pipelined (no barrier): a top-tier placement judge proposes where the fix lives (plugin skill/hook/agent, global config, project-local, memory, nowhere) — then a MANDATORY adversarial overfit skeptic attacks that placement. Skeptics exist because judges systematically over-home: in the reference run 8 of 13 placements were demoted toward narrower or cheaper homes, always that direction. A judge-only pipeline ships upper bounds. Judges and skeptics ground in LIVE source, never the extractors' snapshot — a long run races concurrent sessions (a watched skeptic caught a fix that shipped mid-sweep), and the invoking session re-verifies against HEAD at adjudication.
-5. One completeness critic: cross-check every ESCALATED finding-id against the themes — each appears in a theme or in an explicit drop line. (The reference run's critic caught an escalated finding that had silently fallen out.)
-6. Digest = adjudicated themes with surviving placements + the ledger-probe table. Fixes are the invoking session's work, via the plan-handoff protocol.
+`**Sweep run:** <UTC> · <mode + args> · <N reports / M projects> · bundle <B>B · dispatches <n> · fable medium`
+(`fable medium` written literally — frontmatter-pinned; a self-perceived model can misreport; bundle bytes come from the digest step's counts line.) Then append the script-authored appendix by concatenation — `cat <bundle-dir>/appendix.md >> <digest>` — never retype its tables. A topic dossier's core ends with one extra block: the plugin surfaces to read next (files, hooks, skills).
 
-## Authoring split
+Then stage the digest by path and commit it in a **standalone** `git commit` — never chained, the commit guard blocks compounds; not a git repo or the commit declined → leave the file and say where it is. Emit the in-chat BLUF (≤10 lines). `--focus <report-path>` stops before all of this: reconciled blocks in-chat, no file, no commit.
 
-| Leaf agents (extractor Sonnet · scout Haiku) | Orchestrator (you) |
-|---|---|
-| Extractor: per-report blocks — GIST, OPEN-RECS, PATTERNS, DRIFT, HANDOFFS; CHAIN-STITCHES tail | Ledger reconciliation, chain joining, ranking, digest, BLUF, watermark write |
-| Scout: enumeration lists, topic-grep hits, seeding candidates — retrieval only, no interpretation | Topic-variant naming, clusterer/judge/skeptic/critic prompts in `--deep` |
-| Neither leaf reads the ledgers (disposition context is yours) | |
+## 5. Advance — default mode only
 
-## Context economy — what stays inline, deliberately
+`ballast-sweep advance --manifest <path>` — pass the manifest path the digest step printed, never the newest-manifest default (a concurrent focus/deep run's manifest can land later and take that slot). It owns the SWEEP-STATE write and refuses (exit 2) on a non-default manifest — that refusal is the guard holding, not an error to work around. Zero new reports still advances.
 
-The lean-orchestrator rule has three deliberate exceptions here; don't "optimize" them into leaves:
+## Deep audit (`--deep <range>`)
 
-- **Ledger reads stay with you.** Disposition context is the sweep's core judgment input — content that IS your context, not bulk to offload. Growth valve: if the ledgers ever reach hundreds of lines, grep the rows matching the swept projects/chains yourself instead of whole-file reads (the leaves' no-ledger rule still holds).
-- **Digest, BLUF, and watermark writes stay with you.** The digest is your synthesis — delegating the write ships the full content to a leaf anyway and adds a round trip; the watermark is a two-line edit to a tiny file.
-- **No post-extraction aggregator leaf.** Extractor returns are already in your window — a chain-joining leaf can't un-spend them, and routing blocks through files instead would give extractors Write access and break their no-permission-prompt tool posture.
+Corpus prep is a single `digest --deep <range>` call. The adjudication pipeline then runs as leaves dispatched **from this fork** (general-purpose agents), off the main window:
+
+1. **Ledger probe first**, before any theme exists: every chain with a CLOSED / SUPERSEDED / PARKED row is verify-only downstream, never re-fixed.
+2. **Clusterer** — findings → themes, each ESCALATED finding-id landing in exactly one theme. Cluster in-context, or dispatch a **FRESH** agent with the bundle blocks serialized into its prompt — never a fork, which inherits your context and echoes your narration instead of clustering.
+3. **Per theme, pipelined (no barrier): placement judge → MANDATORY skeptic.** The judge proposes where the fix lives (plugin skill/hook/agent, global config, project-local, memory, nowhere); the skeptic attacks that placement. Skeptics are not optional — judges systematically over-home: 8 of 13 reference placements were demoted toward narrower or cheaper homes, always that direction. Both ground in **LIVE source**, never the bundle snapshot; a long run races concurrent sessions.
+4. **Completeness critic** — every ESCALATED finding-id appears in a theme or in an explicit drop line.
+5. Digest = adjudicated themes with surviving placements + the ledger-probe table. Fixes are the invoking session's work, via the plan-handoff protocol — and the disposing session re-verifies each surviving placement against current HEAD before shipping (a fix can land mid-sweep, or between the sweep and the disposition).
+
+## Seeding the registry (exit 4)
+
+Seeding is registry initialization, not a sweep, so it doesn't breach the watermark-free modes' no-write rule — but it needs AskUserQuestion, and this skill always runs as a backgrounded fork, which can't ask. On exit 4: run `ballast-sweep seed --scan`, return its candidates plus the steps below in-chat, and **stop** — the invoking session runs the steps in-line.
+
+1. Two AskUserQuestions — confirm/prune/add projects from the candidates, then the initial watermark posture ((Recommended) backlog = last 7 days / sweep everything (`last=NONE`) / start from now). Put "(Recommended)" in the option's LABEL, not only its description.
+2. Write `<state-home>/postmortem/SWEEP-STATE.md`: prose header, one `swept: <ISO-timestamp>` line, then `<name> · <absolute-postmortem-dir> · last=<report-basename|NONE>` per project — absolute forward-slash paths, and the ` · ` separator is a byte contract with the nudge hook. Then re-invoke the sweep.
 
 ## Edge cases
 
 | Case | Move |
 |---|---|
-| No SWEEP-STATE | Seed interactively (above) |
-| Registry dir missing on disk | Skip it; note the stale entry in the digest |
-| Zero new reports | One-line BLUF; still advance `swept:` |
-| Huge first backlog | Offer to bound (e.g. last 14 days) before dispatching |
-| Ledgers missing | Create empty with their standard headers; note it |
-| `--focus` value looks like a path but doesn't resolve | Say so and ask whether it was meant as a topic — never grep a path string as a topic |
-| `--deep --focus <report-path>` | Degenerate — run the single-report digest and note the ignored `--deep` |
+| Registry dir or a ledger missing | Script marks `STALE-DIR` / an absent ledger; carry the note into the digest, and create a missing ledger empty with its standard header |
+| Zero new reports | One-line BLUF; still `advance` |
+| Huge first backlog | State the count and offer a bounded range before judging |
+| `--focus` looks like a path but doesn't resolve | Say so and ask whether a topic was meant — never grep a path string as a topic |
+| Topic grep finds zero hits (`HITS: 0`) | Say so and suggest variant spellings — never pad a dossier |
+| `--deep --focus <report-path>` | Degenerate — run the single-report digest, note the ignored `--deep` |
 
 ## Rationalizations
 
 | Excuse | Rebuttal |
 |---|---|
-| "The fix is obvious — ship it during the sweep" | The seam exists because adjudication needs the invoking session's full context; sweeps that fix things are how ledger-closed chains get re-fixed |
-| "The judge looked confident, skip the skeptic" | 8/13 reference-run placements were demoted by skeptics; judge-only output is a known upper bound |
+| "The fix is obvious — ship it during the sweep" | The seam exists because adjudication needs the invoking session's full context; sweeps that fix things re-fix ledger-closed chains |
+| "Nothing to remove here, so add a rule/hook/step" | An additive rec must first argue why subtraction or generalization can't do the job — the layering IS the failure mode |
 | "Update the HARNESS-RECS rows while I'm here" | Dispositions ARE adjudication — the sweep proposes, the session and user dispose |
-| "Big corpus, add more finders to be thorough" | Finder count scales with report count (~4 per leaf), never with thoroughness reflex |
-| "This visual rec is obviously right — just write the prose bullet" | Prose bullets are what the visual stack already tried, at no measured yield; name the artifact shape, or mark the rec `WOULD-REJECT (ratchet shadow)` and let the shadow window count it |
+| "The judge looked confident, skip the skeptic" | 8/13 reference placements were demoted by skeptics; judge-only output is a known upper bound |
+| "Big corpus — fan out to be thorough" | The bundle is the compression; fan-out is a measured lever above ~30 reports, never a thoroughness reflex |
+| "This visual rec is obviously right — just write the prose bullet" | Prose bullets are what the visual stack already tried at no measured yield; name the artifact shape, or mark it `WOULD-REJECT (ratchet shadow)` |
 | "Each carried report is its own finding" | A carried chain is ONE finding with high n — splitting it double-counts evidence and buries the ranking |

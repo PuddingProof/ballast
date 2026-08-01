@@ -10,7 +10,7 @@ seam -- a JSON file of synthetic process records -- plus a temp CLAUDE_PROJECT_D
 enumeration (the powershell/ps branches of enumerate_processes) is NEVER touched here; the seam
 short-circuits before them, exactly as documented in the hook (production never sets the var).
 
-Self-locating + standalone: `python hooks/test_dev_process_nudge.py`.
+Self-locating + standalone: `python hooks/tests/test_dev_process_nudge.py`.
 """
 import contextlib
 import importlib.util
@@ -22,7 +22,7 @@ import sys
 import tempfile
 import unittest
 
-HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dev-process-nudge.py")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dev-process-nudge.py")
 
 
 def _load_module():

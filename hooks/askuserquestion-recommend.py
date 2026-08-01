@@ -7,25 +7,22 @@
 #
 # WHY exit 2 (block), not a soft reminder: a non-blocking PreToolUse hook's additionalContext is
 # delivered TOGETHER WITH the tool's result -- and for AskUserQuestion the "result" is the user's
-# ANSWER, i.e. the reminder would arrive AFTER the question was already shown and answered. That is the
-# exact "fires after the commit" failure git-commit-guard hit: useless for the call it's meant to fix.
-# exit 2 instead DENIES the malformed call and feeds stderr back, so the agent fixes the label and
-# re-asks BEFORE the user ever sees it. The soft global-CLAUDE.md line did not land across >=3
-# postmortems (the recurring "(Recommended) in prose not the label" miss) -- this is point-of-use.
+# ANSWER, so the reminder would arrive after the question was already shown and answered, useless
+# for the call it is meant to fix. exit 2 instead DENIES the malformed call and feeds stderr back,
+# so the agent fixes the label and re-asks BEFORE the user ever sees it. The soft prose rule did
+# not land; this is point-of-use enforcement.
 #
 # RULE (per question): options[0].label must contain "(recommended)" (case-insensitive). The
 # harness-added "Other" option is NOT in tool_input, so only the agent's own 2-4 options are checked.
 #
 # FAIL OPEN on any parse / shape surprise (unreadable stdin, missing questions, odd schema): a
-# convention nudge must NEVER wedge the ability to ask a question. If Claude Code changes the
-# AskUserQuestion payload shape, this hook silently stops enforcing (graceful) rather than blocking
-# every question -- the drift would resurface as the miss recurring, caught by a later postmortem.
-# NOT SILENT, though (governance review item): the genuine internal-error fail-open paths below
-# (unparseable stdin, a non-dict payload) now make a best-effort systemMessage announcement before
-# exiting 0, wrapped in its own try/except so the announce itself can never change the exit code.
-# The "not the shape we validate" early-outs (missing/empty/malformed questions -- the routine,
-# expected case for every non-AskUserQuestion call) stay silent: those aren't errors, they're this
-# hook correctly recognizing it has nothing to check.
+# convention nudge must NEVER wedge the ability to ask a question. If the AskUserQuestion payload
+# shape changes upstream, this hook stops enforcing rather than blocking every question. Not
+# silently, though: the genuine internal-error paths (unparseable stdin, a non-dict payload) make a
+# best-effort systemMessage announcement before exiting 0, wrapped in its own try/except so the
+# announce can never change the exit code. The "not the shape we validate" early-outs
+# (missing/empty/malformed questions -- routine on every non-AskUserQuestion call) stay silent:
+# those aren't errors, they're the hook correctly recognizing it has nothing to check.
 
 import sys
 import json
@@ -52,10 +49,8 @@ def main():
         _announce_error("stdin parse")  # unparseable stdin -> fail open, but announce the internal error
         sys.exit(0)
     if not isinstance(payload, dict):
-        # Valid JSON but not an object (e.g. a bare list) -> same fail-open contract; .get() on a
-        # non-dict raised AttributeError -> exit 1 before this guard (caught by the test suite's
-        # first sweep, 2026-07-11) -- the one payload shape the try above didn't cover. Announced
-        # for the same reason as the unparseable-stdin branch above.
+        # Valid JSON but not an object (e.g. a bare list) -> same fail-open contract: .get() on a
+        # non-dict would AttributeError -> exit 1, the one payload shape the try above can't cover.
         _announce_error("non-dict payload")
         sys.exit(0)
 
@@ -81,12 +76,12 @@ def main():
         # duplicate it. Still hits run.sh's fire ledger (a non-zero exit counts as a fire) like
         # every other fire.
         print(
-            "BLOCKED -- AskUserQuestion: your standing rule is to LEAD with the recommended option AND "
-            'mark it "(Recommended)" in the option LABEL the user reads (not only in prose / the '
-            "preamble / an option's description). Missing it on: " + ", ".join(bad) + ". "
+            'BLOCKED -- AskUserQuestion: the first option\'s LABEL must carry "(Recommended)" -- the '
+            "label the user reads, not only prose / the preamble / an option's description. "
+            "Missing it on: " + ", ".join(bad) + ". "
             'Fix: put your recommended choice FIRST and append " (Recommended)" to its label, then '
-            "re-ask. (No clear lean? Pick the closest and mark it -- the rule wants a recommendation on "
-            "every question.)",
+            "re-ask. (No clear lean? Pick the closest and mark it -- every question wants a "
+            "recommendation.)",
             file=sys.stderr,
         )
         sys.exit(2)

@@ -30,7 +30,7 @@ Decision logic under test (derived from the hook's own code, not from its header
     payload fails open here purely because its tool_input
     naturally lacks a "questions" list.
 
-Self-locating + standalone: `python hooks/test_askuserquestion_recommend.py`.
+Self-locating + standalone: `python hooks/tests/test_askuserquestion_recommend.py`.
 """
 import json
 import os
@@ -38,7 +38,7 @@ import subprocess
 import sys
 import unittest
 
-HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "askuserquestion-recommend.py")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "askuserquestion-recommend.py")
 
 
 def option(label, description=None):

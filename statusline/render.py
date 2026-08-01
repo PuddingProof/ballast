@@ -378,13 +378,11 @@ def render(payload):
             by_label[label] = (mode, status)
         elif status == "confirmed" and by_label[label][1] != "confirmed":
             # CONFIRMED OUTRANKS PENDING within a label. The two keys can legitimately hold
-            # DIFFERENT statuses at once: the keyword hook re-arms a pending chip on every
-            # matching prompt -- including a mere mention while a genuine grant is standing --
-            # and that re-arm lands on whichever keyword the prompt used, which need not be the
-            # key the grant was confirmed under (`autopilot confirmed` + `freehand pending`).
-            # Taking the first entry regardless of status would dim a standing grant down to
-            # "⋯ freehand?" until the pending TTL reaped it -- exactly the demote mode-state.py's
-            # do_raise already refuses to perform within a single key.
+            # DIFFERENT statuses at once (`autopilot confirmed` + `freehand pending`) if a caller
+            # raises one key pending while the other is already confirmed. Taking the first entry
+            # regardless of status would dim a standing grant down to "⋯ freehand?" until the
+            # pending TTL reaped it -- exactly the demote mode-state.py's do_raise already refuses
+            # to perform within a single key.
             by_label[label] = (mode, status)
     chip_strs = [_render_chip(*by_label[label]) for label in label_order]
     if not chip_strs:

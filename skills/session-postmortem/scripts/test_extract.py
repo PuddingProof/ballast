@@ -1,1519 +1,105 @@
-"""Unit tests for the generalized session-postmortem extract.py.
+"""Unit tests for the session-postmortem v5 extract.py engine.
 
-Covers only the project-agnostic behaviors that changed during generalization:
-  - topic_slug bucketing relative to cwd
-  - _looks_like_findings result-shape classifier
-  - invocations slash-command capture + findings-shape tagging
+Standalone + self-locating — both of these must pass:
+    python skills/session-postmortem/scripts/test_extract.py
+    (cd skills/session-postmortem/scripts && python test_extract.py)
 
-Run from the skill directory:  python test_extract.py
+Coverage: the drift-canary census tripwire (the extend-never-delete pin), the compat surface a live
+hook imports (`load_lines` / `_user_prompt` / `_CMD_NAME_RE`), the six user-turn kinds, and the
+digest's contracts (sections, manifest, budget ceiling, bounded-write refusal, usage dedup,
+fail-open sections, transcript resolution).
 """
 import io
 import json
 import os
+import sys
 import tempfile
+import time
 import unittest
-from collections import Counter
 from contextlib import redirect_stdout, redirect_stderr
 
-import extract
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))   # standalone-runnable from anywhere
+
+import extract  # noqa: E402
 
 
-def write_transcript(lines):
-    """Write a list of dict entries to a temp .jsonl, return its path."""
-    fd, path = tempfile.mkstemp(suffix='.jsonl')
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+TS = '2026-07-28T14:%02d:00.000Z'
+
+
+def write_transcript(lines, path=None):
+    """Write a list of dict entries to a .jsonl (temp file unless `path` is given); return the path."""
+    if path is None:
+        fd, path = tempfile.mkstemp(suffix='.jsonl')
+        os.close(fd)
+    with open(path, 'w', encoding='utf-8') as f:
         for d in lines:
             f.write(json.dumps(d) + '\n')
     return path
 
 
-def assistant_edit(ts, file_path, name='Edit'):
-    """Build a transcript entry representing one Edit/Write/MultiEdit tool call."""
-    return {
-        'type': 'assistant',
-        'timestamp': ts,
-        'message': {'content': [
-            {'type': 'tool_use', 'name': name, 'input': {'file_path': file_path}}
-        ]},
-    }
-
-
-def capture(fn, *args):
-    """Call fn(*args), return everything it printed to stdout."""
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        fn(*args)
-    return buf.getvalue()
-
-
-class TopicSlugTest(unittest.TestCase):
-    def test_buckets_by_top_folder_relative_to_cwd(self):
-        with tempfile.TemporaryDirectory() as proj:
-            # 4 of 5 edits under tools/ -> 80% concentration -> slug "tools"
-            lines = [
-                assistant_edit('2026-05-28T00:00:01Z', os.path.join(proj, 'tools', 'a.py')),
-                assistant_edit('2026-05-28T00:00:02Z', os.path.join(proj, 'tools', 'b.py')),
-                assistant_edit('2026-05-28T00:00:03Z', os.path.join(proj, 'tools', 'c.py')),
-                assistant_edit('2026-05-28T00:00:04Z', os.path.join(proj, 'tools', 'd.py')),
-                assistant_edit('2026-05-28T00:00:05Z', os.path.join(proj, 'themes', 'e.json')),
-            ]
-            tpath = write_transcript(lines)
-            old = os.getcwd()
-            try:
-                os.chdir(proj)
-                out = capture(extract.topic_slug, tpath)
-            finally:
-                os.chdir(old)
-                os.remove(tpath)
-            self.assertEqual(out.strip(), 'tools')
-
-    def test_mixed_footprint_falls_back_to_general(self):
-        with tempfile.TemporaryDirectory() as proj:
-            lines = [
-                assistant_edit('2026-05-28T00:00:01Z', os.path.join(proj, 'tools', 'a.py')),
-                assistant_edit('2026-05-28T00:00:02Z', os.path.join(proj, 'themes', 'b.json')),
-                assistant_edit('2026-05-28T00:00:03Z', os.path.join(proj, 'notes', 'c.md')),
-            ]
-            tpath = write_transcript(lines)
-            old = os.getcwd()
-            try:
-                os.chdir(proj)
-                out = capture(extract.topic_slug, tpath)
-            finally:
-                os.chdir(old)
-                os.remove(tpath)
-            self.assertEqual(out.strip(), 'general')
-
-    def test_edits_outside_cwd_are_ignored(self):
-        with tempfile.TemporaryDirectory() as proj:
-            lines = [assistant_edit('2026-05-28T00:00:01Z', 'C:/somewhere/else/x.py')]
-            tpath = write_transcript(lines)
-            old = os.getcwd()
-            try:
-                os.chdir(proj)
-                out = capture(extract.topic_slug, tpath)
-            finally:
-                os.chdir(old)
-                os.remove(tpath)
-            self.assertEqual(out.strip(), 'general')
-
-
-class BucketHelperTest(unittest.TestCase):
-    """Unit tests for _bucket_winner and _bucket_paths (ENG-4 helpers)."""
-
-    def test_bucket_winner_empty_returns_general(self):
-        self.assertEqual(extract._bucket_winner(Counter()), 'general')
-
-    def test_bucket_winner_clear_plurality(self):
-        self.assertEqual(
-            extract._bucket_winner(Counter({'engine': 5, 'tools': 2})), 'engine')
-
-    def test_bucket_winner_tie_returns_general(self):
-        self.assertEqual(
-            extract._bucket_winner(Counter({'alpha': 3, 'beta': 3})), 'general',
-            'tied top two buckets are ambiguous — collapse to general')
-
-    def test_bucket_winner_single_bucket(self):
-        self.assertEqual(extract._bucket_winner(Counter({'tools': 1})), 'tools')
-
-    def test_bucket_paths_outside_cwd_skipped(self):
-        with tempfile.TemporaryDirectory() as proj:
-            counts = extract._bucket_paths(
-                ['C:/somewhere/else/x.py'], proj, {'.debug'})
-            self.assertEqual(sum(counts.values()), 0,
-                             'paths outside cwd contribute nothing')
-
-    def test_bucket_paths_ignored_bucket_skipped(self):
-        with tempfile.TemporaryDirectory() as proj:
-            counts = extract._bucket_paths(
-                [os.path.join(proj, '.debug', 'script.ps1')], proj, {'.debug'})
-            self.assertEqual(sum(counts.values()), 0, '.debug is in ignored_buckets')
-
-    def test_bucket_paths_camelcase_slugified(self):
-        # CamelCase boundary: OpenMeteoAPI -> open-meteo-api.
-        with tempfile.TemporaryDirectory() as proj:
-            counts = extract._bucket_paths(
-                [os.path.join(proj, 'OpenMeteoAPI', 'client.py')], proj, {'.debug'})
-            self.assertIn('open-meteo-api', counts)
-
-    def test_bucket_paths_root_level_file_uses_stem(self):
-        # A root-level file uses its stem (len(parts)==1 path).
-        with tempfile.TemporaryDirectory() as proj:
-            counts = extract._bucket_paths(
-                [os.path.join(proj, 'IDEAS.md')], proj, {'.debug'})
-            self.assertIn('ideas', counts)
-
-
-class TopicSlugGitFallbackTest(unittest.TestCase):
-    """Tests for the git-diff fallback path in topic_slug (ENG-4).
-
-    `git_files_raw` is the optional newline-separated git-changed-file list, passed as a real
-    parameter (E5) rather than read from sys.argv. We capture both stdout (the slug) and stderr
-    (the optional fallback note).
-    """
-
-    def _run(self, transcript_lines, git_files, proj_dir):
-        """Run topic_slug with an explicit git_files_raw; return (stdout.strip(), stderr.strip())."""
-        tpath = write_transcript(transcript_lines)
-        git_arg = '\n'.join(git_files)  # newline-separated, mirrors real git output
-        buf_out = io.StringIO()
-        buf_err = io.StringIO()
-        old_cwd = os.getcwd()
-        try:
-            os.chdir(proj_dir)
-            with redirect_stdout(buf_out), redirect_stderr(buf_err):
-                extract.topic_slug(tpath, git_arg)
-        finally:
-            os.chdir(old_cwd)
-            os.remove(tpath)
-        return buf_out.getvalue().strip(), buf_err.getvalue().strip()
-
-    def test_git_fallback_overrides_when_no_tool_edits(self):
-        """Pure shell session (zero Edit/Write): 10 git files in engine/ -> 'engine'."""
-        with tempfile.TemporaryDirectory() as proj:
-            git_files = [os.path.join(proj, 'engine', f'f{i}.rs') for i in range(10)]
-            slug, note = self._run([], git_files, proj)
-            self.assertEqual(slug, 'engine')
-            self.assertIn('git-diff fallback', note)
-            self.assertIn('10 changed files', note)
-            self.assertIn('0 tool edits', note)
-
-    def test_git_fallback_overrides_low_signal_src_bucket(self):
-        """Tool edits land in 'src' (low-signal); 8 git files in 'engine/' override."""
-        with tempfile.TemporaryDirectory() as proj:
-            tool_lines = [
-                assistant_edit('2026-06-27T00:00:01Z', os.path.join(proj, 'src', 'a.rs')),
-                assistant_edit('2026-06-27T00:00:02Z', os.path.join(proj, 'src', 'b.rs')),
-            ]
-            git_files = [os.path.join(proj, 'engine', f'f{i}.rs') for i in range(8)]
-            slug, note = self._run(tool_lines, git_files, proj)
-            self.assertEqual(slug, 'engine', "'src' is low-signal; git bucket should win")
-            self.assertIn('git-diff fallback', note)
-
-    def test_git_fallback_does_not_override_representative_tool_slug(self):
-        """5 tool edits in 'tools/', 6 git files in 'engine/' — not >=3x gap -> no override."""
-        with tempfile.TemporaryDirectory() as proj:
-            tool_lines = [
-                assistant_edit('2026-06-27T00:00:01Z', os.path.join(proj, 'tools', f'f{i}.py'))
-                for i in range(5)
-            ]
-            # 5 * 3 = 15 > 6, so material_gap=False; tool_slug='tools' not low-signal.
-            git_files = [os.path.join(proj, 'engine', f'f{i}.rs') for i in range(6)]
-            slug, note = self._run(tool_lines, git_files, proj)
-            self.assertEqual(slug, 'tools', 'representative tool slug must not be overridden')
-            self.assertEqual(note, '', 'no fallback note when tool slug wins')
-
-    def test_git_fallback_material_gap_triggers_override(self):
-        """2 tool edits in 'tools/', 15 git files in 'engine/' — 3x gap -> override."""
-        with tempfile.TemporaryDirectory() as proj:
-            tool_lines = [
-                assistant_edit('2026-06-27T00:00:01Z', os.path.join(proj, 'tools', 'a.py')),
-                assistant_edit('2026-06-27T00:00:02Z', os.path.join(proj, 'tools', 'b.py')),
-            ]
-            # 2 * 3 = 6 < 15 and 15 >= 5 -> material_gap=True
-            git_files = [os.path.join(proj, 'engine', f'f{i}.rs') for i in range(15)]
-            slug, note = self._run(tool_lines, git_files, proj)
-            self.assertEqual(slug, 'engine',
-                             'git-changed count 3x+ tool edits -> git bucket wins')
-            self.assertIn('git-diff fallback', note)
-
-    def test_git_fallback_no_override_when_git_also_low_signal(self):
-        """Zero tool edits + 10 git files all in 'src/' -> git also low-signal -> no override."""
-        with tempfile.TemporaryDirectory() as proj:
-            git_files = [os.path.join(proj, 'src', f'f{i}.rs') for i in range(10)]
-            slug, note = self._run([], git_files, proj)
-            self.assertEqual(slug, 'general',
-                             "git bucket 'src' is also low-signal; tool result stands")
-            self.assertEqual(note, '', 'no fallback note when git cannot improve')
-
-    def test_git_fallback_skipped_when_arg_absent(self):
-        """Without argv[3], topic_slug behaves exactly as before (no regression)."""
-        with tempfile.TemporaryDirectory() as proj:
-            tool_lines = [
-                assistant_edit('2026-06-27T00:00:01Z', os.path.join(proj, 'tools', 'a.py')),
-            ]
-            tpath = write_transcript(tool_lines)
-            old_cwd = os.getcwd()
-            try:
-                os.chdir(proj)
-                slug = capture(extract.topic_slug, tpath).strip()
-            finally:
-                os.chdir(old_cwd)
-                os.remove(tpath)
-            self.assertEqual(slug, 'tools', 'no git arg -> original tool-edit logic unchanged')
-
-    def test_git_fallback_zero_edits_small_git_count_fires_via_low_signal(self):
-        """0 tool edits + just 2 git files in 'engine/' -> override via condition (a): the tool slug
-        is 'general' (low-signal), so the >=5-file floor does NOT apply (it only guards a
-        representative tool slug). Locks in the deliberate floor-asymmetry the docstring describes."""
-        with tempfile.TemporaryDirectory() as proj:
-            git_files = [os.path.join(proj, 'engine', f'f{i}.rs') for i in range(2)]
-            slug, note = self._run([], git_files, proj)
-            self.assertEqual(slug, 'engine', 'zero-edit low-signal slug overridden even with <5 git files')
-            self.assertIn('git-diff fallback', note)
-
-
-class FindingsShapeTest(unittest.TestCase):
-    def test_findings_report_detected(self):
-        text = (
-            "Found 3 issues:\n"
-            "1. Critical: SQL injection in db.py:45\n"
-            "2. Warning: unvalidated input in api.py:88\n"
-        )
-        self.assertTrue(extract._looks_like_findings(text))
-
-    def test_launching_skill_not_findings(self):
-        self.assertFalse(
-            extract._looks_like_findings("Launching skill: superpowers:brainstorming")
-        )
-
-    def test_plain_file_mention_not_findings(self):
-        # No file:line, no severity vocab, no numbering -> below threshold
-        self.assertFalse(
-            extract._looks_like_findings("See src/app.py and src/util.py for the details here.")
-        )
-
-    def test_short_text_not_findings(self):
-        self.assertFalse(extract._looks_like_findings("ok"))
-
-    def test_json_findings_report_detected(self):
-        # code-review finder agents emit findings as a JSON array of objects with
-        # separate file/line fields (no inline "file.py:45") — must still tag as findings.
-        text = (
-            'Here are the findings.\n'
-            '[\n'
-            '  {"file": "tools/theme_render.py", "line": 957, "summary": "Dead code: helpers unused",\n'
-            '   "failure_scenario": "135 lines maintained-but-unused"}\n'
-            ']'
-        )
-        self.assertTrue(extract._looks_like_findings(text))
-
-    def test_generic_json_not_findings(self):
-        # A non-findings JSON blob with only generic keys stays out of the disposition table.
-        self.assertFalse(
-            extract._looks_like_findings('{"status": "ok", "count": 3, "name": "render loop"}')
-        )
-
-
-class InvocationsTest(unittest.TestCase):
-    def test_slash_command_echo_captured(self):
-        lines = [{
-            'type': 'user',
-            'timestamp': '2026-05-28T00:00:01Z',
-            'message': {'content':
-                '<command-name>code-review</command-name>\n<command-args>HEAD~2</command-args>'},
-        }]
-        tpath = write_transcript(lines)
-        try:
-            out = capture(extract.invocations, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertIn('slash-command: /code-review HEAD~2', out)
-
-    def test_slash_command_leading_slash_not_doubled(self):
-        # Some echoes store the name WITH a leading slash, e.g. "/compact" -> must not double it
-        lines = [{
-            'type': 'user',
-            'timestamp': '2026-05-28T00:00:01Z',
-            'message': {'content': '<command-name>/compact</command-name>'},
-        }]
-        tpath = write_transcript(lines)
-        try:
-            out = capture(extract.invocations, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertIn('slash-command: /compact', out)
-        self.assertNotIn('//compact', out)
-
-    def test_compact_summary_slash_echo_not_counted(self):
-        # A post-compaction recap (isCompactSummary) quotes prior <command-name> blobs verbatim —
-        # it must NOT mint a slash-command row (verified live 2026-07-20: phantom /code-review
-        # entries at each compact boundary). A genuine echo alongside it still counts.
-        lines = [
-            {'type': 'user', 'timestamp': '2026-05-28T00:00:01Z', 'isCompactSummary': True,
-             'message': {'content':
-                 'This session is being continued…\n<command-name>code-review</command-name>'}},
-            {'type': 'user', 'timestamp': '2026-05-28T00:00:02Z',
-             'message': {'content': '<command-name>/compact</command-name>'}},
-        ]
-        tpath = write_transcript(lines)
-        try:
-            out = capture(extract.invocations, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertNotIn('slash-command: /code-review', out)
-        self.assertIn('slash-command: /compact', out)
-
-    def test_skill_result_tagged_findings_yes(self):
-        lines = [
-            {'type': 'assistant', 'timestamp': '2026-05-28T00:00:01Z',
-             'message': {'content': [
-                 {'type': 'tool_use', 'name': 'Skill', 'input': {'skill': 'code-review'}}
-             ]}},
-            {'type': 'user', 'timestamp': '2026-05-28T00:00:02Z',
-             'message': {'content': [
-                 {'type': 'tool_result', 'content':
-                     "Found issues:\n1. Critical: bug in db.py:45\n2. Warning in api.py:88"}
-             ]}},
-        ]
-        tpath = write_transcript(lines)
-        try:
-            out = capture(extract.invocations, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertIn('Skill: code-review', out)
-        self.assertIn('findings-shape: yes', out)
-
-    def test_launching_skill_tagged_findings_no(self):
-        lines = [
-            {'type': 'assistant', 'timestamp': '2026-05-28T00:00:01Z',
-             'message': {'content': [
-                 {'type': 'tool_use', 'name': 'Skill', 'input': {'skill': 'brainstorming'}}
-             ]}},
-            {'type': 'user', 'timestamp': '2026-05-28T00:00:02Z',
-             'message': {'content': [
-                 {'type': 'tool_result', 'content': "Launching skill: superpowers:brainstorming"}
-             ]}},
-        ]
-        tpath = write_transcript(lines)
-        try:
-            out = capture(extract.invocations, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertIn('findings-shape: no', out)
-
-
-class SessionUuidFromPathTest(unittest.TestCase):
-    UUID = 'a6241b4e-ac7a-4f67-a656-3a7a7be7c0c0'
-
-    def test_live_transcript_filename(self):
-        self.assertEqual(
-            extract._session_uuid_from_path(f'C:/x/projects/foo/{self.UUID}.jsonl'),
-            self.UUID,
-        )
-
-    def test_precompact_archive_filename(self):
-        # <timestamp>_<trigger>_<uuid>.jsonl
-        self.assertEqual(
-            extract._session_uuid_from_path(f'C:/x/compact-backups/20260529-033134_manual_{self.UUID}.jsonl'),
-            self.UUID,
-        )
-
-    def test_no_uuid_falls_back_to_stem(self):
-        self.assertEqual(
-            extract._session_uuid_from_path('C:/x/weird-name.jsonl'),
-            'weird-name',
-        )
-
-
-# ---------------------------------------------------------------------------
-# Prompt-counting regressions (ports of cc-dashboard core/parse.rs tests).
-# These are the load-bearing rules the audit found untested: isMeta exclusion,
-# toolUseResult-field tool-results, and mid-turn queued_command/prompt steers.
-# ---------------------------------------------------------------------------
-def user_line(text, ts='2026-06-08T00:00:00Z', **extra):
-    """A type:user line carrying a plain text-block content array."""
-    d = {'type': 'user', 'timestamp': ts,
-         'message': {'content': [{'type': 'text', 'text': text}]}}
-    d.update(extra)
+def user_line(text, ts=TS % 0, **kw):
+    d = {'type': 'user', 'timestamp': ts, 'cwd': 'C:\\proj',
+         'sessionId': '11111111-2222-3333-4444-555555555555',
+         'message': {'role': 'user', 'content': text}}
+    d.update(kw)
     return d
 
 
-def attachment_line(att_type, command_mode=None, body='steer', ts='2026-06-08T00:00:00Z'):
-    att = {'type': att_type}
-    if command_mode is not None:
-        att['commandMode'] = command_mode
-    att['prompt'] = [{'type': 'text', 'text': body}]
-    return {'type': 'attachment', 'timestamp': ts, 'attachment': att}
+def assistant_line(blocks, ts=TS % 1, mid='msg_1', usage=None, model='claude-opus-4-8'):
+    msg = {'role': 'assistant', 'id': mid, 'model': model, 'content': blocks}
+    if usage is not None:
+        msg['usage'] = usage
+    return {'type': 'assistant', 'timestamp': ts, 'cwd': 'C:\\proj', 'message': msg}
 
 
-class UserPromptCountingTest(unittest.TestCase):
-    def _counts(self, lines):
-        tpath = write_transcript(lines)
+def tool_use(name, inp, tuid='tu_1'):
+    return {'type': 'tool_use', 'id': tuid, 'name': name, 'input': inp}
+
+
+def tool_result(content, tuid='tu_1', ts=TS % 2, is_error=False):
+    block = {'type': 'tool_result', 'tool_use_id': tuid, 'content': content}
+    if is_error:
+        block['is_error'] = True
+    return {'type': 'user', 'timestamp': ts, 'cwd': 'C:\\proj',
+            'toolUseResult': {'stdout': ''},
+            'message': {'role': 'user', 'content': [block]}}
+
+
+def usage(inp=100, out=200, cc=300, cr=400):
+    return {'input_tokens': inp, 'output_tokens': out,
+            'cache_creation_input_tokens': cc, 'cache_read_input_tokens': cr,
+            'cache_creation': {'ephemeral_5m_input_tokens': cc, 'ephemeral_1h_input_tokens': 0}}
+
+
+def run_digest(**kw):
+    """Call extract.digest(**kw), swallow its SystemExit, return (exit_code, stdout, stderr)."""
+    out, err = io.StringIO(), io.StringIO()
+    code = None
+    with redirect_stdout(out), redirect_stderr(err):
         try:
-            return extract._count_tool_calls(tpath)  # (tools, user_prompts, assistant_responses)
-        finally:
-            os.remove(tpath)
-
-    def test_ismeta_line_is_not_a_prompt(self):
-        # Injected synthetic lines (skill base-dir injection, SessionStart caveat, hook context)
-        # carry isMeta:true with plain text content — must NOT count and must NOT be emitted.
-        lines = [
-            user_line('a real prompt'),
-            user_line('Base directory for this skill: C:/x', isMeta=True),
-        ]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 1, 'isMeta injected line is not a user prompt')
-        tpath = write_transcript(lines)
-        try:
-            out = capture(extract.user_msgs, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertIn('a real prompt', out)
-        self.assertNotIn('Base directory for this skill', out)
-
-    def test_tool_result_field_line_is_not_a_prompt(self):
-        # A tool-result user line can render content as plain list[text] while carrying the
-        # top-level toolUseResult / sourceToolUseID field — the field is the load-bearing signal.
-        lines = [
-            user_line('real prompt'),
-            user_line('tool output text', toolUseResult={'ok': 1}),
-            user_line('more output', sourceToolUseID='abc'),
-        ]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 1, 'toolUseResult/sourceToolUseID lines are not prompts')
-
-    def test_queued_prompt_counts_but_task_notification_does_not(self):
-        # Mid-turn steers are attachment/queued_command lines, NOT type:user. commandMode 'prompt'
-        # counts; 'task-notification' and a missing mode do not (fail-closed allow-list).
-        lines = [
-            user_line('start the workflow'),
-            attachment_line('queued_command', 'prompt', body='also handle the edge case'),
-            attachment_line('queued_command', 'task-notification', body='task done'),
-            attachment_line('queued_command', None, body='no mode'),
-            attachment_line('todo_reminder', None, body='unrelated'),
-        ]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 2, 'only the standalone turn + the commandMode:prompt steer count')
-
-    def test_queued_steer_is_emitted_and_tagged(self):
-        lines = [attachment_line('queued_command', 'prompt', body='no, do X instead')]
-        tpath = write_transcript(lines)
-        try:
-            out = capture(extract.user_msgs, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertIn('no, do X instead', out)
-        self.assertIn('mid-turn steer', out)
-
-    def test_task_notification_user_line_is_not_a_prompt(self):
-        # Background-task notices ALSO appear as plain NON-meta `user` lines carrying
-        # origin.kind == "task-notification" (the user-line twin of the attachment form
-        # above — both shapes coexist back to 2026-05; port of the cc-dashboard parse.rs
-        # fix 5df4845 from the 2026-06-09 census).
-        lines = [
-            user_line('a real prompt'),
-            user_line('<task-notification>workflow done</task-notification>',
-                      promptSource='system', origin={'kind': 'task-notification'}),
-        ]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 1, 'origin.kind=task-notification user line is not a turn')
-        tpath = write_transcript(lines)
-        try:
-            out = capture(extract.user_msgs, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertIn('a real prompt', out)
-        self.assertNotIn('workflow done', out, 'task notice must not be emitted as a user msg')
-
-    def test_non_dict_message_user_line_is_not_a_prompt(self):
-        # A malformed user line whose `message` is not a dict must not count (restores the
-        # guard the old _count_tool_calls had; _is_real_user_msg now owns it for both callers).
-        lines = [{'type': 'user', 'timestamp': '2026-06-08T00:00:00Z', 'message': 'oops a string'}]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 0)
-
-    def test_assistant_responses_dedup_by_message_id(self):
-        # One API response is logged as multiple content-block lines sharing a message.id;
-        # counting DISTINCT ids gives real response count, not the ~2.4x line count.
-        def asst(mid, block):
-            return {'type': 'assistant', 'timestamp': '2026-06-08T00:00:01Z',
-                    'message': {'id': mid, 'model': 'claude-opus-4-8', 'content': [block]}}
-        lines = [
-            asst('msg_1', {'type': 'thinking', 'thinking': '...'}),
-            asst('msg_1', {'type': 'text', 'text': 'ok'}),
-            asst('msg_1', {'type': 'tool_use', 'name': 'Read', 'input': {}}),
-            asst('msg_2', {'type': 'text', 'text': 'done'}),
-        ]
-        tools, _, responses = self._counts(lines)
-        self.assertEqual(responses, 2, '3 lines of msg_1 + 1 line of msg_2 = 2 responses')
-        self.assertEqual(tools['Read'], 1, 'tool_use still counted once')
+            extract.digest(**kw)
+        except SystemExit as e:
+            code = e.code
+    return code, out.getvalue(), err.getvalue()
 
 
-class InvocationsFifoTest(unittest.TestCase):
-    def test_back_to_back_agents_both_emitted(self):
-        # Two Agent dispatches in one response = two consecutive assistant lines before any
-        # tool_result. A single-slot tracker dropped the first; the FIFO queue keeps both.
-        lines = [
-            {'type': 'assistant', 'timestamp': '2026-06-08T00:00:01Z',
-             'message': {'content': [
-                 {'type': 'tool_use', 'name': 'Agent', 'id': 'tu_1',
-                  'input': {'subagent_type': 'Explore', 'description': 'first agent'}}]}},
-            {'type': 'assistant', 'timestamp': '2026-06-08T00:00:02Z',
-             'message': {'content': [
-                 {'type': 'tool_use', 'name': 'Agent', 'id': 'tu_2',
-                  'input': {'subagent_type': 'Explore', 'description': 'second agent'}}]}},
-            {'type': 'user', 'timestamp': '2026-06-08T00:00:03Z',
-             'message': {'content': [
-                 {'type': 'tool_result', 'tool_use_id': 'tu_1', 'content': 'result one'}]}},
-            {'type': 'user', 'timestamp': '2026-06-08T00:00:04Z',
-             'message': {'content': [
-                 {'type': 'tool_result', 'tool_use_id': 'tu_2', 'content': 'result two'}]}},
-        ]
-        tpath = write_transcript(lines)
-        try:
-            out = capture(extract.invocations, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertEqual(out.count('Agent: first agent'), 1, 'first agent must not be clobbered')
-        self.assertEqual(out.count('Agent: second agent'), 1)
-
-    def test_workflow_with_null_script_does_not_crash(self):
-        # A Workflow tool_use whose `script` key is present but JSON null must not crash the
-        # label fallback (inp.get('script','') would return None, and None[:60] raises).
-        lines = [
-            {'type': 'assistant', 'timestamp': '2026-06-08T00:00:01Z',
-             'message': {'content': [
-                 {'type': 'tool_use', 'name': 'Workflow', 'id': 'tu_wf',
-                  'input': {'script': None, 'name': 'my-workflow'}}]}},
-            {'type': 'user', 'timestamp': '2026-06-08T00:00:02Z',
-             'message': {'content': [
-                 {'type': 'tool_result', 'tool_use_id': 'tu_wf', 'content': 'launched'}]}},
-        ]
-        tpath = write_transcript(lines)
-        try:
-            out = capture(extract.invocations, tpath)  # must not raise
-        finally:
-            os.remove(tpath)
-        self.assertIn('Workflow: my-workflow', out)
-
-    def test_tool_use_id_pairs_result_to_correct_invocation(self):
-        # An interleaved non-tracked tool_result (Read) must not consume a pending Agent.
-        lines = [
-            {'type': 'assistant', 'timestamp': '2026-06-08T00:00:01Z',
-             'message': {'content': [
-                 {'type': 'tool_use', 'name': 'Agent', 'id': 'tu_agent',
-                  'input': {'description': 'the agent'}},
-                 {'type': 'tool_use', 'name': 'Read', 'id': 'tu_read', 'input': {}}]}},
-            {'type': 'user', 'timestamp': '2026-06-08T00:00:02Z',
-             'message': {'content': [
-                 {'type': 'tool_result', 'tool_use_id': 'tu_read', 'content': 'file contents'},
-                 {'type': 'tool_result', 'tool_use_id': 'tu_agent', 'content': 'agent findings'}]}},
-        ]
-        tpath = write_transcript(lines)
-        try:
-            out = capture(extract.invocations, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertIn('Agent: the agent', out)
-        self.assertIn('agent findings', out)
-        self.assertNotIn('file contents', out, 'Read result must not be paired to the Agent')
-
-
-class StatsTokenSourceTest(unittest.TestCase):
-    """§7 is TRANSCRIPT-NATIVE after ENG-1: token volume from message.usage via _usage_tokens /
-    _usage_by_model — NO ccusage, NO $ cost. The pricing helpers (_price_for / _estimate_cost /
-    _opus_is_legacy) were deleted; their ABSENCE is part of the v2 contract."""
-
-    def test_pricing_helpers_and_ccusage_removed(self):
-        # ENG-1 deleted the manual pricing fallback + the ccusage subprocess — guard against revival.
-        for name in ('_price_for', '_estimate_cost', '_opus_is_legacy'):
-            self.assertFalse(hasattr(extract, name), f'{name} should be gone after ENG-1')
-        with open(os.path.join(os.path.dirname(extract.__file__), 'extract.py'), encoding='utf-8') as f:
-            src = f.read()
-        self.assertNotIn('subprocess.run', src, 'the ccusage subprocess call must be gone')
-
-    def test_usage_by_model_partitions_and_sums_to_total(self):
-        # Load-bearing invariant §7 relies on: sum over models == _usage_tokens total (same dedup).
-        lines = [asst_usage_line('m_1', 'claude-opus-4-8', inp=100, out=10, cc=5, cr=1),
-                 asst_usage_line('m_1', 'claude-opus-4-8', inp=100, out=10, cc=5, cr=1),  # dup id, same usage
-                 asst_usage_line('m_2', 'claude-sonnet-4-6', inp=40, out=4, cc=0, cr=2)]
-        tpath = write_transcript(lines)
-        try:
-            by_model = extract._usage_by_model(tpath)
-            tok = extract._usage_tokens(tpath)
-        finally:
-            os.remove(tpath)
-        self.assertEqual(by_model['claude-opus-4-8'], 116, 'm_1 counted once (max per id): 100+10+5+1')
-        self.assertEqual(by_model['claude-sonnet-4-6'], 46)
-        self.assertEqual(sum(by_model.values()), tok['total'], 'per-model sum MUST equal the grand total')
-
-    def test_usage_by_model_first_seen_order_and_drops_zero(self):
-        lines = [asst_usage_line('m_1', 'claude-sonnet-4-6', inp=5),
-                 asst_usage_line('m_2', 'claude-opus-4-8', inp=9),
-                 asst_usage_line('m_3', 'claude-haiku-4-5', inp=0)]  # zero-token model -> dropped
-        tpath = write_transcript(lines)
-        try:
-            by_model = extract._usage_by_model(tpath)
-        finally:
-            os.remove(tpath)
-        self.assertEqual(list(by_model), ['claude-sonnet-4-6', 'claude-opus-4-8'],
-                         'first-seen order preserved; zero-token model dropped')
-
-    def test_usage_tokens_honors_sub_window_bounds(self):
-        # ENG-1 added start_ts/end_ts so `stats` can bound the token table to a sub-window.
-        def asst(ts, inp):
-            return {'type': 'assistant', 'timestamp': ts,
-                    'message': {'id': ts, 'model': 'claude-opus-4-8',
-                                'usage': {'input_tokens': inp, 'output_tokens': 0,
-                                          'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0}}}
-        lines = [asst('2026-06-22T01:00:00Z', 100), asst('2026-06-22T05:00:00Z', 7)]
-        tpath = write_transcript(lines)
-        try:
-            full = extract._usage_tokens(tpath)
-            windowed = extract._usage_tokens(tpath, '2026-06-22T03:00:00Z', None)
-        finally:
-            os.remove(tpath)
-        self.assertEqual(full['input'], 107)
-        self.assertEqual(windowed['input'], 7, 'only the post-03:00 line is in-window')
-
-    def test_stats_output_is_transcript_native_no_cost(self):
-        # The §7 body: window + token table + Models line, and crucially NO ccusage/$ artifacts.
-        lines = [asst_usage_line('m_1', 'claude-opus-4-8', inp=100, out=10, cc=5, cr=1)]
-        tpath = write_transcript(lines)
-        out = io.StringIO()
-        try:
-            with redirect_stdout(out):
-                extract.stats(tpath)
-        finally:
-            os.remove(tpath)
-        body = out.getvalue()
-        self.assertIn('**Window:**', body)
-        self.assertIn('| **Total** | **116** |', body)
-        self.assertIn('**Models (main-thread):** opus-4-8 (116)', body)
-        for forbidden in ('$', 'ccusage', 'Estimated cost', 'blended'):
-            self.assertNotIn(forbidden, body, f'{forbidden!r} must not appear in the transcript-native §7')
-
-    def test_stats_tool_breakdown_reconciles_when_truncated(self):
-        """>8 distinct main-thread tools: the top-8 breakdown carries a labeled '+N more ×M'
-        remainder so the listed counts reconcile with the stated total (no silent sum-to-less)."""
-        counts = {'Edit': 9, 'Read': 8, 'Bash': 7, 'Write': 6, 'Glob': 5,
-                  'Grep': 4, 'Task': 3, 'PowerShell': 2, 'WebFetch': 1, 'NotebookEdit': 1}
-        blocks, i = [], 0
-        for name, c in counts.items():
-            for _ in range(c):
-                blocks.append((f't{i}', name)); i += 1
-        tpath = write_transcript([asst_usage_line('m_1', 'claude-opus-4-8', inp=10, tools=blocks)])
-        out = io.StringIO()
-        try:
-            with redirect_stdout(out):
-                extract.stats(tpath)
-        finally:
-            os.remove(tpath)
-        body = out.getvalue()
-        self.assertIn(f'**Tool calls (main-thread):** {sum(counts.values())} total', body)  # 46 total
-        # 10 distinct tools -> 8 shown + a labeled remainder covering the 2 one-call tools
-        self.assertIn('+2 more ×2', body)
-
-    def test_stats_output_includes_subagent_aggregate(self):
-        """stats() emits the **Subagent tokens:** aggregate line when a sidecar dir is present.
-        Pins the a['tokens'] key in _collect_subagents and the exact format string so a
-        future rename or format change fails loudly."""
-        import shutil
-        d = tempfile.mkdtemp()
-        try:
-            main = os.path.join(d, 'sess.jsonl')
-            _write_jsonl(main, [asst_usage_line('m_main', 'claude-opus-4-8', inp=100, out=10)])
-            side = os.path.join(d, 'sess', 'subagents')
-            os.makedirs(side)
-            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Explore'}, f)
-            # One assistant usage line: inp=50 + out=5 = 55 total tokens.
-            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
-                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50, out=5)])
-            buf = io.StringIO()
-            with redirect_stdout(buf):
-                extract.stats(main)
-            out = buf.getvalue()
-            # Exact format string from stats():
-            # f'**Subagent tokens:** {sub_total:,} across {n_agents} agent(s) — per-agent breakdown in §2(c).'
-            self.assertIn('**Subagent tokens:** 55 across 1 agent(s)', out,
-                          'subagent aggregate line must appear with correct token count and phrasing')
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
+def read_digest(out_dir):
+    with open(os.path.join(out_dir, 'digest.md'), encoding='utf-8') as f:
+        text = f.read()
+    with open(os.path.join(out_dir, 'manifest.json'), encoding='utf-8') as f:
+        return text, json.load(f)
 
 
 # ---------------------------------------------------------------------------
-# Transcript-shape gates (ports of the 2026-06-22 cc-user-prompts / cc-dashboard
-# parsing fixes): isCompactSummary, isSidechain, entrypoint:sdk-cli, bash-output
-# echoes, <command-message>-first ordering, AskUserQuestion answers, autopilot goals,
-# and the promptSource guardrail. All keyed on real on-disk shapes verified against
-# live transcripts.
+# 1-2. Drift canary — the census tripwire + registry integrity
 # ---------------------------------------------------------------------------
-def ask_answer_line(answers, ts='2026-06-08T00:00:00Z'):
-    """A type:user AskUserQuestion answer line: rides a toolUseResult(answers, questions) and a
-    tool_result content block (verified shape: toolUseResult keys answers/questions/annotations)."""
-    return {'type': 'user', 'timestamp': ts,
-            'toolUseResult': {'answers': answers, 'questions': [{'question': q} for q in answers]},
-            'message': {'content': [{'type': 'tool_result', 'tool_use_id': 'tu_ask', 'content': 'answered'}]}}
 
-
-def goal_line(condition, met=False, ts='2026-06-08T00:00:00Z'):
-    """A type:attachment autopilot goal line (attachment.type==goal_status; text in .condition)."""
-    return {'type': 'attachment', 'timestamp': ts,
-            'attachment': {'type': 'goal_status', 'condition': condition, 'met': met, 'sentinel': 'x'}}
-
-
-class PromptShapeGatesTest(unittest.TestCase):
-    def _counts(self, lines):
-        tpath = write_transcript(lines)
-        try:
-            return extract._count_tool_calls(tpath)  # (tools, user_prompts, assistant_responses)
-        finally:
-            os.remove(tpath)
-
-    def _msgs(self, lines):
-        tpath = write_transcript(lines)
-        try:
-            return capture(extract.user_msgs, tpath)
-        finally:
-            os.remove(tpath)
-
-    def test_compact_summary_recap_is_not_a_prompt(self):
-        # The post-compaction "This session is being continued…" recap is injected as a plain
-        # type:user line carrying isCompactSummary:true (NOT isMeta) — slips every other gate.
-        lines = [user_line('a real prompt'),
-                 user_line('This session is being continued from a previous conversation…',
-                           isCompactSummary=True)]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 1, 'isCompactSummary recap is not a user turn')
-        self.assertNotIn('being continued', self._msgs(lines), 'recap must not be emitted')
-
-    def test_sidechain_replay_is_not_a_prompt(self):
-        lines = [user_line('a real prompt'),
-                 user_line('replayed subagent dispatch prompt', isSidechain=True)]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 1, 'isSidechain replay is not a human turn')
-
-    def test_sdk_cli_eval_probe_is_not_a_prompt(self):
-        lines = [user_line('a real prompt'),
-                 user_line('GREEN eval probe input', entrypoint='sdk-cli')]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 1, 'entrypoint=sdk-cli headless probe is not a human turn')
-
-    def test_bash_output_echo_excluded_but_input_kept(self):
-        # !-mode shell OUTPUT (<bash-stdout>/<bash-stderr>) is not a turn; the <bash-input> the
-        # user TYPED is a real action and must count.
-        lines = [user_line('<bash-stdout>npm test -> 12 passing</bash-stdout>'),
-                 user_line('<bash-stderr>warning: deprecated api</bash-stderr>'),
-                 user_line('<bash-input>npm test</bash-input>')]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 1, 'only the typed <bash-input> counts')
-
-    def test_slash_echo_counts_as_turn_and_renders_clean(self):
-        # ENG-5: a /slash echo IS a user turn — both SSoT parsers (cc-user-prompts _slash,
-        # cc-dashboard is_real_user_turn) count every slash echo, so we must too. It's rendered to a
-        # clean `/name args` (raw <command-*> wrappers, often trailed by a stdout dump, never leak).
-        # The <command-message>-first ordering (client-dependent) resolves the same way.
-        lines = [
-            user_line('<command-name>/compact</command-name>'),                  # bare, pre-slashed
-            user_line('<command-name>code-review</command-name>'
-                      '<command-args>ultra 42</command-args>'),                   # name + args
-            user_line('<command-message>code-review</command-message>'
-                      '<command-name>code-review</command-name>'),               # message-first
-        ]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 3, 'every slash echo counts as a turn (SSoT parity)')
-        out = self._msgs(lines)
-        self.assertIn('/compact', out)
-        self.assertIn('/code-review ultra 42', out)        # name+args, exactly one leading slash
-        self.assertIn('slash-command', out)                # tagged with the marker
-        self.assertNotIn('<command-name>', out, 'raw wrapper must not leak into the display')
-
-    def test_prose_mentioning_command_tag_is_not_a_slash_echo(self):
-        # The slash classifier keys on a LEADING wrapper — a prose turn that merely mentions the tag
-        # mid-sentence is an ordinary turn (counted, emitted verbatim, no slash marker).
-        lines = [user_line('please document the <command-name> echo shape')]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 1)
-        out = self._msgs(lines)
-        self.assertIn('please document the', out)
-        self.assertNotIn('slash-command', out)
-
-    def test_ask_answer_counts_and_is_formatted(self):
-        lines = [ask_answer_line({'Where should it live?': 'global skill'})]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 1, 'a non-empty AskUserQuestion answer IS a real turn')
-        out = self._msgs(lines)
-        self.assertIn('AskUserQuestion answer', out)
-        self.assertIn('Where should it live?', out)
-        self.assertIn('global skill', out)
-
-    def test_cancelled_ask_answer_is_not_a_prompt(self):
-        lines = [ask_answer_line({})]   # cancelled dialog -> empty answers dict
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 0, 'a cancelled AskUserQuestion (answers=={}) is not a turn')
-
-    def test_autopilot_goal_surfaced_deduped_not_counted(self):
-        # The goal is logged as met=false / met=true bookends with the same condition. It is shown
-        # ONCE in user_msgs (tagged) but NOT counted as a prompt (it is a condition, not a turn).
-        cond = 'goals are met when all 4 items ship'
-        lines = [user_line('start the work'), goal_line(cond, met=False), goal_line(cond, met=True)]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 1, 'goal bookends are not counted; only the real turn is')
-        out = self._msgs(lines)
-        self.assertEqual(out.count(cond), 1, 'the goal condition is emitted exactly once (deduped)')
-        self.assertIn('autopilot goal', out)
-
-    def test_promptsource_sdk_is_still_a_real_turn(self):
-        # GUARDRAIL: promptSource is a transport channel, NOT a human-vs-machine signal. A genuine
-        # VS Code (promptSource=sdk) turn must still count — gating on it hid ~790 real turns.
-        lines = [user_line('a real VS Code prompt', promptSource='sdk')]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 1, 'promptSource=sdk must NOT exclude a genuine turn')
-
-    def test_auto_continuation_goal_echo_excluded(self):
-        # A goal-set produces TWO lines: the goal_status (surfaced once as the autopilot goal) AND a
-        # synthetic queued_command/prompt echo "Goal set: …" with origin.kind=='auto-continuation'.
-        # The echo is harness-generated, not user-typed — it must NOT emit as a (mid-turn steer) nor
-        # count. Genuine steers (origin.kind 'human' or absent) still count.
-        cond = 'goals are met when all 4 items ship'
-        echo = {'type': 'attachment', 'timestamp': '2026-06-08T00:00:01Z',
-                'attachment': {'type': 'queued_command', 'commandMode': 'prompt',
-                               'origin': {'kind': 'auto-continuation'}, 'prompt': f'Goal set: {cond}'}}
-        human = {'type': 'attachment', 'timestamp': '2026-06-08T00:00:02Z',
-                 'attachment': {'type': 'queued_command', 'commandMode': 'prompt',
-                                'origin': {'kind': 'human'}, 'prompt': 'no, do X instead'}}
-        lines = [user_line('start the work'), goal_line(cond, met=False), echo, human]
-        _, prompts, _ = self._counts(lines)
-        self.assertEqual(prompts, 2, 'real turn + genuine steer count; auto-continuation echo does not')
-        out = self._msgs(lines)
-        self.assertEqual(out.count('Goal set:'), 0, 'the synthetic goal echo is not emitted as a steer')
-        self.assertIn('no, do X instead', out)
-        self.assertIn('autopilot goal', out)
-
-
-# ---------------------------------------------------------------------------
-# Subagent & tooling parsing (§2 "Subagent & Tooling Evaluation"): sidecar walk,
-# usage-token dedup-by-message.id, tool block-id dedup, MCP-server grouping.
-# ---------------------------------------------------------------------------
-def _write_jsonl(path, lines):
-    with open(path, 'w', encoding='utf-8') as f:
-        for d in lines:
-            f.write(json.dumps(d) + '\n')
-
-
-def asst_usage_line(mid, model, inp=0, out=0, cc=0, cr=0, tools=()):
-    """An assistant line carrying message.usage (raw snake_case fields) + optional tool_use blocks.
-    `tools` = list of (block_id, tool_name)."""
-    return {'type': 'assistant', 'timestamp': '2026-06-22T00:00:00Z',
-            'message': {'id': mid, 'model': model,
-                'usage': {'input_tokens': inp, 'output_tokens': out,
-                          'cache_creation_input_tokens': cc, 'cache_read_input_tokens': cr},
-                'content': [{'type': 'tool_use', 'id': tid, 'name': tn, 'input': {}} for tid, tn in tools]}}
-
-
-class SubagentToolingTest(unittest.TestCase):
-    def test_split_mcp(self):
-        self.assertEqual(extract._split_mcp('mcp__claude_design__render_preview'),
-                         ('claude_design', 'render_preview'))
-        self.assertEqual(extract._split_mcp('Read'), (None, 'Read'))
-        self.assertEqual(extract._split_mcp('mcp__serveronly'), ('serveronly', ''))
-
-    def test_short_model(self):
-        self.assertEqual(extract._short_model('claude-opus-4-8[1m]'), 'opus-4-8')
-        self.assertEqual(extract._short_model('claude-sonnet-4-6'), 'sonnet-4-6')
-        self.assertEqual(extract._short_model('?'), '?')
-
-    def test_usage_tokens_dedup_by_message_id(self):
-        # 3 lines repeat the SAME usage under one message.id (content-block fan-out) -> counted ONCE
-        # via max, not summed 3x; a second message.id is a distinct response and adds.
-        lines = [asst_usage_line('m_1', 'claude-opus-4-8', inp=100, out=10),
-                 asst_usage_line('m_1', 'claude-opus-4-8', inp=100, out=10),
-                 asst_usage_line('m_1', 'claude-opus-4-8', inp=100, out=10),
-                 asst_usage_line('m_2', 'claude-opus-4-8', inp=50, out=5)]
-        tpath = write_transcript(lines)
-        try:
-            tok = extract._usage_tokens(tpath)
-        finally:
-            os.remove(tpath)
-        self.assertEqual(tok['input'], 150, 'm_1 counted once (max per id), not 3x')
-        self.assertEqual(tok['output'], 15)
-        self.assertEqual(tok['total'], 165)
-
-    def test_tool_histogram_block_id_dedup(self):
-        # The same tool_use block id re-logged counts once; distinct ids each count.
-        lines = [
-            {'type': 'assistant', 'message': {'content': [
-                {'type': 'tool_use', 'id': 'toolu_a', 'name': 'Read', 'input': {}},
-                {'type': 'tool_use', 'id': 'toolu_b', 'name': 'Edit', 'input': {}}]}},
-            {'type': 'assistant', 'message': {'content': [
-                {'type': 'tool_use', 'id': 'toolu_a', 'name': 'Read', 'input': {}}]}},
-        ]
-        tpath = write_transcript(lines)
-        try:
-            h = extract._tool_histogram(tpath)
-        finally:
-            os.remove(tpath)
-        self.assertEqual(h['Read'], 1, 'duplicate block id counted once')
-        self.assertEqual(h['Edit'], 1)
-
-    def test_subagents_roster_split_and_journal_ignored(self):
-        import shutil
-        d = tempfile.mkdtemp()
-        try:
-            main = os.path.join(d, 'sess.jsonl')
-            _write_jsonl(main, [asst_usage_line('m_main', 'claude-opus-4-8', inp=1000, out=100,
-                                                tools=[('toolu_m', 'Read')])])
-            side = os.path.join(d, 'sess', 'subagents', 'workflows', 'wf_1')
-            os.makedirs(side)
-            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Explore'}, f)
-            _write_jsonl(os.path.join(side, 'agent-0.jsonl'), [
-                asst_usage_line('a0', 'claude-sonnet-4-6', inp=200, out=100,
-                                tools=[('toolu_x', 'Grep'), ('toolu_y', 'Read')])])
-            _write_jsonl(os.path.join(side, 'journal.jsonl'), [{'type': 'log'}])  # not an agent
-            out = capture(extract.subagents, main)
-            self.assertIn('Subagents dispatched:** 1', out)
-            self.assertIn('1× Explore', out)
-            self.assertIn('sonnet-4-6', out)
-            self.assertIn('main 1,100 + subagents 300 = 1,400', out)
-            tb = capture(extract.tool_breakdown, main)
-            self.assertIn('1 main + 2 across subagents', tb)
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    def test_subagents_none_when_no_sidecar(self):
-        tpath = write_transcript([asst_usage_line('m', 'claude-opus-4-8', inp=1)])
-        try:
-            out = capture(extract.subagents, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertIn('No subagents dispatched', out)
-
-    def test_mcp_table_in_tool_breakdown(self):
-        lines = [{'type': 'assistant', 'message': {'content': [
-            {'type': 'tool_use', 'id': 't1', 'name': 'mcp__claude_design__render_preview', 'input': {}},
-            {'type': 'tool_use', 'id': 't2', 'name': 'mcp__claude_design__list_files', 'input': {}},
-            {'type': 'tool_use', 'id': 't3', 'name': 'Read', 'input': {}}]}}]
-        tpath = write_transcript(lines)
-        try:
-            out = capture(extract.tool_breakdown, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertIn('MCP servers used', out)
-        self.assertIn('| claude_design | 2 | 2 |', out)
-
-    def test_usage_tokens_keyless_lines_summed(self):
-        # Assistant lines with no message.id can't be deduped, so they are SUMMED (not maxed).
-        lines = [asst_usage_line(None, 'claude-opus-4-8', inp=100, out=10),
-                 asst_usage_line(None, 'claude-opus-4-8', inp=50, out=5)]
-        tpath = write_transcript(lines)
-        try:
-            tok = extract._usage_tokens(tpath)
-        finally:
-            os.remove(tpath)
-        self.assertEqual(tok['input'], 150, 'keyless lines summed (no id to dedup on)')
-        self.assertEqual(tok['total'], 165)
-
-    def test_oversized_meta_falls_back_to_agent_type(self):
-        # A meta.json over the 64 KB cap is NOT parsed; agent_type falls back to 'agent' (parse.rs
-        # parity) — guards a future off-by-one / wrong-constant regression on the cap.
-        import shutil
-        d = tempfile.mkdtemp()
-        try:
-            main = os.path.join(d, 'sess.jsonl')
-            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1)])
-            side = os.path.join(d, 'sess', 'subagents')
-            os.makedirs(side)
-            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
-                f.write('{"agentType": "Explore"' + ' ' * 70000 + '}')   # valid JSON, > 64 KB
-            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
-                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=10)])
-            out = capture(extract.subagents, main)
-            self.assertIn('1× agent', out, 'oversized meta -> agentType not read; fallback to agent')
-            self.assertNotIn('Explore', out)
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    # --- dispatch label (`description`) + nested-depth (`spawnDepth`) surfacing ---
-
-    def test_sanitize_label_collapses_whitespace_and_pipes(self):
-        raw = 'Extract   rain-proof\n07-23 | reports A'
-        self.assertEqual(extract._sanitize_label(raw), 'Extract rain-proof 07-23 / reports A')
-
-    def test_sanitize_label_truncates_at_60_chars(self):
-        out = extract._sanitize_label('x' * 80)
-        self.assertEqual(out, 'x' * 60 + '…', '60 chars kept plus a trailing ellipsis marker')
-
-    def test_dispatch_label_rendered_in_roster(self):
-        import shutil
-        d = tempfile.mkdtemp()
-        try:
-            main = os.path.join(d, 'sess.jsonl')
-            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
-            side = os.path.join(d, 'sess', 'subagents')
-            os.makedirs(side)
-            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'ballast:harness-sweep-extractor',
-                           'description': 'Extract rain-proof 07-23 reports A'}, f)
-            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
-                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
-            out = capture(extract.subagents, main)
-            self.assertIn('Dispatch label', out, 'roster header carries the new column')
-            self.assertIn('Extract rain-proof 07-23 reports A', out)
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    def test_dispatch_label_missing_renders_dash(self):
-        import shutil
-        d = tempfile.mkdtemp()
-        try:
-            main = os.path.join(d, 'sess.jsonl')
-            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
-            side = os.path.join(d, 'sess', 'subagents')
-            os.makedirs(side)
-            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Explore'}, f)   # no description key
-            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
-                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
-            out = capture(extract.subagents, main)
-            self.assertIn('| Explore | — |', out, 'no description -> em-dash placeholder cell')
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    def test_dispatch_label_long_description_truncated_in_roster(self):
-        import shutil
-        d = tempfile.mkdtemp()
-        try:
-            main = os.path.join(d, 'sess.jsonl')
-            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
-            side = os.path.join(d, 'sess', 'subagents')
-            os.makedirs(side)
-            long_desc = 'A' * 80
-            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Explore', 'description': long_desc}, f)
-            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
-                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
-            out = capture(extract.subagents, main)
-            self.assertIn('A' * 60 + '…', out, 'long description truncated to 60 chars + ellipsis')
-            self.assertNotIn('A' * 61, out, 'the untruncated 61st char must not appear')
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    def test_dispatch_label_pipe_and_newline_do_not_break_table(self):
-        import shutil
-        d = tempfile.mkdtemp()
-        try:
-            main = os.path.join(d, 'sess.jsonl')
-            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
-            side = os.path.join(d, 'sess', 'subagents')
-            os.makedirs(side)
-            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Explore', 'description': 'weird | label\nwith a newline'}, f)
-            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
-                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
-            out = capture(extract.subagents, main)
-            row = next(l for l in out.splitlines() if l.startswith('| Explore |'))
-            self.assertEqual(row.count('|'), 7, 'sanitized label must not introduce extra table columns')
-            self.assertIn('weird / label with a newline', out)
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    def test_spawn_depth_2_marked_nested_in_roster(self):
-        import shutil
-        d = tempfile.mkdtemp()
-        try:
-            main = os.path.join(d, 'sess.jsonl')
-            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
-            side = os.path.join(d, 'sess', 'subagents')
-            os.makedirs(side)
-            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Explore', 'spawnDepth': 2}, f)
-            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
-                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
-            out = capture(extract.subagents, main)
-            self.assertIn('↳ Explore (depth 2)', out, 'a nested dispatch is marked inline')
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    def test_spawn_depth_absent_or_garbage_defaults_to_1_not_nested(self):
-        import shutil
-        d = tempfile.mkdtemp()
-        try:
-            main = os.path.join(d, 'sess.jsonl')
-            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
-            side = os.path.join(d, 'sess', 'subagents')
-            os.makedirs(side)
-            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Good'}, f)   # no spawnDepth key
-            with open(os.path.join(side, 'agent-1.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Bad', 'spawnDepth': 'garbage'}, f)   # non-int garbage
-            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
-                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
-            _write_jsonl(os.path.join(side, 'agent-1.jsonl'),
-                         [asst_usage_line('a1', 'claude-sonnet-4-6', inp=40)])
-            out = capture(extract.subagents, main)
-            self.assertNotIn('↳', out, 'absent/garbage spawnDepth defaults to depth 1 -> not nested')
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    def test_label_and_depth_do_not_affect_counts_or_token_split(self):
-        # Adding description/spawnDepth must not perturb the dispatched count, by_type tally, or the
-        # main-vs-subagent token split — those stay computed exactly as before this change (mirrors
-        # test_subagents_roster_split_and_journal_ignored with description/spawnDepth added).
-        import shutil
-        d = tempfile.mkdtemp()
-        try:
-            main = os.path.join(d, 'sess.jsonl')
-            _write_jsonl(main, [asst_usage_line('m_main', 'claude-opus-4-8', inp=1000, out=100,
-                                                tools=[('toolu_m', 'Read')])])
-            side = os.path.join(d, 'sess', 'subagents')
-            os.makedirs(side)
-            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Explore',
-                           'description': 'Extract rain-proof 07-23 reports A',
-                           'spawnDepth': 2}, f)
-            _write_jsonl(os.path.join(side, 'agent-0.jsonl'), [
-                asst_usage_line('a0', 'claude-sonnet-4-6', inp=200, out=100,
-                                tools=[('toolu_x', 'Grep'), ('toolu_y', 'Read')])])
-            out = capture(extract.subagents, main)
-            self.assertIn('Subagents dispatched:** 1', out)
-            self.assertIn('1× Explore', out)
-            self.assertIn('main 1,100 + subagents 300 = 1,400', out)
-            tb = capture(extract.tool_breakdown, main)
-            self.assertIn('1 main + 2 across subagents', tb)
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    # --- ENG-3: forked/resumed-UUID sidecar merge ---
-
-    def test_session_uuid_chain_collects_fork_uuids(self):
-        # Filename UUID is always chain[0]; a distinct canonical sessionId on a replayed line is
-        # appended; the bridge-session `cse_*` id and a repeat of the filename UUID are ignored.
-        import shutil
-        ua = '11111111-1111-4111-8111-111111111111'
-        ub = '22222222-2222-4222-8222-222222222222'
-        lines = [
-            {'type': 'assistant', 'sessionId': ua, 'message': {'id': 'm', 'content': []}},
-            {'type': 'user', 'sessionId': ub, 'message': {'content': [{'type': 'text', 'text': 'x'}]}},
-            {'type': 'bridge-session', 'sessionId': ua, 'bridgeSessionId': 'cse_01ABC'},  # cse id ignored
-        ]
-        d = tempfile.mkdtemp()
-        tpath = os.path.join(d, ua + '.jsonl')
-        _write_jsonl(tpath, lines)
-        try:
-            self.assertEqual(extract._session_uuid_chain(tpath), [ua, ub])
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    def test_session_uuid_chain_single_when_no_fork(self):
-        # No sessionId fork (the current CC build) -> chain is just the filename UUID; merge is a no-op.
-        import shutil
-        ua = '11111111-1111-4111-8111-111111111111'
-        d = tempfile.mkdtemp()
-        tpath = os.path.join(d, ua + '.jsonl')
-        _write_jsonl(tpath, [asst_usage_line('m', 'claude-opus-4-8', inp=1)])
-        try:
-            self.assertEqual(extract._session_uuid_chain(tpath), [ua])
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    def test_subagents_and_tools_merge_forked_uuid_sidecars(self):
-        # A forked/resumed UUID splits sidecars across <uuidA>/subagents + <uuidB>/subagents, linked
-        # to ONE transcript by sessionId. Both must merge into the roster, token split, and tool count.
-        import shutil
-        d = tempfile.mkdtemp()
-        try:
-            ua = '11111111-1111-4111-8111-111111111111'
-            ub = '22222222-2222-4222-8222-222222222222'
-            main = os.path.join(d, ua + '.jsonl')   # filename UUID = uuidA
-            # main thread (sessionId uuidA) + one replayed historical line carrying the OLD uuidB
-            _write_jsonl(main, [
-                {**asst_usage_line('m_main', 'claude-opus-4-8', inp=1000, out=100,
-                                   tools=[('toolu_m', 'Read')]), 'sessionId': ua},
-                {'type': 'user', 'sessionId': ub,
-                 'message': {'content': [{'type': 'text', 'text': 'replayed'}]}},
-            ])
-            # sidecar dir A (current UUID)
-            sa = os.path.join(d, ua, 'subagents')
-            os.makedirs(sa)
-            with open(os.path.join(sa, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Explore'}, f)
-            _write_jsonl(os.path.join(sa, 'agent-0.jsonl'), [
-                asst_usage_line('a0', 'claude-sonnet-4-6', inp=200, out=100,
-                                tools=[('toolu_x', 'Grep')])])
-            # sidecar dir B (forked/prior UUID) — must ALSO be merged
-            sb = os.path.join(d, ub, 'subagents')
-            os.makedirs(sb)
-            with open(os.path.join(sb, 'agent-1.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'code-review'}, f)
-            _write_jsonl(os.path.join(sb, 'agent-1.jsonl'), [
-                asst_usage_line('a1', 'claude-haiku-4-5', inp=50, out=25,
-                                tools=[('toolu_y', 'Read')])])
-            out = capture(extract.subagents, main)
-            self.assertIn('Subagents dispatched:** 2', out)
-            self.assertIn('Explore', out)
-            self.assertIn('code-review', out)
-            # token split merges both sidecars: main 1,100 + (300 + 75) = 1,475
-            self.assertIn('main 1,100 + subagents 375 = 1,475', out)
-            self.assertIn('resume-chain UUIDs', out)
-            self.assertIn(ub, out)   # the forked UUID is surfaced in the merge note
-            # tool breakdown merges both: main Read(1) + sub Grep(1) + Read(1) = 3
-            tb = capture(extract.tool_breakdown, main)
-            self.assertIn('1 main + 2 across subagents', tb)
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    # --- ENG-6: roster display cap (count stays exact) + reparse-point no-follow ---
-
-    def test_subagents_roster_capped_at_12_count_exact(self):
-        # 15 dispatched agents -> COUNT stays exact (15) but only the top-12-by-token rows render,
-        # plus the "showing top 12 of 15" note. Distinct token spends make the top-12 cut deterministic.
-        import shutil
-        d = tempfile.mkdtemp()
-        try:
-            main = os.path.join(d, 'sess.jsonl')
-            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=500000)])
-            side = os.path.join(d, 'sess', 'subagents')
-            os.makedirs(side)
-            for i in range(15):
-                with open(os.path.join(side, f'agent-{i}.meta.json'), 'w', encoding='utf-8') as f:
-                    json.dump({'agentType': 'Explore'}, f)
-                _write_jsonl(os.path.join(side, f'agent-{i}.jsonl'),
-                             [asst_usage_line(f'a{i}', 'claude-sonnet-4-6', inp=(i + 1) * 1000)])
-            out = capture(extract.subagents, main)
-            self.assertIn('Subagents dispatched:** 15', out)         # dispatched COUNT exact
-            self.assertEqual(out.count('| Explore | '), 12, 'only 12 roster rows render')
-            self.assertIn('showing top 12 of 15', out)
-            self.assertIn('| 15,000 |', out, 'highest-spend agent is shown')
-            self.assertNotIn('| 1,000 |', out, 'the 3 lowest-spend agents are dropped below the cap')
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    def test_reparse_point_dir_not_followed(self):
-        # A symlinked dir inside subagents/ must NOT be descended — its planted agent stays invisible.
-        # Symlink creation needs privilege on Windows; skip (don't fail) when it can't be created.
-        import shutil
-        d = tempfile.mkdtemp()
-        try:
-            main = os.path.join(d, 'sess.jsonl')
-            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
-            side = os.path.join(d, 'sess', 'subagents')
-            os.makedirs(side)
-            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Good'}, f)
-            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
-                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
-            # A planted agent OUTSIDE the tree, reachable only by following a symlinked dir.
-            outside = os.path.join(d, 'outside')
-            os.makedirs(outside)
-            with open(os.path.join(outside, 'agent-9.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Evil'}, f)
-            _write_jsonl(os.path.join(outside, 'agent-9.jsonl'),
-                         [asst_usage_line('a9', 'claude-opus-4-8', inp=99)])
-            try:
-                os.symlink(outside, os.path.join(side, 'link'), target_is_directory=True)
-            except (OSError, NotImplementedError, AttributeError) as e:
-                self.skipTest(f'cannot create symlink (privilege?): {e}')
-            self.assertTrue(extract._is_reparse_point(os.path.join(side, 'link')),
-                            'the link is detected as a reparse point')
-            out = capture(extract.subagents, main)
-            self.assertIn('1× Good', out)
-            self.assertIn('Subagents dispatched:** 1', out)
-            self.assertNotIn('Evil', out, 'a symlinked dir must not be followed into')
-        finally:
-            shutil.rmtree(d, ignore_errors=True)
-
-    def test_junction_dir_not_followed_windows(self):
-        # Windows JUNCTION (mklink /J) needs NO privilege (unlike a symlink) and is the common reparse
-        # vector os.path.islink() MISSES — the load-bearing case for _is_reparse_point on this OS, so
-        # the no-follow guard gets real green coverage here even when the symlink test self-skips.
-        import shutil, subprocess
-        import sys as _sys
-        if _sys.platform != 'win32':
-            self.skipTest('junction (mklink /J) is Windows-only')
-        d = tempfile.mkdtemp()
-        link = os.path.join(d, 'sess', 'subagents', 'jlink')
-        try:
-            main = os.path.join(d, 'sess.jsonl')
-            _write_jsonl(main, [asst_usage_line('m', 'claude-opus-4-8', inp=1000)])
-            side = os.path.join(d, 'sess', 'subagents')
-            os.makedirs(side)
-            with open(os.path.join(side, 'agent-0.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Good'}, f)
-            _write_jsonl(os.path.join(side, 'agent-0.jsonl'),
-                         [asst_usage_line('a0', 'claude-sonnet-4-6', inp=50)])
-            # A planted agent OUTSIDE the tree, reachable only by descending a junction.
-            outside = os.path.join(d, 'outside')
-            os.makedirs(outside)
-            with open(os.path.join(outside, 'agent-9.meta.json'), 'w', encoding='utf-8') as f:
-                json.dump({'agentType': 'Evil'}, f)
-            _write_jsonl(os.path.join(outside, 'agent-9.jsonl'),
-                         [asst_usage_line('a9', 'claude-opus-4-8', inp=99)])
-            r = subprocess.run(['cmd', '/c', 'mklink', '/J', link, outside],
-                               capture_output=True, text=True)
-            if r.returncode != 0 or not os.path.isdir(link):
-                self.skipTest(f'mklink /J unavailable: {(r.stderr or r.stdout).strip()}')
-            self.assertTrue(extract._is_reparse_point(link), 'a junction is a reparse point')
-            out = capture(extract.subagents, main)
-            self.assertIn('1× Good', out)
-            self.assertIn('Subagents dispatched:** 1', out)
-            self.assertNotIn('Evil', out, 'a junction must not be followed into')
-        finally:
-            # Remove the junction itself (os.rmdir on a junction unlinks it, not its target) before
-            # rmtree, so cleanup can't traverse it into `outside`.
-            try:
-                if os.path.isdir(link):
-                    os.rmdir(link)
-            except OSError:
-                pass
-            shutil.rmtree(d, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
-# Format-drift canary (ENG-2) — ports of cc-dashboard core/drift.rs's drift tests,
-# adapted to the parsed-dict observer + compact-check dual-marker detection.
-# ---------------------------------------------------------------------------
 class DriftCanaryTest(unittest.TestCase):
-    """`_collect_drift` returns the {(kind, value): count} accumulator so assertions read like
-    drift.rs's find()."""
-
     def _drift(self, lines):
-        tpath = write_transcript(lines)
-        try:
-            return extract._collect_drift(tpath)
-        finally:
-            os.remove(tpath)
-
-    def test_known_shapes_produce_no_drift(self):
-        # Every shape here is in a registry — the canary must stay silent.
-        lines = [
-            user_line('hello'),
-            {'type': 'assistant', 'timestamp': '2026-06-21T00:00:01Z',
-             'message': {'id': 'm', 'model': 'claude-opus-4-8', 'usage': {'output_tokens': 1}}},
-            {'type': 'system', 'subtype': 'turn_duration', 'timestamp': '2026-06-21T00:00:02Z'},
-            attachment_line('queued_command', 'prompt', body='steer'),
-            user_line('<system-reminder>note</system-reminder>', promptSource='sdk'),
-        ]
-        self.assertEqual(self._drift(lines), {}, 'every known shape is recognized — no drift')
-
-    def test_novel_line_type_surfaces(self):
-        self.assertEqual(self._drift([{'type': 'telepathy', 'timestamp': 'x'}]).get(('line_type', 'telepathy')), 1)
-
-    def test_novel_system_subtype_surfaces(self):
-        d = self._drift([{'type': 'system', 'subtype': 'quantum_flush', 'timestamp': 'x'}])
-        self.assertEqual(d.get(('system_subtype', 'quantum_flush')), 1)
-
-    def test_scheduled_task_fire_is_known(self):
-        # Characterized live 2026-06-27 (the /loop scheduled-wakeup resume notice) and added to the
-        # registry — it must now be SILENT, while an unknown sibling subtype still drifts.
-        self.assertEqual(self._drift([{'type': 'system', 'subtype': 'scheduled_task_fire', 'timestamp': 'x'}]), {})
-        d = self._drift([{'type': 'system', 'subtype': 'scheduled_task_future', 'timestamp': 'x'}])
-        self.assertEqual(d.get(('system_subtype', 'scheduled_task_future')), 1)
-
-    def test_pr_link_is_known(self):
-        # Characterized live 2026-07-07 (gh/PR sidecar metadata; deliberately no uuid/parentUuid,
-        # mirroring production) and added to the registry — must now be SILENT, while an invented
-        # sibling line type still drifts.
-        self.assertEqual(self._drift([{'type': 'pr-link', 'prNumber': 11,
-                                        'prRepository': 'example/repo',
-                                        'prUrl': 'https://github.com/example/repo/pull/11',
-                                        'sessionId': 's1', 'timestamp': 'x'}]), {})
-        d = self._drift([{'type': 'pr-link-v2', 'prNumber': 11, 'timestamp': 'x'}])
-        self.assertEqual(d.get(('line_type', 'pr-link-v2')), 1)
-
-    def test_model_refusal_no_fallback_is_known(self):
-        # Characterized live 2026-07-07 (no-fallback sibling of model_refusal_fallback) and added
-        # to the registry — must now be SILENT, while an invented sibling subtype still drifts.
-        self.assertEqual(self._drift([{'type': 'system', 'subtype': 'model_refusal_no_fallback',
-                                        'level': 'warning', 'apiRefusalCategory': 'policy',
-                                        'apiRefusalExplanation': 'x', 'originalModel': 'claude-opus-4-8',
-                                        'refusedUserMessageUuid': 'u1', 'content': '',
-                                        'timestamp': 'x'}]), {})
-        d = self._drift([{'type': 'system', 'subtype': 'model_refusal_no_retry', 'timestamp': 'x'}])
-        self.assertEqual(d.get(('system_subtype', 'model_refusal_no_retry')), 1)
-
-    def test_plan_file_reference_is_known(self):
-        # Characterized live 2026-07-07 (post-compact plan-file re-injection, sibling of
-        # compact_file_reference) and added to the registry — must now be SILENT, while an invented
-        # sibling attachment type still drifts.
-        self.assertEqual(self._drift([{'type': 'attachment',
-                                        'attachment': {'type': 'plan_file_reference',
-                                                       'planFilePath': 'C:/tmp/plan.md',
-                                                       'planContent': 'plan text'}}]), {})
-        d = self._drift([{'type': 'attachment', 'attachment': {'type': 'plan_file_reference_v2'}}])
-        self.assertEqual(d.get(('attachment_type', 'plan_file_reference_v2')), 1)
-
-    def test_hook_non_blocking_error_is_known(self):
-        # Characterized live 2026-07-07 (non-blocking sibling of hook_blocking_error, same tool-hook
-        # envelope) and added to the registry — must now be SILENT, while an invented sibling
-        # attachment type still drifts.
-        self.assertEqual(self._drift([{'type': 'attachment',
-                                        'attachment': {'type': 'hook_non_blocking_error',
-                                                       'hookName': 'lint', 'hookEvent': 'PostToolUse',
-                                                       'exitCode': 1, 'toolUseID': 'tu1',
-                                                       'command': 'lint.sh', 'stderr': 'warn',
-                                                       'stdout': '', 'durationMs': 12}}]), {})
-        d = self._drift([{'type': 'attachment', 'attachment': {'type': 'hook_non_blocking_warning'}}])
-        self.assertEqual(d.get(('attachment_type', 'hook_non_blocking_warning')), 1)
-
-    def test_novel_attachment_type_and_command_mode_surface(self):
-        d = self._drift([
-            {'type': 'attachment', 'attachment': {'type': 'holo_reminder'}},
-            {'type': 'attachment', 'attachment': {'type': 'queued_command', 'commandMode': 'telepathic-steer'}},
-        ])
-        self.assertEqual(d.get(('attachment_type', 'holo_reminder')), 1)
-        self.assertEqual(d.get(('command_mode', 'telepathic-steer')), 1)
-        # queued_command itself is known — only the novel mode drifts, not the attachment type.
-        self.assertNotIn(('attachment_type', 'queued_command'), d)
-
-    def test_novel_prompt_source_and_content_tag_surface(self):
-        d = self._drift([
-            user_line('hi', promptSource='telepathy'),
-            user_line('<bash-stdin>echo hi</bash-stdin>'),   # bash-stdin is NOT in the registry
-        ])
-        self.assertEqual(d.get(('prompt_source', 'telepathy')), 1)
-        self.assertEqual(d.get(('user_content_tag', 'bash-stdin')), 1)
-
-    def test_novel_origin_kind_surfaces(self):
-        # The extract.py-unique axis drift.rs lacks: a novel origin.kind on a user line.
-        d = self._drift([user_line('hi', origin={'kind': 'precognition'})])
-        self.assertEqual(d.get(('origin_kind', 'precognition')), 1)
-        # The known kinds stay silent.
-        self.assertEqual(self._drift([user_line('hi', origin={'kind': 'human'})]), {})
-
-    def test_attachment_nested_origin_kind_surfaces(self):
-        # The OTHER origin.kind gate site: `_attachment_prompt` keys on att['origin']['kind'] (it
-        # drops the 'auto-continuation' goal echo). A novel kind THERE must drift too — observing
-        # only the top-level user origin would miss it (and leave 'auto-continuation' unreachable).
-        d = self._drift([{'type': 'attachment',
-                          'attachment': {'type': 'queued_command', 'commandMode': 'prompt',
-                                         'origin': {'kind': 'auto-resumption'}}}])
-        self.assertEqual(d.get(('origin_kind', 'auto-resumption')), 1)
-        # The known attachment-only kind is now reachable AND silent.
-        self.assertEqual(self._drift([{'type': 'attachment',
-                          'attachment': {'type': 'queued_command', 'commandMode': 'prompt',
-                                         'origin': {'kind': 'auto-continuation'}}}]), {})
-
-    def test_novel_user_is_flag_surfaces_but_snapshot_flag_does_not(self):
-        # A truthy is*-flag on a USER line outside KNOWN_USER_FLAGS drifts…
-        d = self._drift([user_line('hi', isTelepathic=True)])
-        self.assertEqual(d.get(('user_is_flag', 'isTelepathic')), 1)
-        # …but isSnapshotUpdate rides file-history-snapshot lines, not user lines, so the user-scoped
-        # axis never sees it (the live-tree false-positive this scoping was chosen to avoid).
-        snap = self._drift([{'type': 'file-history-snapshot', 'isSnapshotUpdate': True,
-                             'messageId': 'm', 'snapshot': {}}])
-        self.assertEqual(snap, {}, 'file-history-snapshot isSnapshotUpdate is not user-line drift')
-
-    def test_prose_opening_with_angle_bracket_is_not_a_tag(self):
-        # '<= 5' / '<3' open with '<' but the next char isn't a letter — prose, not markup.
-        d = self._drift([user_line('<= 5 should pass the gate'), user_line('<3 to the team')])
-        self.assertFalse(any(k == 'user_content_tag' for k, _ in d), 'prose opening with < is not a tag')
-
-    def test_tool_result_inner_content_tag_does_not_drift(self):
-        # A user line carrying a tool_result block SKIPS the content-tag axis (mirrors drift.rs
-        # is_tool_result_line), so neither the tool's '<result>…' output nor a co-resident text
-        # block opening with an unknown tag mints spurious user_content_tag drift.
-        d = self._drift([{'type': 'user', 'timestamp': 'x', 'toolUseResult': {'ok': 1},
-                          'message': {'content': [
-                              {'type': 'tool_result', 'tool_use_id': 'tu', 'content': '<result>data</result>'},
-                              {'type': 'text', 'text': '<novel-tag>x</novel-tag>'}]}}])
-        self.assertNotIn(('user_content_tag', 'novel-tag'), d)
-        self.assertNotIn(('user_content_tag', 'result'), d)
-
-    def test_counts_accumulate_across_lines(self):
-        novel = {'type': 'telepathy', 'timestamp': 'x'}
-        self.assertEqual(self._drift([novel, novel, novel]).get(('line_type', 'telepathy')), 3)
-
-    def test_cardinality_cap_is_fail_closed(self):
-        # > MAX_DISTINCT distinct novel line types: only the first MAX_DISTINCT are admitted; the
-        # overflow is dropped (fail-closed). An already-seen pair still counts past the cap.
-        many = [{'type': f'novel-{i}', 'timestamp': 'x'} for i in range(extract.MAX_DISTINCT + 10)]
-        acc = self._drift(many)
-        self.assertEqual(len(acc), extract.MAX_DISTINCT, 'accumulator is bounded at MAX_DISTINCT')
-        acc2 = self._drift(many + [{'type': 'novel-0', 'timestamp': 'x'}])
-        self.assertEqual(acc2[('line_type', 'novel-0')], 2, 'an already-seen pair counts past the cap')
+        acc = {}
+        for d in lines:
+            extract._observe_drift(acc, d)
+        return acc
 
     def test_drift_canary_knows_every_censused_production_shape(self):
         # THE TRIPWIRE (port of drift.rs drift_canary_knows_every_censused_production_shape): every
@@ -1537,7 +123,9 @@ class DriftCanaryTest(unittest.TestCase):
                   'ultra_effort_exit', 'hook_blocking_error', 'goal_status', 'auto_mode_exit',
                   'hook_cancelled', 'already_read_file', 'plan_mode_reentry', 'selected_lines_in_ide',
                   'plan_file_reference', 'hook_non_blocking_error', 'hook_system_message',
-                  'task_status', 'mcp_instructions_delta']:
+                  'task_status', 'mcp_instructions_delta',
+                  # sighted live 2026-07-30 (v5 bench run, rain-proof transcript): Read token-cap banner
+                  'read_truncation_notice']:
             self.assertIn(a, extract.KNOWN_ATTACHMENT_TYPES, f'censused attachment type {a} must be known')
         # `mcp_instructions_delta` history: characterized PHANTOM 2026-07-07 (zero structural
         # occurrences then; an assertNotIn pinned the decision) → REAL 2026-07-21 (×3 structural
@@ -1558,430 +146,764 @@ class DriftCanaryTest(unittest.TestCase):
         self.assertNotIn('totally-new-line-type', extract.KNOWN_LINE_TYPES)
         self.assertNotIn('totally-new-attachment', extract.KNOWN_ATTACHMENT_TYPES)
 
+    def test_registries_are_immutable_frozensets(self):
+        for name in ('KNOWN_LINE_TYPES', 'KNOWN_SYSTEM_SUBTYPES', 'KNOWN_ATTACHMENT_TYPES',
+                     'KNOWN_COMMAND_MODES', 'KNOWN_PROMPT_SOURCES', 'KNOWN_ORIGIN_KINDS',
+                     'KNOWN_USER_CONTENT_TAGS', 'KNOWN_USER_FLAGS'):
+            self.assertIsInstance(getattr(extract, name), frozenset, f'{name} must be a frozenset')
 
-class DriftSubcommandTest(unittest.TestCase):
-    """End-to-end `drift()` subcommand tests — redirect_stdout + assertRaises(SystemExit),
-    mirroring CompactCheckTest._run. `drift()` always exits 0; the emitted rows (vs. 'no drift')
-    are the diagnostic signal."""
+    def test_max_distinct_is_the_fail_closed_bound(self):
+        self.assertEqual(extract.MAX_DISTINCT, 64)
+        many = [{'type': f'novel-{i}', 'timestamp': 'x'} for i in range(extract.MAX_DISTINCT + 10)]
+        acc = self._drift(many)
+        self.assertEqual(len(acc), extract.MAX_DISTINCT, 'accumulator is bounded at MAX_DISTINCT')
+        acc2 = self._drift(many + [{'type': 'novel-0', 'timestamp': 'x'}])
+        self.assertEqual(acc2[('line_type', 'novel-0')], 2, 'an already-seen pair counts past the cap')
 
-    def _run(self, lines):
-        tpath = write_transcript(lines)
+    def test_novel_shapes_surface_and_known_ones_stay_quiet(self):
+        self.assertEqual(self._drift([{'type': 'telepathy', 'timestamp': 'x'}]).get(
+            ('line_type', 'telepathy')), 1)
+        self.assertEqual(self._drift([user_line('hello')]), {}, 'a clean user line is not drift')
+        d = self._drift([{'type': 'attachment', 'attachment': {'type': 'queued_command',
+                                                               'commandMode': 'prompt',
+                                                               'origin': {'kind': 'auto-resumption'}}}])
+        self.assertEqual(d.get(('origin_kind', 'auto-resumption')), 1)
+        self.assertEqual(self._drift([user_line('<= 5 should pass')]), {},
+                         'prose opening with < is not a tag')
+
+    def test_drift_subcommand_prints_rows_and_exits_zero(self):
+        path = write_transcript([user_line('hi'), {'type': 'telepathy', 'timestamp': 'x'}])
         buf = io.StringIO()
         try:
             with redirect_stdout(buf):
                 with self.assertRaises(SystemExit) as cm:
-                    extract.drift(tpath)
+                    extract.drift(path)
         finally:
-            os.remove(tpath)
-        return cm.exception.code, buf.getvalue()
-
-    def test_clean_transcript_prints_no_drift(self):
-        # A transcript containing only known shapes → 'no drift' and exit 0.
-        code, out = self._run([user_line('hello')])
-        self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), 'no drift')
-
-    def test_novel_line_type_emits_tab_row(self):
-        # A single unknown `type` emits one `kind<TAB>value<TAB>count` row and exits 0.
-        # Pins the tab delimiter, column order, and the 'line_type' kind label.
-        code, out = self._run([{'type': 'telepathy', 'timestamp': '2026-06-28T00:00:00Z'}])
-        self.assertEqual(code, 0)
-        rows = out.strip().splitlines()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].split('\t'), ['line_type', 'telepathy', '1'])
+            os.remove(path)
+        self.assertEqual(cm.exception.code, 0)
+        self.assertEqual(buf.getvalue().strip().split('\t'), ['line_type', 'telepathy', '1'])
 
 
-class CompactCheckTest(unittest.TestCase):
-    """compact_check fires on EITHER compaction shape and keeps exit-1/exit-0 semantics (ENG-2 B)."""
+# ---------------------------------------------------------------------------
+# 3. Compat surface — `hooks/commit-review-gate.py` imports these three by name
+# ---------------------------------------------------------------------------
 
-    def _run(self, lines):
-        tpath = write_transcript(lines)
-        buf = io.StringIO()
+class CompatSurfaceTest(unittest.TestCase):
+    def test_load_lines_skips_malformed(self):
+        fd, path = tempfile.mkstemp(suffix='.jsonl')
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(json.dumps({'type': 'user'}) + '\n')
+            f.write('{not json\n')
+            f.write(json.dumps({'type': 'assistant'}) + '\n')
         try:
-            with redirect_stdout(buf):
-                with self.assertRaises(SystemExit) as cm:
-                    extract.compact_check(tpath)
+            got = list(extract.load_lines(path))
         finally:
-            os.remove(tpath)
-        return cm.exception.code, buf.getvalue()
+            os.remove(path)
+        self.assertEqual([d['type'] for d in got], ['user', 'assistant'])
 
-    def test_compact_boundary_system_line_detected(self):
-        # The newer structured marker: type==system / subtype==compact_boundary.
-        code, out = self._run([user_line('hi'),
-                               {'type': 'system', 'subtype': 'compact_boundary',
-                                'timestamp': '2026-06-27T00:00:00Z'}])
-        self.assertEqual(code, 1, 'compact_boundary system line is a compaction event')
-        self.assertIn('compact_boundary', out)
+    def test_user_prompt_admits_a_typed_turn(self):
+        p = extract._user_prompt(user_line('do the thing'))
+        self.assertIsNotNone(p)
+        self.assertEqual(p, ('do the thing', None))
 
-    def test_compact_summary_flag_still_detected(self):
-        # The original field-keyed marker still fires (no regression).
-        code, out = self._run([user_line('recap', isCompactSummary=True)])
-        self.assertEqual(code, 1)
-        self.assertIn('isCompactSummary', out)
+    def test_user_prompt_drops_the_non_turns(self):
+        cases = {
+            'isMeta': user_line('injected', isMeta=True),
+            'sidechain': user_line('replayed', isSidechain=True),
+            'compact summary': user_line('This session is being continued…', isCompactSummary=True),
+            'tool_result': tool_result('output'),
+            'task-notification': user_line('bg task done', origin={'kind': 'task-notification'}),
+            'sdk-cli probe': user_line('eval probe', entrypoint='sdk-cli'),
+            'bash output echo': user_line('<bash-stdout>hi</bash-stdout>'),
+        }
+        for label, line in cases.items():
+            self.assertIsNone(extract._user_prompt(line), f'{label} is not a user turn')
 
-    def test_no_compaction_exits_zero(self):
-        code, _ = self._run([user_line('hi'), user_line('there')])
-        self.assertEqual(code, 0, 'a clean transcript exits 0')
-
-    def test_compact_check_both_markers(self):
-        # A transcript with BOTH an isCompactSummary user line AND a system/compact_boundary
-        # line fires exit 1 and both labels appear in the output — pins the '; '.join
-        # combined-marker path through compact_check().
-        code, out = self._run([
-            user_line('recap', isCompactSummary=True),
-            {'type': 'system', 'subtype': 'compact_boundary',
-             'timestamp': '2026-06-28T00:00:00Z'},
-        ])
-        self.assertEqual(code, 1)
-        self.assertIn('isCompactSummary', out)
-        self.assertIn('compact_boundary', out)
+    def test_cmd_name_re_group_one_is_the_command_name(self):
+        m = extract._CMD_NAME_RE.search('<command-name>/code-review</command-name>')
+        self.assertIsNotNone(m)
+        self.assertEqual(m.group(1), '/code-review')
 
 
-def hook_fire_line(content, ts='2026-07-10T00:00:00Z', hook_name='SomeHook', hook_event='PreToolUse'):
-    """A `hook_system_message` attachment line — the per-fire visibility one-liner ballast hooks
-    emit (empirically verified shape, see extract.py's `hook_fires` docstring)."""
-    return {'type': 'attachment', 'timestamp': ts,
-            'attachment': {'type': 'hook_system_message', 'content': content,
-                           'hookName': hook_name, 'hookEvent': hook_event, 'toolUseID': 'tu_x'}}
+# ---------------------------------------------------------------------------
+# 4. User-turn kinds — the six-kind ladder layered on the ported gate
+# ---------------------------------------------------------------------------
 
+class UserTurnKindTest(unittest.TestCase):
+    def test_typed_turn_is_verbatim(self):
+        self.assertEqual(extract._user_turn(user_line('ship it')), ('typed', 'ship it'))
 
-class HookFiresTest(unittest.TestCase):
-    def test_no_fires_prints_message(self):
-        tpath = write_transcript([user_line('hello')])
+    def test_typed_turn_strips_injected_spans_only(self):
+        line = user_line('<system-reminder>injected</system-reminder>real prose here')
+        kind, text = extract._user_turn(line)
+        self.assertEqual(kind, 'typed')
+        self.assertEqual(text, 'real prose here')
+
+    def test_bash_input_is_re_prefixed(self):
+        kind, text = extract._user_turn(user_line('<bash-input>git status</bash-input>'))
+        self.assertEqual((kind, text), ('bash_input', '!git status'))
+
+    def test_slash_command_renders_name_and_args(self):
+        raw = '<command-name>code-review</command-name><command-args>high</command-args>'
+        self.assertEqual(extract._user_turn(user_line(raw)), ('slash_command', '/code-review high'))
+
+    def test_queued_steer_via_attachment(self):
+        att = {'type': 'attachment', 'timestamp': TS % 3,
+               'attachment': {'type': 'queued_command', 'commandMode': 'prompt',
+                              'prompt': 'no, do X instead'}}
+        self.assertEqual(extract._user_turn(att), ('queued_steer', 'no, do X instead'))
+
+    def test_queued_steer_via_prompt_source(self):
+        kind, _ = extract._user_turn(user_line('type-ahead', promptSource='queued'))
+        self.assertEqual(kind, 'queued_steer')
+
+    def test_ask_answer_renders_question_and_choice(self):
+        line = user_line('', toolUseResult={
+            'answers': {'Which model?': 'Opus'},
+            'questions': [{'question': 'Which model?',
+                           'options': [{'label': 'Opus'}, {'label': 'Sonnet'}]}]},
+            message={'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': 'tu_a', 'content': 'ok'}]})
+        kind, text = extract._user_turn(line)
+        self.assertEqual(kind, 'ask_answer')
+        self.assertIn('Q: Which model?', text)
+        self.assertIn('A: Opus', text)
+
+    def test_goal_is_deduped_across_its_bookends(self):
+        goal = lambda met: {'type': 'attachment', 'timestamp': TS % 4,   # noqa: E731
+                            'attachment': {'type': 'goal_status', 'met': met,
+                                           'condition': 'all tests pass'}}
+        self.assertEqual(extract._user_turn(goal(False)), ('goal', 'all tests pass'))
+        path = write_transcript([goal(False), goal(True)])
         try:
-            out = capture(extract.hook_fires, tpath)
+            scan = extract._scan(path)
         finally:
-            os.remove(tpath)
-        self.assertEqual(out.strip(), 'no hook fires recorded')
+            os.remove(path)
+        self.assertEqual(scan['kinds']['goal'], 1, 'met=false/met=true bookends are one goal')
 
-    def test_tallies_by_parsed_hook_name(self):
-        # 2 fires of one hook + 1 of another -> correct per-hook counts + total.
+    def test_all_six_kinds_are_reachable_in_one_scan(self):
         lines = [
-            hook_fire_line('⚓ ballast: git-commit-guard — pre-commit reminder(s) injected'),
-            hook_fire_line('⚓ ballast: git-commit-guard — pre-commit reminder(s) injected'),
-            hook_fire_line('📐 ballast: doc-write-guard — durable-doc altitude reminder injected'),
+            user_line('typed prose', ts=TS % 0),
+            user_line('<bash-input>ls</bash-input>', ts=TS % 1),
+            user_line('<command-name>compact</command-name>', ts=TS % 2),
+            user_line('steered', ts=TS % 3, promptSource='queued'),
+            {'type': 'attachment', 'timestamp': TS % 4,
+             'attachment': {'type': 'goal_status', 'condition': 'green build'}},
+            user_line('', ts=TS % 5, toolUseResult={'answers': {'Q?': 'A'}},
+                      message={'role': 'user', 'content': [
+                          {'type': 'tool_result', 'tool_use_id': 't', 'content': 'x'}]}),
         ]
-        tpath = write_transcript(lines)
+        path = write_transcript(lines)
         try:
-            out = capture(extract.hook_fires, tpath)
+            scan = extract._scan(path)
         finally:
-            os.remove(tpath)
-        self.assertIn('git-commit-guard: 2', out)
-        self.assertIn('doc-write-guard: 1', out)
-        self.assertIn('**Total:** 3', out)
-
-    def test_no_em_dash_falls_back_to_full_line(self):
-        # 'ballast: principles loaded' has no em-dash-delimited name segment (real fire, verified
-        # live) — D2's fallback: tally by the full content line rather than dropping/crashing.
-        tpath = write_transcript([hook_fire_line('⚓ ballast: principles loaded')])
-        try:
-            out = capture(extract.hook_fires, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertIn('ballast: principles loaded: 1', out)
-
-    def test_plain_double_hyphen_separator_tallies_with_varying_clause(self):
-        # E1: '--' is a legitimate name/clause separator alongside the em dash. Two fires of the
-        # SAME hook with DIFFERENT clause tails must still tally as one name, not fragment into
-        # two fallback keys keyed off the full (varying) line.
-        lines = [
-            hook_fire_line('⚓ ballast: dev-process-nudge -- 1 process already referencing this project'),
-            hook_fire_line('⚓ ballast: dev-process-nudge -- 3 processes already referencing this project'),
-        ]
-        tpath = write_transcript(lines)
-        try:
-            out = capture(extract.hook_fires, tpath)
-        finally:
-            os.remove(tpath)
-        self.assertIn('dev-process-nudge: 2', out)
-        self.assertIn('**Total:** 2', out)
+            os.remove(path)
+        self.assertEqual(dict(scan['kinds']),
+                         {'typed': 1, 'bash_input': 1, 'slash_command': 1, 'queued_steer': 1,
+                          'goal': 1, 'ask_answer': 1})
 
 
-def _bundle_fixture_lines():
-    """A small, self-describing transcript: 4 lines, 2 real user turns, no compaction markers —
-    the known ground truth `BundleTest` checks the manifest metrics against."""
-    return [
-        user_line('first message', ts='2026-07-01T00:00:00Z'),
-        {'type': 'assistant', 'timestamp': '2026-07-01T00:00:01Z',
-         'message': {'id': 'msg_1', 'model': 'claude-sonnet-5',
-                     'content': [{'type': 'text', 'text': 'ok, on it'}]}},
-        user_line('second message', ts='2026-07-01T00:00:02Z'),
-        {'type': 'assistant', 'timestamp': '2026-07-01T00:00:03Z',
-         'message': {'id': 'msg_2', 'model': 'claude-sonnet-5', 'content': [
-             {'type': 'tool_use', 'name': 'Edit', 'id': 'tu_1', 'input': {'file_path': 'foo.py'}}]}},
+# ---------------------------------------------------------------------------
+# 5. Digest end-to-end
+# ---------------------------------------------------------------------------
+
+def synthetic_session(n_extra_tools=6):
+    """A ~30-record transcript exercising every section: user turns of several kinds, assistant
+    text, tool calls (ok + ERR), an Agent dispatch, a Skill call, edits, a git commit, a hook fire,
+    a compact boundary, and an interruption."""
+    lines = [
+        user_line('first ask: build the thing', ts=TS % 0),
+        assistant_line([{'type': 'text', 'text': 'Starting on it now, here is the plan.'}],
+                       ts=TS % 1, mid='m1', usage=usage()),
+        assistant_line([tool_use('Read', {'file_path': 'C:\\proj\\src\\a.py'}, 'tu_read')],
+                       ts=TS % 1, mid='m1', usage=usage()),
+        tool_result('file contents', 'tu_read', ts=TS % 2),
+        assistant_line([tool_use('Edit', {'file_path': 'C:\\proj\\src\\a.py'}, 'tu_edit')],
+                       ts=TS % 2, mid='m2', usage=usage(50, 60, 70, 80)),
+        tool_result('edited', 'tu_edit', ts=TS % 3),
+        assistant_line([tool_use('Write', {'file_path': 'C:\\proj\\src\\b.py'}, 'tu_write')],
+                       ts=TS % 3, mid='m3'),
+        tool_result('<tool_use_error>disk full</tool_use_error>', 'tu_write', ts=TS % 4,
+                    is_error=True),
+        user_line('<command-name>code-review</command-name>', ts=TS % 5),
+        assistant_line([tool_use('Agent', {'subagent_type': 'plan-executor',
+                                           'prompt': 'do the batch'}, 'tu_agent')], ts=TS % 5,
+                       mid='m4'),
+        tool_result('agent done', 'tu_agent', ts=TS % 6),
+        assistant_line([tool_use('Skill', {'skill': 'ballast:code-review', 'args': 'high'},
+                                 'tu_skill')], ts=TS % 6, mid='m5'),
+        tool_result('skill launched', 'tu_skill', ts=TS % 7),
+        assistant_line([tool_use('Bash', {'command': 'git commit -m "x"'}, 'tu_git')], ts=TS % 7,
+                       mid='m6'),
+        tool_result('[main 1a2b3c4] engine: land the digest\n 2 files changed', 'tu_git',
+                    ts=TS % 8),
+        {'type': 'attachment', 'timestamp': TS % 8,
+         'attachment': {'type': 'hook_system_message', 'content': '⚓ ballast: doc-write-guard — ok',
+                        'hookName': 'H', 'hookEvent': 'PreToolUse'}},
+        assistant_line([tool_use('mcp__gmail__search', {'query': 'inbox'}, 'tu_mcp')], ts=TS % 9,
+                       mid='m7'),
+        tool_result('3 results', 'tu_mcp', ts=TS % 10),
+        {'type': 'system', 'subtype': 'compact_boundary', 'timestamp': TS % 11},
+        user_line('second ask: now verify', ts=TS % 12),
+        assistant_line([tool_use('Bash', {'command': 'pytest -q'}, 'tu_test')], ts=TS % 12,
+                       mid='m8'),
+        tool_result('[Request interrupted by user for tool use]', 'tu_test', ts=TS % 13),
+        user_line('steer mid-flight', ts=TS % 14, promptSource='queued'),
+        assistant_line([{'type': 'text', 'text': 'Understood — switching approach.'}], ts=TS % 15,
+                       mid='m9', usage=usage(10, 20, 30, 40)),
     ]
+    for i in range(n_extra_tools):
+        lines.append(assistant_line([tool_use('Grep', {'pattern': f'needle{i}'}, f'tu_g{i}')],
+                                    ts=TS % (16 + i), mid=f'mg{i}'))
+        lines.append(tool_result('match', f'tu_g{i}', ts=TS % (16 + i)))
+    return lines
 
 
-class BundleTest(unittest.TestCase):
-    """`bundle` happy path (D1): all 8 dumps written, manifest parses, statuses ok, metrics sane."""
+class DigestTest(unittest.TestCase):
+    def test_digest_writes_both_files_with_every_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tpath = write_transcript(synthetic_session(), os.path.join(tmp, 's.jsonl'))
+            out = os.path.join(tmp, 'out')
+            code, stdout, _ = run_digest(out_dir=out, transcript=tpath)
+            self.assertEqual(code, 0, 'a clean digest exits 0')
+            text, m = read_digest(out)
+            for section in ('## SESSION', '## USER TURNS', '## TIMELINE', '## INVENTORY',
+                            '## FILES TOUCHED', '## ANOMALIES'):
+                self.assertIn(section, text, f'{section} must be present')
+            self.assertNotIn('[section unavailable', text)
+            for field in ('schema', 'transcript', 'session_id', 'project_dir', 'generated_utc',
+                          'transcript_lines', 'transcript_bytes', 'first_ts', 'last_ts',
+                          'wall_minutes', 'user_turns', 'assistant_responses', 'tool_calls_total',
+                          'subagents', 'compact_boundaries', 'models', 'total_est_cost_usd',
+                          'suggested_slug', 'git_window', 'truncation', 'focus',
+                          'digest_generation_seconds', 'resolved_via'):
+                self.assertIn(field, m, f'manifest must carry {field}')
+            self.assertEqual(m['schema'], 5)
+            self.assertEqual(m['truncation']['digest_bytes'],
+                             os.path.getsize(os.path.join(out, 'digest.md')),
+                             'reported digest_bytes must equal the file on disk')
+            self.assertEqual(m['git_window'], {'since': m['first_ts'], 'until': m['last_ts']})
 
-    def test_bundle_happy_path_all_files_and_manifest(self):
-        lines = _bundle_fixture_lines()
-        tpath = write_transcript(lines)
+    def test_u_numbering_is_consistent_between_sections(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tpath = write_transcript(synthetic_session(), os.path.join(tmp, 's.jsonl'))
+            out = os.path.join(tmp, 'out')
+            run_digest(out_dir=out, transcript=tpath)
+            text, m = read_digest(out)
+            turns = text.split('## USER TURNS', 1)[1].split('## TIMELINE', 1)[0]
+            timeline = text.split('## TIMELINE', 1)[1].split('## INVENTORY', 1)[0]
+            headers = [ln for ln in turns.splitlines() if ln.startswith('### U')]
+            self.assertEqual(len(headers), m['user_turns']['total'])
+            self.assertEqual([h.split()[1] for h in headers],
+                             [f'U{i + 1}' for i in range(len(headers))])
+            for i in range(len(headers)):
+                self.assertIn(f'U{i + 1} (', timeline, 'every user turn is marked in the timeline')
+
+    def test_session_facts_and_inventory_reflect_the_transcript(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tpath = write_transcript(synthetic_session(), os.path.join(tmp, 's.jsonl'))
+            out = os.path.join(tmp, 'out')
+            run_digest(out_dir=out, transcript=tpath)
+            text, m = read_digest(out)
+            self.assertEqual(m['user_turns']['total'], 4)
+            self.assertEqual(m['compact_boundaries'], 1)
+            self.assertGreater(m['tool_calls_total'], 6)
+            self.assertIn('ballast:code-review', text)          # skills inventory
+            self.assertIn('plan-executor', text)                # agent dispatch
+            self.assertIn('gmail', text)                        # MCP server table
+            self.assertIn('doc-write-guard', text)              # hook fire
+            self.assertIn('1a2b3c4', text)                      # git commit sha
+            self.assertIn('a.py', text)                         # files touched
+            self.assertIn('--- COMPACT ---', text)
+            self.assertIn('[interrupted]', text)
+            self.assertIn('(ERR)', text)
+
+    def test_focus_is_echoed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tpath = write_transcript(synthetic_session(2), os.path.join(tmp, 's.jsonl'))
+            out = os.path.join(tmp, 'out')
+            run_digest(out_dir=out, transcript=tpath, focus='budget algorithm')
+            text, m = read_digest(out)
+            self.assertEqual(m['focus'], 'budget algorithm')
+            self.assertIn('budget algorithm', text)
+
+    def test_oversized_record_is_counted_from_an_unrendered_payload(self):
+        # The real shape: a PDF read's 12 MB rides `toolUseResult.file.base64`, which no section
+        # renders — a rendered-content measure would report zero on the very records worth flagging.
+        rec = tool_result('PDF file read: report.pdf', 'tu_pdf')
+        rec['toolUseResult'] = {'file': {'base64': 'A' * (extract._OVERSIZE_CHARS + 10)}}
+        path = write_transcript([user_line('read it'), rec])
         try:
-            with tempfile.TemporaryDirectory() as outdir:
-                bundle_out = os.path.join(outdir, 'bundle')
-                buf = io.StringIO()
-                with redirect_stdout(buf):
-                    with self.assertRaises(SystemExit) as cm:
-                        extract.bundle(tpath, bundle_out)
-                self.assertEqual(cm.exception.code, 0)
-
-                manifest_path = os.path.join(bundle_out, 'manifest.json')
-                self.assertTrue(os.path.isfile(manifest_path))
-                with open(manifest_path, encoding='utf-8') as f:
-                    manifest = json.load(f)
-
-                self.assertEqual(manifest['schema'], 1)
-                expected_names = ['user-msgs', 'invocations', 'edits', 'assistant-text',
-                                   'subagents', 'tool-breakdown', 'stats', 'hook-fires']
-                for name in expected_names:
-                    self.assertIn(name, manifest['files'], f'{name}.md missing from manifest')
-                    self.assertEqual(manifest['files'][name]['status'], 'ok')
-                    fp = os.path.join(bundle_out, manifest['files'][name]['file'])
-                    self.assertTrue(os.path.isfile(fp), f'{fp} was not written')
-
-                m = manifest['metrics']
-                self.assertEqual(m['transcript_lines'], len(lines))
-                self.assertEqual(m['user_turns'], 2, 'two real user_line entries, no markers')
-                self.assertFalse(m['compacted'])
-                self.assertEqual(m['time_window'], ['2026-07-01T00:00:00Z', '2026-07-01T00:00:03Z'])
-
-                # stdout contract: manifest path, one status line per dump, one metrics summary.
-                out = buf.getvalue()
-                self.assertIn(manifest_path, out)
-                self.assertIn('user_turns=2', out)
-                self.assertIn('compacted=no', out)
+            scan = extract._scan(path)
         finally:
-            os.remove(tpath)
+            os.remove(path)
+        self.assertEqual(scan['oversized'], 1)
+
+    def test_idle_gap_marker(self):
+        lines = [user_line('start', ts='2026-07-28T10:00:00.000Z'),
+                 assistant_line([{'type': 'text', 'text': 'working on it right now'}],
+                                ts='2026-07-28T10:00:10.000Z'),
+                 user_line('back', ts='2026-07-28T12:30:00.000Z')]
+        with tempfile.TemporaryDirectory() as tmp:
+            tpath = write_transcript(lines, os.path.join(tmp, 's.jsonl'))
+            out = os.path.join(tmp, 'out')
+            run_digest(out_dir=out, transcript=tpath)
+            text, _ = read_digest(out)
+            self.assertIn('[idle ~149m]', text)
 
 
-class BundleBoundedWriteTest(unittest.TestCase):
-    """Bounded-write refusal (D1): a non-empty --out dir with no manifest.json is refused; a dir
-    the tool already wrote (has manifest.json) is a re-run that succeeds in place."""
+# ---------------------------------------------------------------------------
+# 6. Budget ceiling — the protected section survives the squeeze
+# ---------------------------------------------------------------------------
 
-    def test_refuses_non_empty_dir_without_manifest(self):
-        tpath = write_transcript(_bundle_fixture_lines())
+class BudgetTest(unittest.TestCase):
+    def _bloated(self):
+        """Three long user prompts plus a long tail of tool calls carrying multi-KB args and
+        multi-KB results — the shape that blows a small budget."""
+        lines = []
+        for i in range(3):
+            lines.append(user_line(f'PROMPT{i} ' + ('long user reasoning. ' * 400), ts=TS % i))
+        for i in range(120):
+            lines.append(assistant_line(
+                [{'type': 'text', 'text': 'assistant narration ' * 200}], ts=TS % (i % 60),
+                mid=f'mt{i}'))
+            lines.append(assistant_line(
+                [tool_use('Bash', {'command': f'echo {i} ' + ('x' * 4000)}, f'tu_{i}')],
+                ts=TS % (i % 60), mid=f'mb{i}'))
+            lines.append(tool_result('R' * 200000, f'tu_{i}', ts=TS % (i % 60)))
+        return lines
+
+    def test_digest_stays_under_the_hard_ceiling(self):
+        budget = 20000
+        with tempfile.TemporaryDirectory() as tmp:
+            tpath = write_transcript(self._bloated(), os.path.join(tmp, 's.jsonl'))
+            out = os.path.join(tmp, 'out')
+            code, _, _ = run_digest(out_dir=out, transcript=tpath, budget=budget)
+            self.assertEqual(code, 0)
+            text, m = read_digest(out)
+            self.assertLessEqual(m['truncation']['digest_bytes'], int(budget * 1.25),
+                                 'digest must land under the 1.25x hard ceiling')
+            self.assertGreater(m['truncation']['records_truncated'], 0,
+                               'the timeline elision must be reported')
+            # USER TURNS is protected: every prompt still renders at or above the 1024 floor.
+            turns = text.split('## USER TURNS', 1)[1].split('## TIMELINE', 1)[0]
+            bodies = turns.split('### U')[1:]
+            self.assertEqual(len(bodies), 3, 'no user turn is dropped')
+            for b in bodies:
+                self.assertGreaterEqual(len(b), 1024, 'user prompts never cut below the floor')
+                self.assertIn('elided', b)
+
+    def test_user_section_is_not_degraded_when_it_is_not_the_bloat(self):
+        # A big budget with the same transcript: the user cap never leaves 4096, so a prompt that
+        # fits at 4096 is NOT elided (the ladder only touches the protected section under pressure).
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = [user_line('short and sweet', ts=TS % 0)] + self._bloated()[3:40]
+            tpath = write_transcript(lines, os.path.join(tmp, 's.jsonl'))
+            out = os.path.join(tmp, 'out')
+            run_digest(out_dir=out, transcript=tpath, budget=200000)
+            text, m = read_digest(out)
+            self.assertEqual(m['truncation']['user_prompts_truncated'], 0)
+            self.assertIn('short and sweet', text)
+
+
+# ---------------------------------------------------------------------------
+# 7. Bounded-write guard
+# ---------------------------------------------------------------------------
+
+class BoundedWriteTest(unittest.TestCase):
+    def test_refuses_a_non_empty_dir_with_no_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tpath = write_transcript(synthetic_session(1), os.path.join(tmp, 's.jsonl'))
+            out = os.path.join(tmp, 'out')
+            os.makedirs(out)
+            with open(os.path.join(out, 'someone-elses.md'), 'w', encoding='utf-8') as f:
+                f.write('data')
+            code, _, err = run_digest(out_dir=out, transcript=tpath)
+            self.assertEqual(code, 2)
+            self.assertIn('refusing to write', err)
+
+    def test_refuses_a_dir_holding_another_transcripts_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = write_transcript(synthetic_session(1), os.path.join(tmp, 'a.jsonl'))
+            b = write_transcript(synthetic_session(1), os.path.join(tmp, 'b.jsonl'))
+            out = os.path.join(tmp, 'out')
+            self.assertEqual(run_digest(out_dir=out, transcript=a)[0], 0)
+            code, _, err = run_digest(out_dir=out, transcript=b)
+            self.assertEqual(code, 2)
+            self.assertIn('different transcript', err)
+
+    def test_re_run_on_the_same_transcript_overwrites_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = write_transcript(synthetic_session(1), os.path.join(tmp, 'a.jsonl'))
+            out = os.path.join(tmp, 'out')
+            self.assertEqual(run_digest(out_dir=out, transcript=a)[0], 0)
+            self.assertEqual(run_digest(out_dir=out, transcript=a)[0], 0)
+
+    def test_default_out_dir_is_per_session_under_the_user_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tpath = write_transcript(synthetic_session(1), os.path.join(tmp, 's.jsonl'))
+            expected = os.path.join(os.path.expanduser('~'), '.claude', '.cache', 'ballast',
+                                    'digest', 's')
+            code, stdout, _ = run_digest(transcript=tpath)
+            try:
+                self.assertEqual(code, 0)
+                self.assertTrue(stdout.startswith(expected), stdout)
+            finally:
+                for f in ('digest.md', 'manifest.json'):
+                    p = os.path.join(expected, f)
+                    if os.path.exists(p):
+                        os.remove(p)
+                if os.path.isdir(expected):
+                    os.rmdir(expected)
+
+
+# ---------------------------------------------------------------------------
+# 8. Usage dedup + pricing
+# ---------------------------------------------------------------------------
+
+class UsageTest(unittest.TestCase):
+    def test_two_records_sharing_a_message_id_are_counted_once(self):
+        u = usage(1000, 2000, 3000, 4000)
+        lines = [assistant_line([{'type': 'text', 'text': 'part one of the response'}],
+                                mid='same', usage=u),
+                 assistant_line([tool_use('Read', {'file_path': 'x'}, 'tu_x')], mid='same', usage=u)]
+        path = write_transcript(lines)
         try:
-            with tempfile.TemporaryDirectory() as outdir:
-                target = os.path.join(outdir, 'existing')
-                os.makedirs(target)
-                with open(os.path.join(target, 'stray.txt'), 'w', encoding='utf-8') as f:
-                    f.write('junk')
-                buf, errbuf = io.StringIO(), io.StringIO()
-                with redirect_stdout(buf), redirect_stderr(errbuf):
-                    with self.assertRaises(SystemExit) as cm:
-                        extract.bundle(tpath, target)
-                self.assertEqual(cm.exception.code, 2)
-                self.assertEqual(sorted(os.listdir(target)), ['stray.txt'],
-                                  'nothing written on refusal')
+            scan = extract._scan(path)
         finally:
-            os.remove(tpath)
+            os.remove(path)
+        tok = scan['models']['claude-opus-4-8']
+        self.assertEqual((tok['input'], tok['output'], tok['cache_create'], tok['cache_read']),
+                         (1000, 2000, 3000, 4000), 'one response, counted once')
+        self.assertEqual(scan['assistant_responses'], 1, 'distinct message.id == one response')
 
-    def test_rerun_with_existing_manifest_succeeds(self):
-        tpath = write_transcript(_bundle_fixture_lines())
+    def test_pricing_families_and_the_unknown_model_null(self):
+        self.assertEqual(extract._price_for('claude-opus-4-8[1m]')[:2], (5.0, 25.0))
+        self.assertEqual(extract._price_for('claude-opus-4-1-20250805')[:2], (15.0, 75.0))
+        self.assertEqual(extract._price_for('claude-fable-5')[:2], (10.0, 50.0))
+        self.assertEqual(extract._price_for('claude-sonnet-4-5')[:2], (3.0, 15.0))
+        self.assertEqual(extract._price_for('claude-haiku-4-5')[:2], (1.0, 5.0))
+        self.assertIsNone(extract._price_for('gpt-9-turbo'), 'an unknown family is unpriced')
+        tok = {'input': 1_000_000, 'output': 0, 'cache_read': 0, 'cc_5m': 0, 'cc_1h': 0}
+        self.assertAlmostEqual(extract._cost_usd('claude-opus-4-8', tok), 5.0)
+        self.assertIsNone(extract._cost_usd('gpt-9-turbo', tok))
+
+    def test_unknown_model_keeps_tokens_but_reports_null_cost(self):
+        lines = [assistant_line([{'type': 'text', 'text': 'hello from the future model'}],
+                                mid='m1', usage=usage(), model='claude-nova-9')]
+        with tempfile.TemporaryDirectory() as tmp:
+            tpath = write_transcript(lines, os.path.join(tmp, 's.jsonl'))
+            out = os.path.join(tmp, 'out')
+            run_digest(out_dir=out, transcript=tpath)
+            _, m = read_digest(out)
+            self.assertEqual(m['models']['claude-nova-9']['input'], 100)
+            self.assertIsNone(m['models']['claude-nova-9']['est_cost_usd'])
+            self.assertEqual(m['total_est_cost_usd'], 0)
+
+
+# ---------------------------------------------------------------------------
+# 9. Fail-open sections
+# ---------------------------------------------------------------------------
+
+class FailOpenTest(unittest.TestCase):
+    def test_a_raising_section_degrades_to_a_marker(self):
+        original = extract._sec_inventory
+
+        def boom(scan, caps):
+            raise RuntimeError('synthetic section failure')
+
+        extract._sec_inventory = boom
         try:
-            with tempfile.TemporaryDirectory() as outdir:
-                target = os.path.join(outdir, 'bundle')
-                buf1 = io.StringIO()
-                with redirect_stdout(buf1):
-                    with self.assertRaises(SystemExit) as cm1:
-                        extract.bundle(tpath, target)
-                self.assertEqual(cm1.exception.code, 0)
-
-                # Re-run into the same (now non-empty, manifest.json-bearing) dir succeeds.
-                buf2 = io.StringIO()
-                with redirect_stdout(buf2):
-                    with self.assertRaises(SystemExit) as cm2:
-                        extract.bundle(tpath, target)
-                self.assertEqual(cm2.exception.code, 0)
+            with tempfile.TemporaryDirectory() as tmp:
+                tpath = write_transcript(synthetic_session(2), os.path.join(tmp, 's.jsonl'))
+                out = os.path.join(tmp, 'out')
+                code, _, _ = run_digest(out_dir=out, transcript=tpath)
+                text, _ = read_digest(out)
         finally:
-            os.remove(tpath)
+            extract._sec_inventory = original
+        self.assertEqual(code, 0, 'a broken section never fails the run')
+        self.assertIn('[section unavailable: synthetic section failure]', text)
+        for section in ('## SESSION', '## USER TURNS', '## TIMELINE', '## FILES TOUCHED',
+                        '## ANOMALIES'):
+            self.assertIn(section, text, f'{section} survives a sibling failure')
+        self.assertIn('first ask: build the thing', text, 'the other sections keep their content')
 
 
-class BundleDumpIsolationTest(unittest.TestCase):
-    """Per-dump isolation (D1): one dump raising is recorded as an error and the rest still
-    succeed; overall exit code reflects the failure."""
+# ---------------------------------------------------------------------------
+# 10. Transcript resolution — env id, cwd fallback, and `--id` as a path
+# ---------------------------------------------------------------------------
 
-    def test_one_dump_failing_is_isolated(self):
-        tpath = write_transcript(_bundle_fixture_lines())
-        original = list(extract._BUNDLE_DUMPS)
+class SuggestedSlugTest(unittest.TestCase):
+    ROOT = 'C:\\proj' if os.name == 'nt' else '/proj'
 
-        def _boom(path):
-            raise RuntimeError('simulated dump failure')
+    def slug(self, *rels):
+        return extract._suggested_slug([os.path.join(self.ROOT, r) for r in rels], self.ROOT)
 
-        # Patch the shared _BUNDLE_DUMPS LIST in place (not extract.edits) — bundle() looks up
-        # this module-level list by name at call time, but each entry already holds a direct
-        # function reference captured when the list was built, so reassigning extract.edits alone
-        # would not reach it.
-        extract._BUNDLE_DUMPS[:] = [(name, _boom if name == 'edits' else fn)
-                                     for name, fn in original]
+    def test_dot_dirs_descend_to_a_content_bearing_segment(self):
+        self.assertEqual(self.slug('.claude/harness-sweep/dossier.md'), 'harness-sweep')
+
+    def test_pass_through_layout_dirs_descend(self):
+        self.assertEqual(self.slug('src/components/Foo.tsx', 'src/components/Bar.tsx'),
+                         'components')
+
+    def test_ignored_dir_on_the_descent_kills_the_path(self):
+        self.assertEqual(self.slug('.debug/shot.png', '.debug/shot2.png'), 'general')
+
+    def test_bare_dotfile_carries_no_topic(self):
+        self.assertEqual(self.slug('.gitignore'), 'general')
+
+    def test_root_file_still_uses_its_stem(self):
+        self.assertEqual(self.slug('CHANGELOG.md'), 'changelog')
+
+
+class ResolveTest(unittest.TestCase):
+    def setUp(self):
+        self._saved = os.environ.pop('CLAUDE_CODE_SESSION_ID', None)
+
+    def tearDown(self):
+        if self._saved is not None:
+            os.environ['CLAUDE_CODE_SESSION_ID'] = self._saved
+
+    def test_slug_encoding_matches_the_real_projects_dir_shape(self):
+        self.assertEqual(extract.encode_cwd_to_slug('C:\\Users\\dev\\Projects\\ballast'),
+                         'C--Users-dev-Projects-ballast')
+
+    def test_env_session_id_resolves_the_live_transcript(self):
+        uuid = '11111111-2222-3333-4444-555555555555'
+        with tempfile.TemporaryDirectory() as home:
+            pdir = os.path.join(home, '.claude', 'projects', 'C--proj')
+            os.makedirs(pdir)
+            live = write_transcript([user_line('hi')], os.path.join(pdir, uuid + '.jsonl'))
+            r = extract._resolve_transcript(session_id=uuid, home=home, cwd='C:\\other')
+            self.assertEqual(r['via'], 'env')
+            self.assertEqual(os.path.abspath(r['live']), os.path.abspath(live))
+
+    def test_cwd_fallback_picks_the_newest_jsonl_in_the_slug_dir(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            pdir = os.path.join(home, '.claude', 'projects', extract.encode_cwd_to_slug(cwd))
+            os.makedirs(pdir)
+            older = write_transcript([user_line('old')], os.path.join(pdir, 'a.jsonl'))
+            newer = write_transcript([user_line('new')], os.path.join(pdir, 'b.jsonl'))
+            os.utime(older, (time.time() - 600, time.time() - 600))
+            r = extract._resolve_transcript(home=home, cwd=cwd)
+            self.assertEqual(r['via'], 'cwd_newest')
+            self.assertEqual(os.path.abspath(r['live']), os.path.abspath(newer))
+            self.assertEqual(r['uuid'], 'b', 'a non-UUID stem falls back to the bare stem')
+
+    def test_unresolvable_returns_no_live_path(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            r = extract._resolve_transcript(home=home, cwd=cwd)
+            self.assertIsNone(r['live'])
+            self.assertIsNone(r['via'])
+
+    def test_explicit_id_resolves_a_unique_prefix(self):
+        uuid = '11111111-2222-3333-4444-555555555555'
+        with tempfile.TemporaryDirectory() as home:
+            pdir = os.path.join(home, '.claude', 'projects', 'C--proj')
+            os.makedirs(pdir)
+            live = write_transcript([user_line('hi')], os.path.join(pdir, uuid + '.jsonl'))
+            r = extract._resolve_transcript(session_id='11111111', home=home, cwd='C:\\other')
+            self.assertEqual(r['via'], 'id_prefix')
+            self.assertEqual(os.path.abspath(r['live']), os.path.abspath(live))
+            self.assertEqual(r['uuid'], uuid, 'prefix hit widens to the full UUID')
+
+    def test_explicit_id_miss_errors_instead_of_falling_back(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cwd:
+            pdir = os.path.join(home, '.claude', 'projects', extract.encode_cwd_to_slug(cwd))
+            os.makedirs(pdir)
+            write_transcript([user_line('decoy')], os.path.join(pdir, 'a.jsonl'))
+            r = extract._resolve_transcript(session_id='deadbeef', home=home, cwd=cwd)
+            self.assertIsNone(r['live'], 'an explicit id must never fall back to cwd_newest')
+            self.assertIn('deadbeef', r['error'])
+
+    def test_explicit_id_ambiguous_prefix_errors(self):
+        with tempfile.TemporaryDirectory() as home:
+            pdir = os.path.join(home, '.claude', 'projects', 'C--proj')
+            os.makedirs(pdir)
+            for tail in ('aaaa', 'bbbb'):
+                write_transcript([user_line('x')], os.path.join(
+                    pdir, f'11111111-2222-3333-4444-55555555{tail}.jsonl'))
+            r = extract._resolve_transcript(session_id='11111111', home=home, cwd='C:\\other')
+            self.assertIsNone(r['live'])
+            self.assertIn('ambiguous', r['error'])
+
+    def test_id_flag_accepts_a_transcript_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tpath = write_transcript(synthetic_session(1), os.path.join(tmp, 's.jsonl'))
+            out = os.path.join(tmp, 'out')
+            code, _, _ = run_digest(out_dir=out, session_id=tpath)
+            self.assertEqual(code, 0, '--id may carry a .jsonl path instead of a session id')
+            _, m = read_digest(out)
+            self.assertEqual(m['resolved_via'], 'explicit')
+            self.assertEqual(m['transcript'], os.path.abspath(tpath))
+
+
+# ---------------------------------------------------------------------------
+# 11. Review-batch regressions — pairing, raw-command git detection, prose cleaning,
+#     oversize-probe starvation, and the shared `_cut` renderer
+# ---------------------------------------------------------------------------
+
+class PairingRegressionTest(unittest.TestCase):
+    def _ask_lines(self):
+        """An AskUserQuestion tool_use whose ANSWER line is both a real user turn and the
+        tool_result that closes it — the line that used to `continue` before pairing."""
+        return [
+            assistant_line([tool_use('AskUserQuestion',
+                                     {'questions': [{'question': 'Which model?'}]}, 'tu_ask')],
+                           ts=TS % 1, mid='m1'),
+            user_line('', ts=TS % 2,
+                      toolUseResult={'answers': {'Which model?': 'Opus'},
+                                     'questions': [{'question': 'Which model?'}]},
+                      message={'role': 'user', 'content': [
+                          {'type': 'tool_result', 'tool_use_id': 'tu_ask', 'content': 'ok'}]}),
+        ]
+
+    def test_ask_answer_line_pairs_its_pending_tool_use(self):
+        path = write_transcript(self._ask_lines())
         try:
-            with tempfile.TemporaryDirectory() as outdir:
-                target = os.path.join(outdir, 'bundle')
-                buf, errbuf = io.StringIO(), io.StringIO()
-                with redirect_stdout(buf), redirect_stderr(errbuf):
-                    with self.assertRaises(SystemExit) as cm:
-                        extract.bundle(tpath, target)
-                self.assertEqual(cm.exception.code, 1, 'one failed dump -> exit 1')
-
-                with open(os.path.join(target, 'manifest.json'), encoding='utf-8') as f:
-                    manifest = json.load(f)
-                self.assertEqual(manifest['files']['edits']['status'], 'error')
-                self.assertIn('simulated dump failure', manifest['files']['edits']['error'])
-                for name in ('user-msgs', 'invocations', 'assistant-text', 'subagents',
-                             'tool-breakdown', 'stats', 'hook-fires'):
-                    self.assertEqual(manifest['files'][name]['status'], 'ok',
-                                      f'{name} should be unaffected by the edits failure')
+            scan = extract._scan(path)
         finally:
-            extract._BUNDLE_DUMPS[:] = original
-            os.remove(tpath)
+            os.remove(path)
+        self.assertEqual(scan['unpaired_tools'], 0,
+                         'an ask-answer line closes its AskUserQuestion tool_use')
+        self.assertEqual(scan['kinds']['ask_answer'], 1, 'it is still counted as a user turn')
+        rows = [ev for ev in scan['events'] if ev.get('n2') == 'AskUserQuestion']
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].get('done'), 'the timeline row must read ok, not ?')
 
+    def test_ask_answer_pairing_shows_ok_in_the_rendered_timeline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tpath = write_transcript(self._ask_lines(), os.path.join(tmp, 's.jsonl'))
+            out = os.path.join(tmp, 'out')
+            self.assertEqual(run_digest(out_dir=out, transcript=tpath)[0], 0)
+            text, _ = read_digest(out)
+            timeline = text.split('## TIMELINE', 1)[1].split('## INVENTORY', 1)[0]
+            row = [ln for ln in timeline.splitlines() if 'AskUserQuestion' in ln]
+            self.assertEqual(len(row), 1, timeline)
+            self.assertIn('(ok)', row[0])
+            self.assertNotIn('**Tool calls with no recorded result:**', text)
 
-class BundleMetricsFailureTest(unittest.TestCase):
-    """E2: a metrics-block exception must not strand the dumps already written to disk with no
-    manifest.json at all — the manifest still lands, with null metrics + a metrics_error key."""
-
-    def test_metrics_failure_still_writes_manifest_with_null_metrics(self):
-        tpath = write_transcript(_bundle_fixture_lines())
-        original = extract._count_lines
-
-        def _boom(path):
-            raise RuntimeError('simulated metrics failure')
-
-        # Patch the module-level function bundle() calls by bare name (mirrors how
-        # BundleDumpIsolationTest patches _BUNDLE_DUMPS in place).
-        extract._count_lines = _boom
+    def test_ordinary_tool_result_still_pairs(self):
+        lines = [assistant_line([tool_use('Read', {'file_path': 'x.py'}, 'tu_r')], mid='m1'),
+                 tool_result('contents', 'tu_r')]
+        path = write_transcript(lines)
         try:
-            with tempfile.TemporaryDirectory() as outdir:
-                target = os.path.join(outdir, 'bundle')
-                buf, errbuf = io.StringIO(), io.StringIO()
-                with redirect_stdout(buf), redirect_stderr(errbuf):
-                    with self.assertRaises(SystemExit) as cm:
-                        extract.bundle(tpath, target)
-                self.assertEqual(cm.exception.code, 1, 'metrics failure -> exit 1')
-
-                manifest_path = os.path.join(target, 'manifest.json')
-                self.assertTrue(os.path.isfile(manifest_path),
-                                 'manifest must still be written despite the metrics crash')
-                with open(manifest_path, encoding='utf-8') as f:
-                    manifest = json.load(f)
-                self.assertIsNone(manifest['metrics']['transcript_lines'])
-                self.assertIsNone(manifest['metrics']['user_turns'])
-                self.assertIn('simulated metrics failure', manifest.get('metrics_error', ''))
-                # Per-dump statuses are unaffected -- all 8 dumps still ran before the metrics block.
-                for name in ('user-msgs', 'invocations', 'edits', 'assistant-text',
-                             'subagents', 'tool-breakdown', 'stats', 'hook-fires'):
-                    self.assertEqual(manifest['files'][name]['status'], 'ok')
-                self.assertIn('simulated metrics failure', errbuf.getvalue())
+            scan = extract._scan(path)
         finally:
-            extract._count_lines = original
-            os.remove(tpath)
+            os.remove(path)
+        self.assertEqual(scan['unpaired_tools'], 0)
 
 
-class BundleStaleDumpFileTest(unittest.TestCase):
-    """E3: a re-run's failing dump must not leave the PREVIOUS run's file on disk — the invariant
-    is status:"ok" iff <name>.md on disk is from THIS run."""
-
-    def test_failing_dump_removes_stale_file_from_prior_run(self):
-        tpath = write_transcript(_bundle_fixture_lines())
+class GitDetectionRegressionTest(unittest.TestCase):
+    def test_git_commit_past_the_arg_cap_is_still_detected(self):
+        # A real compound: `git add <many paths> && git commit -m …`, with the commit verb sitting
+        # well past the 400-char rendered arg cap. Detection reads the RAW input, never the cut.
+        cmd = 'git add ' + ' '.join(f'src/path/number-{i}.py' for i in range(20)) + \
+              ' && git commit -m "engine: land the batch"'
+        self.assertGreater(len(cmd), 450, 'the fixture must exceed the 400-char arg cap')
+        lines = [assistant_line([tool_use('Bash', {'command': cmd}, 'tu_git')], mid='m1'),
+                 tool_result('[main 9f8e7d6] engine: land the batch\n 3 files changed', 'tu_git')]
+        path = write_transcript(lines)
         try:
-            with tempfile.TemporaryDirectory() as outdir:
-                target = os.path.join(outdir, 'bundle')
-                # First run: everything succeeds; pre-seeds the bundle dir with a real manifest
-                # AND a real edits.md (the "stale file" this test's second run must clean up).
-                with redirect_stdout(io.StringIO()):
-                    with self.assertRaises(SystemExit) as cm1:
-                        extract.bundle(tpath, target)
-                self.assertEqual(cm1.exception.code, 0)
-                edits_file = os.path.join(target, 'edits.md')
-                self.assertTrue(os.path.isfile(edits_file), 'precondition: first run wrote edits.md')
+            scan = extract._scan(path)
+        finally:
+            os.remove(path)
+        self.assertEqual(scan['commits'], [('9f8e7d6', 'engine: land the batch')])
 
-                # Second run: force 'edits' to fail (patch _BUNDLE_DUMPS in place, as the existing
-                # isolation test does) — the prior edits.md must not survive under an error status.
-                original = list(extract._BUNDLE_DUMPS)
+    def test_a_non_commit_bash_call_is_not_flagged(self):
+        lines = [assistant_line([tool_use('Bash', {'command': 'git status'}, 'tu_s')], mid='m1'),
+                 tool_result('[main 1234567] not a commit line', 'tu_s')]
+        path = write_transcript(lines)
+        try:
+            scan = extract._scan(path)
+        finally:
+            os.remove(path)
+        self.assertEqual(scan['commits'], [])
 
-                def _boom(path):
-                    raise RuntimeError('simulated dump failure')
 
-                extract._BUNDLE_DUMPS[:] = [(name, _boom if name == 'edits' else fn)
-                                             for name, fn in original]
+class CleanProseRegressionTest(unittest.TestCase):
+    def test_back_to_back_leading_ide_elements_are_all_stripped(self):
+        raw = ('<ide_opened_file>The user opened a.py</ide_opened_file>'
+               '<ide_selection>lines 1-4</ide_selection>real prompt')
+        self.assertEqual(extract._clean_prose(raw), 'real prompt')
+        kind, text = extract._user_turn(user_line(raw))
+        self.assertEqual((kind, text), ('typed', 'real prompt'))
+
+    def test_a_single_leading_element_and_plain_prose_are_unchanged_in_behavior(self):
+        self.assertEqual(extract._clean_prose('<ide_selection>x</ide_selection>hi'), 'hi')
+        self.assertEqual(extract._clean_prose('just prose'), 'just prose')
+
+
+class OversizeProbeRegressionTest(unittest.TestCase):
+    def test_oversized_string_among_the_earliest_keys_of_a_wide_record(self):
+        # The LIFO stack pops the LAST-pushed entries first, so in a record wider than the node
+        # budget the earliest keys were never reached. Strings must be tested at extend time.
+        rec = {'big': 'A' * (extract._OVERSIZE_CHARS + 10)}
+        rec.update({f'k{i:05d}': i for i in range(2500)})
+        self.assertTrue(extract._max_str_len(rec, extract._OVERSIZE_CHARS))
+
+    def test_a_wide_record_with_no_oversized_string_is_not_flagged(self):
+        rec = {f'k{i:05d}': 'small' for i in range(2500)}
+        self.assertFalse(extract._max_str_len(rec, extract._OVERSIZE_CHARS))
+
+    def test_the_deep_real_shapes_still_hit(self):
+        deep = {'toolUseResult': {'file': {'base64': 'A' * (extract._OVERSIZE_CHARS + 1)}}}
+        self.assertTrue(extract._max_str_len(deep, extract._OVERSIZE_CHARS))
+        self.assertFalse(extract._max_str_len({'a': {'b': {'c': {'d': {'e': {'f': 'A' * 99999}}}}}},
+                                              extract._OVERSIZE_CHARS),
+                         'beyond the depth bound stays unreachable')
+
+
+class CutRoutingTest(unittest.TestCase):
+    def test_tool_arg_marks_its_truncation(self):
+        arg = extract._tool_arg({'command': 'y' * 500})
+        self.assertEqual(len(arg), 401)
+        self.assertTrue(arg.endswith('…'), 'a cut arg must carry the truncation marker')
+
+    def test_tool_arg_collapses_whitespace_and_keeps_short_args_intact(self):
+        self.assertEqual(extract._tool_arg({'command': '  git   status\n'}), 'git status')
+        self.assertEqual(extract._tool_arg({}), '')
+
+    def test_sanitize_label_still_bars_pipes_and_caps_at_60(self):
+        self.assertEqual(extract._sanitize_label('a | b\n c'), 'a / b c')
+        s = extract._sanitize_label('z' * 100)
+        self.assertEqual(len(s), 61)
+        self.assertTrue(s.endswith('…'))
+
+
+class SimplificationTest(unittest.TestCase):
+    def test_user_cap_max_is_derived_from_the_ladder(self):
+        self.assertEqual(extract._USER_CAP_MAX, extract._LADDER[0][2])
+
+    def test_dead_constants_are_gone(self):
+        self.assertFalse(hasattr(extract, '_DISPATCH_TOOLS'))
+        self.assertFalse(hasattr(extract, 'SUBCOMMANDS'))
+
+    def _main(self, argv):
+        saved = sys.argv
+        out, err = io.StringIO(), io.StringIO()
+        code = None
+        try:
+            sys.argv = argv
+            with redirect_stdout(out), redirect_stderr(err):
                 try:
-                    buf2, errbuf2 = io.StringIO(), io.StringIO()
-                    with redirect_stdout(buf2), redirect_stderr(errbuf2):
-                        with self.assertRaises(SystemExit) as cm2:
-                            extract.bundle(tpath, target)
-                    self.assertEqual(cm2.exception.code, 1)
-                    self.assertFalse(os.path.exists(edits_file),
-                                      "prior run's stale edits.md must be removed on this run's failure")
-                    with open(os.path.join(target, 'manifest.json'), encoding='utf-8') as f:
-                        manifest = json.load(f)
-                    self.assertEqual(manifest['files']['edits']['status'], 'error')
-                finally:
-                    extract._BUNDLE_DUMPS[:] = original
+                    extract.main()
+                except SystemExit as e:
+                    code = e.code
         finally:
-            os.remove(tpath)
+            sys.argv = saved
+        return code, out.getvalue(), err.getvalue()
 
-
-class BundleManifestIdentityTest(unittest.TestCase):
-    """E4: the re-run allowance keys on the existing manifest.json belonging to THIS transcript,
-    not merely existing — a foreign or unparsable manifest refuses rather than silently
-    overwriting a different transcript's bundle."""
-
-    def test_rerun_same_transcript_succeeds(self):
-        tpath = write_transcript(_bundle_fixture_lines())
+    def test_main_drift_path_and_error_exit_codes(self):
+        path = write_transcript([user_line('hi')])
         try:
-            with tempfile.TemporaryDirectory() as outdir:
-                target = os.path.join(outdir, 'bundle')
-                with redirect_stdout(io.StringIO()):
-                    with self.assertRaises(SystemExit) as cm1:
-                        extract.bundle(tpath, target)
-                self.assertEqual(cm1.exception.code, 0)
-                # Re-run into the same dir with the SAME transcript succeeds.
-                with redirect_stdout(io.StringIO()):
-                    with self.assertRaises(SystemExit) as cm2:
-                        extract.bundle(tpath, target)
-                self.assertEqual(cm2.exception.code, 0)
+            self.assertEqual(self._main(['extract.py', 'drift', path])[0], 0)
+            self.assertEqual(self._main(['extract.py', 'drift'])[0], 2, 'missing path exits 2')
+            self.assertEqual(self._main(['extract.py', 'drift', path + '.nope'])[0], 2)
+            self.assertEqual(self._main(['extract.py', 'bundle', path])[0], 2, 'unknown sub exits 2')
+            self.assertEqual(self._main(['extract.py'])[0], 2)
         finally:
-            os.remove(tpath)
-
-    def test_rerun_different_transcript_refused(self):
-        tpath1 = write_transcript(_bundle_fixture_lines())
-        tpath2 = write_transcript(_bundle_fixture_lines())
-        try:
-            with tempfile.TemporaryDirectory() as outdir:
-                target = os.path.join(outdir, 'bundle')
-                with redirect_stdout(io.StringIO()):
-                    with self.assertRaises(SystemExit) as cm1:
-                        extract.bundle(tpath1, target)
-                self.assertEqual(cm1.exception.code, 0)
-
-                errbuf = io.StringIO()
-                with redirect_stdout(io.StringIO()), redirect_stderr(errbuf):
-                    with self.assertRaises(SystemExit) as cm2:
-                        extract.bundle(tpath2, target)
-                self.assertEqual(cm2.exception.code, 2, 'different transcript -> refuse')
-                self.assertIn('different transcript', errbuf.getvalue())
-        finally:
-            os.remove(tpath1)
-            os.remove(tpath2)
-
-    def test_rerun_unparsable_manifest_treated_as_foreign(self):
-        tpath = write_transcript(_bundle_fixture_lines())
-        try:
-            with tempfile.TemporaryDirectory() as outdir:
-                target = os.path.join(outdir, 'bundle')
-                os.makedirs(target)
-                with open(os.path.join(target, 'manifest.json'), 'w', encoding='utf-8') as f:
-                    f.write('{not valid json')
-                errbuf = io.StringIO()
-                with redirect_stdout(io.StringIO()), redirect_stderr(errbuf):
-                    with self.assertRaises(SystemExit) as cm:
-                        extract.bundle(tpath, target)
-                self.assertEqual(cm.exception.code, 2,
-                                  'unparsable manifest -> treated as foreign, refuse')
-        finally:
-            os.remove(tpath)
+            os.remove(path)
 
 
 if __name__ == '__main__':

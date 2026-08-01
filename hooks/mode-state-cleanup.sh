@@ -1,47 +1,30 @@
 #!/bin/bash
 # SessionEnd hook (wired in hooks/hooks.json) — statusline mode-state hygiene.
 #
-# WHY THIS EXISTS: hooks/freehand-mode.sh, hooks/plan-handoff.sh, and the mode-owning skills write
-# per-session "chip" state under ~/.claude/ballast/modes/<sid> (via statusline/mode-state.py) so the
-# statusLine renderer can draw a glanceable per-mode indicator (✈️ freehand, 📋 plan-handoff, 🧠
-# critical-analysis — the registry lives in statusline/render.py). That state is scoped to one session and
-# has no reason to survive it — a session that ends abruptly (crash, /clear, closed terminal) would
-# otherwise leave a stale file behind forever, since nothing else deletes it (the renderer's TTL is
-# a *display* backstop, not a disk one). This hook deletes the just-ended session's own state file,
-# and mode-state.py's `cleanup` subcommand piggybacks a GC sweep of any OTHER session's file older
-# than 7 days — so ballast/modes/ stays bounded even across sessions that never fire SessionEnd
-# cleanly.
+# WHY THIS EXISTS: freehand-mode.sh, plan-handoff.sh, and the mode-owning skills write per-session
+# "chip" state under ~/.claude/ballast/modes/<sid> (via statusline/mode-state.py) for the statusLine
+# renderer. That state is scoped to one session, and nothing else deletes it — the renderer's TTL is
+# a *display* backstop, not a disk one — so an abrupt end (crash, /clear, closed terminal) would
+# strand it forever. This hook unlinks the just-ended session's file; mode-state.py's `cleanup`
+# subcommand piggybacks a GC sweep of any OTHER session's file older than 7 days, keeping
+# ballast/modes/ bounded even across sessions that never fire SessionEnd cleanly.
 #
-# SID RESOLUTION, TWO-TIER: extract `.session_id` from the payload via $BALLAST_PYTHON first (same
-# extraction pattern as plan-handoff.sh / freehand-mode.sh: python -c, rc=1 on ANY parse failure).
-# If that fails (no python, bad JSON, missing field), fall back to the `CLAUDE_CODE_SESSION_ID`
-# env var — the name the harness actually sets in hook processes — so this hook degrades gracefully
-# to a zero-dependency path instead of doing nothing just because python was unavailable. Neither
-# resolving is a legitimate outcome too (payload unparseable AND env unset) -- silent no-op, not an
-# error.
-# ENV NAME, corrected 2026-07-25: this read `CLAUDE_SESSION_ID`, which the harness has NEVER set in
-# a hook process (verified against the v2.1.220 binary's hook-child env builder and a live env dump
-# from a hook). Because this is the FALLBACK behind the payload extraction, the bug was invisible
-# on the happy path but silently no-op'd SessionEnd cleanup whenever the payload path was
-# unavailable — stranding the statusline mode chip until the renderer's TTL aged it out. The nested
-# `:-` keeps the legacy name as a harmless fallback if a future harness sets it. NOT related to the
-# `${CLAUDE_SESSION_ID}` substitution used in skill/agent bodies: that is a load-time plugin-loader
-# mechanism, correct as-is, and never reaches a hook's environment.
+# SID RESOLUTION, TWO-TIER: extract `.session_id` from the payload via $BALLAST_PYTHON (same
+# pattern as plan-handoff.sh / freehand-mode.sh: python -c, rc=1 on ANY parse failure); on failure
+# fall back to `CLAUDE_CODE_SESSION_ID` — the name the harness actually sets in a hook process
+# (`CLAUDE_SESSION_ID` is NOT set there; it is a load-time plugin-loader substitution for skill and
+# agent bodies, kept below only as a harmless nested fallback). Neither resolving is legitimate too:
+# silent no-op, not an error.
 #
-# NO STDOUT, EVER: every other conditional-fire hook in this repo emits a systemMessage so a fire
-# is never silent (see hooks/CLAUDE.md's "every conditional fire is user-visible" rule) -- this
-# hook is the deliberate exception. SessionEnd fires as the session is closing; there is no
-# terminal left to read a systemMessage in, and nothing here is a decision the user could act on or
-# override (it's unconditional best-effort hygiene, not a guard). The fire ledger in run.sh still
-# records it via the rc-nonzero / stdout-nonempty check -- since this hook never produces stdout,
-# it ledgers only on the rare nonzero exit, which never happens here (see below) -- so a normal run
-# is intentionally invisible everywhere, including the ledger. That's fine: nothing here is worth
-# auditing after the fact.
+# NO STDOUT, EVER: the deliberate exception to hooks/CLAUDE.md's "every conditional fire is
+# user-visible" rule. SessionEnd fires as the session closes — there is no terminal left to read a
+# systemMessage in, and this is unconditional best-effort hygiene, not a decision to override. With
+# no stdout and no nonzero exit, a normal run is invisible in run.sh's fire ledger too; nothing here
+# is worth auditing after the fact.
 #
-# FAIL-OPEN, EVERYWHERE: the mode-state.py call itself is fail-quiet (`|| true`) so a bad sid, an
-# unwritable state dir, or mode-state.py being missing/broken never surfaces as an error. This
-# script always exits 0 regardless of what happened above -- SessionEnd is not a moment to ever
-# block or delay on cleanup housekeeping.
+# FAIL-OPEN, EVERYWHERE: the mode-state.py call is fail-quiet (`|| true`) so a bad sid, an
+# unwritable state dir, or a missing/broken mode-state.py never surfaces as an error, and this
+# script always exits 0 — SessionEnd is no moment to block or delay on housekeeping.
 
 set -u
 

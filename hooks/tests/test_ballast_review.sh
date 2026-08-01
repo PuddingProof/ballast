@@ -12,11 +12,11 @@
 # verbatim), (2) the no-args usage error, (3) the --fix read-only-invariant rejection anywhere in
 # the args, (4) the --model/--effort leading-flag passthrough to the claude CLI (never the prompt).
 #
-# Self-locating: finds bin/ballast-review relative to this file (hooks/ -> ../bin/). Exit code =
+# Self-locating: finds bin/ballast-review relative to this file (hooks/tests/ -> ../../bin/). Exit code =
 # number of failures.
 set -u
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SHIM="$DIR/../bin/ballast-review"
+SHIM="$DIR/../../bin/ballast-review"
 
 fails=0
 pass() { printf 'PASS  %s\n' "$1"; }

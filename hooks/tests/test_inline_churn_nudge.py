@@ -26,7 +26,7 @@ Decision logic under test (derived from the hook's own code, not from its header
   - prune() reaps counter files untouched for 2+ days, but explicitly never reaps shadow.log
     itself (the accumulating dataset).
 
-Self-locating + standalone: `python hooks/test_inline_churn_nudge.py`.
+Self-locating + standalone: `python hooks/tests/test_inline_churn_nudge.py`.
 """
 import json
 import os
@@ -37,7 +37,7 @@ import tempfile
 import time
 import unittest
 
-HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inline-churn-nudge.py")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "inline-churn-nudge.py")
 
 
 def run_hook(payload_text, env):

@@ -8,11 +8,11 @@
 # raw-payload fallback) so neither can silently regress.
 #
 # Payloads are DATA on stdin (never executed), so running this file does not trip the caller's own
-# git hooks. Self-locating: finds git-commit-guard.sh next to this file; runs wherever it's checked
+# git hooks. Self-locating: finds git-commit-guard.sh one directory up (hooks/); runs wherever it's checked
 # out. Exit code = number of failures.
 set -u
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GUARD="$DIR/git-commit-guard.sh"
+GUARD="$DIR/../git-commit-guard.sh"
 
 # Resolve a working Python 3 the same way the run.sh dispatcher does, and export it so the guard's
 # JSON-emit / extraction path uses a real interpreter (never the Windows Store stub).

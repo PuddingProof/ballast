@@ -33,7 +33,7 @@ Decision logic under test (derived from the hook's own code, not from its header
     blank/`#`-comment lines are ignored, and any read/parse error (missing file included)
     fails open to "no exclusions" so the guard stays fully active.
 
-Self-locating + standalone: `python hooks/test_doc_write_guard.py`.
+Self-locating + standalone: `python hooks/tests/test_doc_write_guard.py`.
 """
 import json
 import os
@@ -43,7 +43,7 @@ import sys
 import tempfile
 import unittest
 
-HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "doc-write-guard.py")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "doc-write-guard.py")
 
 
 def run_hook(payload_text, env):

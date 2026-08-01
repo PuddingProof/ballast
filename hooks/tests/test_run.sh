@@ -9,11 +9,11 @@
 # forwarded stdout or exit code. These cases pin all three, plus the ledger's "exactly one line per
 # fire, zero lines for a non-fire" contract.
 #
-# Payloads are DATA on stdin (never executed). Self-locating: finds run.sh next to this file.
+# Payloads are DATA on stdin (never executed). Self-locating: finds run.sh one directory up (hooks/).
 # Exit code = number of failures.
 set -u
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN="$DIR/run.sh"
+RUN="$DIR/../run.sh"
 
 # Resolve a working Python 3 the same way run.sh's own probe does (run.sh re-resolves internally
 # regardless, but exporting here mirrors this dir's other suites' convention and keeps the probe

@@ -24,7 +24,7 @@ Three things carry the weight here, and none is decoration:
 HERMETIC (hooks/CLAUDE.md rule): every invocation sets BALLAST_CLAUDE_HOME to a temp dir, so the
 session state directory is never the real ~/.claude. Production never sets that var.
 
-Self-locating + standalone: `python hooks/test_visual_arm.py`.
+Self-locating + standalone: `python hooks/tests/test_visual_arm.py`.
 """
 import json
 import os
@@ -35,7 +35,7 @@ import tempfile
 import time
 import unittest
 
-HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "visual-arm.py")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "visual-arm.py")
 
 SESSION = "sess-abc-123"
 TRANSCRIPT = "/home/u/.claude/projects/proj/sess-abc-123.jsonl"

@@ -3,73 +3,66 @@
 PostToolUse hook (Write|Edit|MultiEdit): the first FRONTEND file touch of a session arms the
 visual workflow skill -- once, in the MAIN LOOP, with a one-line additionalContext injection.
 
-WHY IT EXISTS (spec R3). The workflow skill fired 4 times against the reviewer's 50 because it
-was a done-time trigger: by the time anyone thought "visual check", the frontend work was
-already built blind. Arming moves the load to the first frontend touch, deterministically,
-instead of hoping a model remembers.
+WHY IT EXISTS. A done-time trigger fires too late: by the time anyone thinks "visual check", the
+frontend work was already built blind. Arming moves the load to the first frontend touch,
+deterministically, instead of hoping a model remembers.
 
-WHY MAIN-LOOP-ONLY IS LOAD-BEARING (the one rule not to soften). Executors do the editing, so
-the first frontend touch of a session is usually a LEAF's. An injection there lands in an agent
-that is forbidden to act on it -- it cannot own the session's origin, cannot route the ladder,
-cannot run the done gate -- while burning the once-per-session trigger. That is the 4/71
-under-fire reproduced by its own fix. So a leaf touch records a PENDING-ARM flag and emits
-NOTHING (no stdout at all, not even a systemMessage); the next qualifying main-loop fire drains
-it as the injection. The state file is this hook's audit record in place of the ledger row a
-silent fire cannot produce -- an accepted, named residual of the no-output rule.
+WHY MAIN-LOOP-ONLY IS LOAD-BEARING (the one rule not to soften). Executors do the editing, so the
+first frontend touch is usually a LEAF's -- and an injection there lands in an agent forbidden to
+act on it (it cannot own the session's origin, route the ladder, or run the done gate) while
+burning the once-per-session trigger. So a leaf touch records a PENDING-ARM flag and emits NOTHING
+(no stdout at all, not even a systemMessage); the next qualifying main-loop fire drains it as the
+injection. The state file is this hook's audit record in place of the ledger row a silent fire
+cannot produce.
 
 CALLER DISCRIMINATION is payload-only, ported from process-lifecycle-guard.py (`agent_type` OR
-`agent_id`). B0a (live probe, CC 2.1.220) confirmed fire-side on PostToolUse: both fields
-present on leaf fires, absent on main-loop fires -- and that `session_id` is PARENT-STABLE on a
-leaf fire, which is why session_id is the ledger key. Never key on `prompt_id` (rotates per
-turn).
+`agent_id`). Verified fire-side on PostToolUse (CC 2.1.220): both fields present on leaf fires,
+absent on main-loop fires, and `session_id` is PARENT-STABLE on a leaf fire -- which is why
+session_id is the ledger key. Never key on `prompt_id` (it rotates per turn).
 
-DEGRADED MODE IS DESIGNED, NOT ACCIDENTAL -- and it needs its own guard, because is_subagent()
-fails toward False (= "main loop"), which is the WRONG direction here: for the install/lifecycle
-guards False means "defer to the attended user", but for arming False means "inject", and a
-truly ambiguous payload must never inject. The resolution: injecting requires the payload to
-AFFIRMATIVELY look like a well-formed main-loop fire --
+DEGRADED MODE IS DESIGNED, and needs its own guard because is_subagent() fails toward False
+(= "main loop"), the WRONG direction here: for the install/lifecycle guards False means "defer to
+the attended user", but for arming it means "inject", and an ambiguous payload must never inject.
+So injecting requires the payload to AFFIRMATIVELY look like a well-formed main-loop fire --
   * the payload is a dict carrying a non-empty `session_id` (the ledger key), AND
   * `tool_input` is a dict carrying a non-empty string `file_path`, AND
   * neither discriminator key is present in any form.
-An `agent_type`/`agent_id` key that is PRESENT but reads empty/odd is ambiguity, not a main-loop
-fire (B0a: main fires omit the keys entirely) -- it resolves to RECORD. Any other shortfall
-resolves to RECORD if a frontend file and a usable key are both determinable, else to silence.
-The asymmetry is the whole point: a missed injection costs one turn of latency, a leaf injection
-burns the trigger for the session.
+A discriminator key PRESENT but reading empty/odd is ambiguity, not a main-loop fire (main fires
+omit the keys entirely) -- it resolves to RECORD. Any other shortfall resolves to RECORD if a
+frontend file and a usable key are both determinable, else to silence. The asymmetry is the point:
+a missed injection costs one turn of latency, a leaf injection burns the session's trigger.
 
 POSTURE: soft nudge (exit 0 + additionalContext), once per session, worded to no-op gracefully
 on a mis-fire. Never blocks anything; PostToolUse cannot.
 
 FRONTEND PATTERN (test-pinned in test_visual_arm.py, positives AND negatives).
   * EXTENSIONS ARE DECISIVE: .tsx .jsx .svelte .vue .css .scss .html .astro -- any path.
-    Deliberately no directory exclusions (`coverage/index.html`, `docs/*.html` DO arm): a
-    dir-exclusion list is a maintenance treadmill with no ceiling, the cost of a mis-fire is one
-    ignorable line, and the injection's own "matched by accident? Ignore this." is the
-    compensating control. This boundary is pinned as a positive test row so it reads as a
-    decision, not an oversight.
-  * PATH HEURISTIC (narrow, secondary): a component/style/template PATH SEGMENT plus a
-    script extension (.ts .js .mjs .cjs). It exists for styling-adjacent files whose extension
-    says nothing -- `src/components/Button.ts` holding a styled-component, `ui/theme.ts`. Segment
-    match only: `src/parse-components.ts` does not arm. Extension gate too:
-    `docs/components/overview.md` does not arm.
+    Deliberately no directory exclusions (`coverage/index.html`, `docs/*.html` DO arm): such a
+    list is a maintenance treadmill with no ceiling, a mis-fire costs one ignorable line, and the
+    injection's own "matched by accident? Ignore this." is the compensating control. Pinned as a
+    positive test row so it reads as a decision, not an oversight.
+  * PATH HEURISTIC (narrow, secondary): a component/style/template PATH SEGMENT plus a script
+    extension (.ts .js .mjs .cjs), for styling-adjacent files whose extension says nothing
+    (`src/components/Button.ts` holding a styled-component, `ui/theme.ts`). Segment match only
+    (`src/parse-components.ts` does not arm), extension-gated too (`docs/components/overview.md`
+    does not arm).
 
 STATE: <ballast-home>/.cache/ballast-arm/arm-<session-key>.json, one file per session, keyed by
 `session_id`. Never the plugin dir (replaced wholesale on update); BALLAST_CLAUDE_HOME is the
-hermetic-test override, never set in production. Records the R3 MEASUREMENT DENOMINATOR:
-`armed_at`, `armed_via` (direct|drain), and per-class fire counts -- so a later sweep can compute
-armed-sessions vs sessions that actually loaded the workflow skill (the like-for-like denominator
-R3 demands). Files older than 7 days are pruned whenever the dir is touched.
+hermetic-test override, never set in production. Records the MEASUREMENT DENOMINATOR -- `armed_at`,
+`armed_via` (direct|drain), per-class fire counts -- so a later sweep can compute armed-sessions
+against sessions that actually loaded the workflow skill. Files older than 7 days are pruned on any
+dir touch.
 
 FAIL-OPEN GUARANTEE. Every path is wrapped; a malformed payload, an unreadable/unwritable state
 dir, or a regex surprise exits 0. Fail-open is ANNOUNCED (systemMessage, wrapped in its own
-try/except, never affecting the exit code) except on a LEAF fire, where the no-output rule wins:
-a leaf's error is swallowed silently rather than risk stdout in a leaf context.
+try/except, never affecting the exit code) except on a LEAF fire, where the no-output rule wins.
 
 NAMED RESIDUALS (accepted; do not silently "fix"):
-  1. Leaf fires produce no fires-ledger row (run.sh ledgers non-empty stdout). Deliberate -- see
+  1. Leaf fires produce no fires-ledger row (run.sh ledgers non-empty stdout) -- deliberate, per
      the main-loop-only rule. The state file's counters are the substitute audit trail.
-  2. The extension list is frozen by the plan; .less/.sass/.styl/.pcss are NOT in it. A project
-     using them arms only via the path heuristic (their files usually sit under styles/).
+  2. The extension list omits .less/.sass/.styl/.pcss. A project using them arms only via the
+     path heuristic (their files usually sit under styles/).
   3. Non-visual frontend edits (a .ts config under ui/, a .css comment) arm the session and cost
      one ignorable injected line. Recall is preferred over precision here by design.
 """
@@ -121,11 +114,10 @@ def _announce_error(site, skipped):
 def is_subagent(payload):
     """True when this fire originates anywhere other than the main loop.
 
-    Ported from process-lifecycle-guard.py (itself a verbatim port from package-install-guard).
-    B0a re-verified the two fields fire-side on PostToolUse at CC 2.1.220: both present on leaf
-    fires, absent on main-loop fires. Deliberately the OR, not the AND -- agent_type only is a
-    main-thread agent persona, agent_id only is a forked query, and neither is a context the user
-    is watching.
+    Ported from process-lifecycle-guard.py, and re-verified fire-side on PostToolUse (CC 2.1.220):
+    both fields present on leaf fires, absent on main-loop fires. Deliberately the OR, not the AND
+    -- agent_type only is a main-thread agent persona, agent_id only is a forked query, and neither
+    is a context the user is watching.
 
     Fails toward False. That is the wrong direction for arming, which is exactly why callers must
     use caller_class() below rather than this predicate alone.
@@ -193,13 +185,13 @@ def state_dir():
 def session_key(payload):
     """`session_id`, sanitized to a filename-safe charset.
 
-    B0a froze this: a leaf PostToolUse fire carries the PARENT session's session_id, so a leaf's
-    pending-arm record and the main loop's drain land in the same file. `transcript_path`'s stem
-    is the documented-equivalent fallback (B0a measured stem == session_id); a payload field is
-    never a trusted path component, hence the sanitize.
+    A leaf PostToolUse fire carries the PARENT session's session_id, so a leaf's pending-arm
+    record and the main loop's drain land in the same file. `transcript_path`'s stem is the
+    measured-equivalent fallback; a payload field is never a trusted path component, hence the
+    sanitize.
 
     Deliberately NO `or "nosession"` fallback, unlike the siblings (process-lifecycle-guard's
-    valve, the origin ledger): those need *a* filename and a shared one is harmless, while a
+    valve, the origin ledger): those only need *a* filename and a shared one is harmless, while a
     shared arm-state file would leak one session's armed flag into another's. Here an empty key
     is a hard stop -- main() refuses to record or inject without one.
     """
@@ -248,7 +240,7 @@ def new_state(key):
         "pending_arm": False,
         "pending_arm_at": None,
         "pending_arm_via": None,  # "leaf" | "ambiguous"
-        # R3 measurement denominator: enough to compute armed-sessions and to see how the arm was
+        # Measurement denominator: enough to compute armed-sessions and to see how the arm was
         # reached, without a second ledger. Counts STATE-TOUCHING fires only -- the cheap exit in
         # main() drops non-frontend leaf/ambiguous fires before any IO, deliberately: this hook
         # fires on every edit in every session and a counter is not worth a write per edit.
@@ -354,7 +346,7 @@ def main():
 
         # Fast path: a main-loop fire on a NON-frontend file can only ever matter as a drain, and
         # a drain needs an existing state file (the pending flag lives there). No file -> nothing
-        # to drain and nothing R3's denominator needs -- skip the read+write+prune this hook would
+        # to drain and nothing the denominator needs -- skip the read+write+prune this hook would
         # otherwise pay on every edit of every non-frontend session.
         if cls == "main" and not frontend and not os.path.isfile(state_path(key)):
             return 0

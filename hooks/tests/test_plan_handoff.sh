@@ -18,11 +18,11 @@
 #
 # Hermetic via BALLAST_CLAUDE_HOME (mode-state.py's own override) so no test ever touches the real
 # ~/.claude/ballast/modes/. Payloads are DATA on stdin (never executed). Self-locating: finds
-# plan-handoff.sh next to this file. Exit code = number of failures.
+# plan-handoff.sh one directory up (hooks/). Exit code = number of failures.
 
 set -u
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOOK="$DIR/plan-handoff.sh"
+HOOK="$DIR/../plan-handoff.sh"
 
 # Resolve a working Python 3 the same way run.sh's own probe does.
 # The specific hazard: a Windows App-Execution-Alias stub (`.../WindowsApps/python3`) sits on
@@ -154,7 +154,7 @@ echo
 # Co-located here (small, sibling hook, same statusline-mode-indicator build) rather than a
 # separate one-case file.
 # =================================================================================================
-CLEANUP_HOOK="$DIR/mode-state-cleanup.sh"
+CLEANUP_HOOK="$DIR/../mode-state-cleanup.sh"
 
 # --- 6: payload with session_id -> state file deleted, no stdout, exit 0 ------------------------
 home="$(newtmp)"

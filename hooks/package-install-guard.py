@@ -27,43 +27,35 @@ a leaf the user isn't watching must never be able to raise a prompt at them):
     verdict and finish with what exists). The allowlist still passes.
   - anything else                 -> silent pass-through (exit 0, no output).
 
-Why deny and not ask for a leaf (the escalation is EARNED, per the enforcement-
-posture rule — a soft version was empirically defeated): the prompt a leaf
-raises arrives with no context the user can adjudicate from, and a leaf that
-can't resolve its own tooling keeps re-trying. Watched 2026-07-25: a
-visual-reviewer leaf spent an hour+ re-triggering the ask gate trying to stand
-up a dev server, burning tokens on every loop. Denying returns a fast, legible
-"you don't install — report the gap" instead of a stall. The prohibition is
-already stated in prose (global CLAUDE.md, the fanout injection, each agent
-body); this is its mechanism-level backstop, because prose alone was defeated
-twice.
+WHY DENY AND NOT ASK FOR A LEAF (an earned escalation — the soft version was
+empirically defeated): a leaf's prompt reaches the user with no context they can
+adjudicate from, and a leaf that can't resolve its own tooling keeps re-trying
+until the budget is gone. Denying returns a fast, legible "you don't install —
+report the gap" instead of a stall. The prohibition is already stated in prose
+(global CLAUDE.md, the fanout injection, each agent body); this is its
+mechanism-level backstop.
 
 Design notes:
   - Verbs are matched on text with heredoc bodies AND quoted strings / $()
     subshells stripped first, so the words inside an echoed string, a grep
     pattern, or a commit message -- whether quoted (`-m "npm install ..."`) or
     fed through a `git commit -F - <<EOF ... EOF` heredoc -- don't false-trigger.
-    (The quote-strip mirrors block-compound-commands.sh; the heredoc strip closes
-    the `-F` heredoc hole a descriptive commit message tripped on 2026-07-08.)
+    (The quote-strip mirrors block-compound-commands.sh.)
   - Fails OPEN (exit 0) on any parse error: a hook bug must never block every
     Bash/PowerShell call, and the declarative npm/pip ask-rules in settings.json
-    remain as a backstop for the common case. The hook is the ADDED layer for the
-    npx / env-prefix holes those rules can't express. The fail-open path is not
-    SILENT, though (governance review item): before exiting 0 it makes a
-    best-effort systemMessage announcement so a persistently-crashing guard is
-    visible rather than quietly dead -- the announce is wrapped in its own
-    try/except and can never itself change the exit code.
-  - Treat this allowlist as pruneable: it only suppresses the prompt for these
+    remain as a backstop for the common case -- this hook is the ADDED layer for
+    the npx / env-prefix holes those rules can't express. Not SILENT, though:
+    before exiting 0 it makes a best-effort systemMessage announcement, wrapped
+    in its own try/except so it can never change the exit code.
+  - Treat the allowlist as pruneable: it only suppresses the prompt for these
     exact local dev-tool runs; every real install still asks.
-  - CALLER DISCRIMINATION is payload-only. There is no env-var discriminator on
-    the hook path, and `transcript_path` is always the PARENT session's, so the
-    only signals are the two payload fields verified against the binary
-    (v2.1.220): `agent_type` (the subagent_type string) and `agent_id` (absent
-    on the main loop, present on ANY nested agent at any depth). See
-    is_subagent() for the exact predicate and its caveats. Both are
-    harness-version-volatile by nature: if upstream renames them the predicate
-    goes False and this degrades to the pre-existing ask gate -- fail-open by
-    construction, and the prose prohibition remains the backstop.
+  - CALLER DISCRIMINATION is payload-only: there is no env-var discriminator on
+    the hook path and `transcript_path` is always the PARENT session's, leaving
+    two binary-verified payload fields (v2.1.220), `agent_type` and `agent_id` —
+    see is_subagent() for the predicate and its caveats. Both are
+    harness-version-volatile: if upstream renames them the predicate goes False
+    and this degrades to the pre-existing ask gate -- fail-open by construction,
+    with the prose prohibition as the backstop.
 """
 
 import sys
@@ -74,9 +66,9 @@ import re
 try:
     payload = json.load(sys.stdin)
 except Exception:
-    # Fail open — never block on a malformed payload. Announce-on-error (governance review item):
-    # best-effort, wrapped in its own try/except so the announce itself can never change the exit
-    # code -- a crashed guard must stay visible instead of silently going dead every call.
+    # Fail open — never block on a malformed payload. Announce-on-error: best-effort, wrapped in
+    # its own try/except so the announce can never change the exit code -- a crashed guard must
+    # stay visible instead of silently going dead every call.
     try:
         print(json.dumps({
             "systemMessage": "⚠️ ballast: package-install-guard — internal error, guard skipped; install checks deferred to native permission flow",
@@ -104,11 +96,11 @@ UNWRAP = re.compile(
 s = UNWRAP.sub(lambda m: " " + m.group(2) + " ", s)
 # Heredoc bodies (<<DELIM ... DELIM, incl. <<'DELIM' / <<"DELIM" / <<-DELIM) are
 # raw text, not command -- a `git commit -F - <<'EOF' ... EOF` message that only
-# DESCRIBES an install must not fire the gate. Strip them FIRST: a quoted
-# delimiter (<<'EOF') would otherwise be mangled by the quote strippers below,
-# breaking the closing-delimiter match. The closing delimiter is matched at line
-# start (MULTILINE); if there's no closing line the pattern simply doesn't match
-# and the body is left as-is (fail-safe -- no worse than the pre-fix behavior).
+# DESCRIBES an install must not fire the gate. Stripped FIRST: a quoted delimiter
+# (<<'EOF') would otherwise be mangled by the quote strippers below, breaking the
+# closing-delimiter match. The closing delimiter is matched at line start
+# (MULTILINE); with no closing line the pattern simply doesn't match and the body
+# is left as-is (fail-safe).
 s = re.sub(
     r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1.*?^[ \t]*\2[ \t]*$",
     "",
@@ -164,15 +156,14 @@ def is_subagent() -> bool:
       - `agent_id`   — ABSENT on the main loop, present on any nested agent,
                        at any depth (a 3rd-layer leaf looks like a 1st).
 
-    Either one alone is enough here. The caveat matrix: both present = a real
-    Task sub-agent; agent_type only = a main-thread agent persona; agent_id
-    only = a forked query. All three are non-main-loop contexts the user isn't
-    watching, which is exactly the set that must not raise an install prompt --
-    so the predicate is deliberately the OR, not the AND.
+    Deliberately the OR, not the AND: both present = a real Task sub-agent;
+    agent_type only = a main-thread agent persona; agent_id only = a forked
+    query. All three are contexts the user isn't watching, which is exactly the
+    set that must not raise an install prompt.
 
     Any parse surprise (a non-string field, a mangled payload) resolves False,
-    which degrades to the historical ask gate rather than denying the main
-    session -- fail-open in the direction that can't brick a session.
+    degrading to the ask gate rather than denying the main session -- fail-open
+    in the direction that can't brick a session.
     """
     try:
         return bool(

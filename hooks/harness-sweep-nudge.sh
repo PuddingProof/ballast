@@ -25,20 +25,9 @@
 # we additionally require `dev/check.sh` -- the co-presence of BOTH uniquely identifies "this is
 # the ballast source checkout, not merely a project with the plugin installed."
 #
-# NAMED RESIDUAL RISKS (accepted, not bugs):
-#   1. Strict lexical `>` same-day miss: if a report and the watermark share the same date
-#      prefix, this hook's cheap strict-greater-than comparison can undercount by one same-day
-#      file (see step 3's comment for the precise mechanics). This is intentionally asymmetric
-#      with the harness-sweep SKILL's inclusive `>=` comparison, which re-scans the watermark's
-#      whole date and is idempotent against ledger-first reconciliation -- the skill is the
-#      backstop for anything this hook's cheaper strict check under-nudges on. A missed same-day
-#      nudge is harmless (worst case: the user finds out next session instead of this one).
-#   2. CLAUDE_PROJECT_DIR unset: some invocation paths (or older harness versions) may not set
-#      this env var. If so, step 1 exits silently -- a dead nudge, accepted, not worth adding
-#      a fallback probe for.
-#
-# Both residuals are also pinned by the test suite (test j for #1's asymmetry, and the
-# no-CLAUDE_PROJECT_DIR case for #2) so a future edit can't silently change either behavior.
+# NAMED RESIDUAL RISKS (accepted, not bugs, both pinned by the test suite so a future edit can't
+# silently change either): (1) the strict lexical `>` same-day miss documented at step 3;
+# (2) CLAUDE_PROJECT_DIR unset -> step 1 exits silently, a dead nudge, no fallback probe added.
 
 set -u
 
@@ -67,15 +56,9 @@ state="$dir/postmortem/SWEEP-STATE.md"
 # field-splitting, which can behave differently under a non-UTF-8 locale) -- `case` pattern
 # matching on a shell string is a pure byte comparison, so this is locale-immune by construction.
 #
-# Once a line contains the literal, pure parameter-expansion (no fork, no external tool) pulls
-# out the three fields:
-#   rest="${line#* · }"   -- strip the shortest match of "<anything>· " from the front, leaving
-#                            "<dir> · last=<wm>"
-#   pdir="${rest%% · *}"  -- strip the longest match of " · <anything>" from the back, leaving
-#                            just "<dir>"
-#   wm="${rest##* · }"    -- strip the longest match of "<anything>· " from the front, leaving
-#                            "last=<wm>"
-#   wm="${wm#last=}"      -- strip the literal "last=" prefix, leaving "<wm>" (or "NONE")
+# Once a line contains the literal, pure parameter-expansion (no fork, no external tool) pulls the
+# three fields out of it -- shortest-match strip from the front for <dir>, longest-match strips for
+# the watermark, then the literal "last=" prefix off (leaving "<wm>" or "NONE").
 total=0
 projects=0
 # Harden against hand-edited registry files (SKILL.md invites hand-editing SWEEP-STATE.md):
@@ -122,16 +105,10 @@ done < "$state"
 # DRIFT-SIGHTINGS.md lines look like "YYYY-MM-DD · <sighting text> ... [registered]" once
 # triaged. We count date-led lines that do NOT contain "registered" anywhere.
 #
-# `grep -cv PATTERN` on a file with ZERO matching (non-"registered") lines returns exit code 1
-# (grep's "no lines selected" signal) even though that's a perfectly valid "0 unregistered
-# sightings" answer, not an error. Under `set -u` PLUS command substitution, the real hazard is
-# that a non-zero $? from this substitution could trip a later check-the-exit-code pattern and
-# get misclassified as a real failure, or (in a stricter script) abort a chain. We defuse both
-# hazards directly: `|| true` neutralizes the non-zero exit from the `-cv` grep so nothing
-# downstream ever sees it as a failure, and `drift="${drift:-0}"` is the belt-and-braces default
-# in case the whole substitution ever comes back empty (e.g. the sight file vanished between the
-# `-f` check and the grep, or an unexpected grep failure mode) -- both together are the standard
-# fix for this `set -u` + "zero matches looks like an error" regression class.
+# `grep -cv` returns exit 1 when ZERO lines are selected -- a valid "0 unregistered sightings"
+# answer, not an error. `|| true` keeps that from being misread downstream as a failure, and
+# `drift="${drift:-0}"` defaults an empty substitution (e.g. the file vanished after the `-f`
+# check). Keep both.
 drift=0
 sight="$dir/postmortem/DRIFT-SIGHTINGS.md"
 [ -f "$sight" ] && drift="$(grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2} · ' "$sight" 2>/dev/null | grep -cv 'registered' || true)"

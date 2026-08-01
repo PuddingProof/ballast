@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Regression tests for ballast-allow.py -- the self-scoped PreToolUse permission-allow hook.
 
-This hook auto-approves exactly three command shapes (a bare, unmodified `ballast-extract`,
-`ballast-mode`, or `ballast-review`) and MUST defer everything else to the normal permission
-prompt. A regression here is a standing auto-approval hole on every Bash call, so the bypass
-vectors below are pinned as tests.
+This hook auto-approves exactly four command shapes (a bare, unmodified `ballast-extract`,
+`ballast-mode`, `ballast-review`, or `ballast-sweep`) and MUST defer everything else to the normal
+permission prompt. A regression here is a standing auto-approval hole on every Bash call, so the
+bypass vectors below are pinned as tests.
 
 OPT-IN GATE (governance review item): the hook now emits NOTHING for ANY input unless
 `<home_root>/ballast/allow-standing-grants` exists. HERMETIC (hooks/CLAUDE.md rule): every test
@@ -13,8 +13,8 @@ touches the real ~/.claude. `AllowLegitInvocations` cases create the marker (tod
 opted in); the new `OptInGate` class covers the no-marker / marker-error deferrals.
 
 Runs with the plain stdlib unittest (no pytest dependency) so dev/check.sh can invoke it with the
-same resolved interpreter it uses for the extractor suite. Self-locating: finds ballast-allow.py
-next to this file, so there are no absolute paths and it runs wherever the plugin is checked out.
+same resolved interpreter it uses for the extractor suite. Self-locating: finds ballast-allow.py one
+directory up (hooks/), so there are no absolute paths and it runs wherever the plugin is checked out.
 """
 import json
 import os
@@ -24,7 +24,7 @@ import sys
 import tempfile
 import unittest
 
-HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ballast-allow.py")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ballast-allow.py")
 
 
 def run(payload, env):
@@ -109,6 +109,13 @@ class AllowLegitInvocations(HermeticTestCase):
         allowed, rc, err = self.run_hermetic(bash("ballast-review high abc123..HEAD two-phase shutdown fix"))
         self.assertEqual(allowed, True)
 
+    def test_sweep_bare(self):
+        self.assertEqual(self.run_hermetic(bash("ballast-sweep"))[0], True)
+
+    def test_sweep_with_args(self):
+        allowed, rc, err = self.run_hermetic(bash("ballast-sweep digest --focus visual-probe"))
+        self.assertEqual(allowed, True)
+
 
 class OptInGate(HermeticTestCase):
     """(a) no marker -> the exact command that previously allowed now defers silently, exit 0.
@@ -128,6 +135,11 @@ class OptInGate(HermeticTestCase):
 
     def test_no_marker_review_defers_silently(self):
         allowed, rc, err = self.run_hermetic(bash("ballast-review"))
+        self.assertFalse(allowed)
+        self.assertEqual(rc, 0)
+
+    def test_no_marker_sweep_defers_silently(self):
+        allowed, rc, err = self.run_hermetic(bash("ballast-sweep digest"))
         self.assertFalse(allowed)
         self.assertEqual(rc, 0)
 
@@ -252,6 +264,22 @@ class RejectSmuggledSecondCommand(HermeticTestCase):
 
     def test_review_path_qualified(self):
         self._assert_deferred("./bin/ballast-review high")
+
+    def test_sweep_name_prefix_confusion(self):
+        # `ballast-sweeper` merely STARTS WITH `ballast-sweep` -- same prefix-hazard rule.
+        self._assert_deferred("ballast-sweeper digest")
+
+    def test_sweep_semicolon(self):
+        self._assert_deferred("ballast-sweep digest; rm -rf /")
+
+    def test_sweep_command_substitution(self):
+        self._assert_deferred("ballast-sweep digest --focus $(whoami)")
+
+    def test_sweep_redirection(self):
+        self._assert_deferred("ballast-sweep audit > /tmp/out")
+
+    def test_sweep_path_qualified(self):
+        self._assert_deferred("./bin/ballast-sweep digest")
 
 
 class FailOpenNeverCrashes(HermeticTestCase):

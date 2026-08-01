@@ -1,131 +1,75 @@
 #!/usr/bin/env python3
 """ballast-allow.py -- PreToolUse hook (matcher "Bash|PowerShell"), self-scoped permission allow.
 
-WHY THIS EXISTS: a plugin cannot ship permission-settings entries (Claude Code has no manifest
-mechanism for that -- see build spec's portability-mechanism #3). Without SOME allow path, every
-single invocation of the plugin's own `ballast-extract` transcript-reader (or `ballast-mode`
-session-mode writer, or `ballast-review` sidecar-review shim) would sit behind a manual permission
-prompt forever, even though each is narrowly bounded and part of the shipped harness. This hook is
-the narrow, self-contained substitute: it recognizes exactly three bare, unmodified invocation
-shapes -- `ballast-extract`, `ballast-mode`, and `ballast-review` -- and answers
-`permissionDecision: allow` for THAT call only. Everything else -- literally any other command,
-including any of the three names wrapped in anything that could smuggle a second command alongside
-it -- is left untouched (exit 0 -> defer to Claude Code's normal permission flow, which still
-prompts the user as usual).
+A plugin cannot ship permission-settings entries, so every invocation of the plugin's own
+`ballast-extract`, `ballast-mode`, `ballast-review`, and `ballast-sweep` shims would otherwise sit
+behind a manual permission prompt forever. This hook is the narrow substitute: it recognizes
+exactly those four bare, unmodified invocation shapes and answers `permissionDecision: allow` for
+THAT call only. Anything else -- including any of the four names wrapped in something that could
+smuggle a second command alongside it -- is left untouched.
 
-OPT-IN (governance review item): none of the above is a standing grant the plugin decides on the
-user's behalf. A plugin cannot ship permission-settings entries -- and per governance review, it
-should not silently self-grant one at the hook layer either, which is exactly what unconditionally
-emitting `permissionDecision: allow` amounted to. So this hook now ships INERT by default: it emits
-NOTHING for ANY input unless the user has deliberately created
-`<home_root>/ballast/allow-standing-grants` (see `_standing_grants_enabled` / `home_root`, mirroring
-doc-write-guard.py's home_root() convention; documented in the README as an explicit opt-in step).
-Marker absent -> every command, including the three safe shapes above, defers to Claude Code's
-normal permission flow like this hook wasn't installed. Marker present -> exactly the behavior
-described above. The marker check runs ONCE, before any payload parsing or command matching (the
-cheapest possible short-circuit for the common no-marker case), and fails CLOSED on any error --
-the inverse of this file's usual fail-open direction, because here the risky output is the allow
-decision itself, not a missed one.
+OPT-IN GATE (invariant): the hook ships INERT and emits NOTHING for ANY input unless the user has
+deliberately created `<home_root>/ballast/allow-standing-grants` -- a plugin does not self-grant a
+standing permission on the user's behalf. The marker check runs ONCE, before any payload parsing or
+matching, and fails CLOSED on any error: the inverse of this file's usual fail-open direction,
+because here the risky output IS the allow decision.
 
-SECURITY RATIONALE (why the regexes are this conservative and not looser):
-  - This hook runs on EVERY Bash/PowerShell call in EVERY session that has the plugin enabled.
-    A bug here is a standing auto-approval hole, not a one-off mistake -- so the match surface is
-    kept as small as intent allows, and anything ambiguous is deliberately treated as "not a match"
-    (silent pass-through), never as "match, allow" by default.
-  - `ballast-extract` reads transcript JSONL and prints markdown to stdout (see
-    session-postmortem/scripts/extract.py) for every subcommand except ONE: `bundle --out <dir>`,
-    which writes the bulk-dump markdown files + a manifest.json to that dir. No other subcommand
-    writes anything, and none makes network calls or runs git operations. `bundle`'s write surface
-    is bounded three ways: (a) it only ever writes FIXED filenames it derives itself (`<dump>.md`,
-    `manifest.json`) -- the `--out` argument selects a directory, never a filename, so it can't be
-    steered into overwriting an arbitrary target file; (b) it refuses to write into a dir that
-    already exists, is non-empty, and has no prior `manifest.json` -- so it can't silently clobber
-    an unrelated directory's contents, only a dir it created itself or one it already owns from a
-    prior run; (c) every byte written is content DERIVED SOLELY from parsing the transcript path
-    already on the command line -- nothing in `bundle`'s output surface is attacker-shaped beyond
-    what an auto-allowed read-only dump already exposed. Auto-allowing the bare invocation still
-    carries far less risk than auto-allowing "any command containing ballast-extract", which is
-    why the match is anchored to the ENTIRE command string (re.fullmatch), not merely to substring
-    containment.
-  - `ballast-mode` (statusline/mode-state.py) DOES write, unlike ballast-extract's read-only
-    surface -- but the write surface is deliberately bounded: `mode` and `--session <sid>` are
-    both validated there against strict fullmatch allowlists (mode `[a-z0-9-]{1,32}`, sid
-    `[0-9a-fA-F-]{8,64}`) BEFORE any filesystem operation, and neither charset can contain `/`,
-    `\\`, or `..` -- so a session id can never traverse out of its target directory. Every write
-    this CLI can perform lands under `~/.claude/ballast/modes/` and nowhere else. Worst case of a
-    bug or a hostile-but-validated argument here is a wrong or missing status-line chip, not an
-    arbitrary write. Auto-allowing the bare invocation is bounded by that same bind: it is
-    ballast-mode's OWN argument validation, not this hook, that keeps the write surface narrow --
-    this hook only ever needs to keep a SECOND command from riding along (see below).
-  - Deliberately NOT on this allowlist: `ballast-statusline` (the settings.json installer,
-    statusline/install.py). It edits `~/.claude/settings.json` directly -- a much larger blast
-    radius than a per-session mode chip -- so it stays behind the normal permission prompt on
-    every invocation, bare or not. See also the prefix-hazard note below: `ballast-statusline`
-    must never accidentally match via loose handling of the `ballast-mode` pattern.
-  - `ballast-review` (bin/ballast-review, the sidecar-review trampoline) has the LARGEST blast
-    radius of the three: it spawns a full headless `claude -p` session under the user's own
-    account -- a real agent loop with network access, well beyond extract's read-only file access
-    or mode's bounded validated writes. Three things keep auto-allowing the bare invocation safe
-    despite that: (1) the shim pins the sidecar's prompt to START with the native `/code-review`
-    slash command (plus, outside the prompt entirely, optional leading --model/--effort flags
-    handed to the claude CLI itself -- session cost dials whose values are still bounded by the
-    char class below). State that bound honestly: everything after the level is free-form prose
-    that DOES reach the sidecar as the skill's target/context arguments -- the char class stops a
-    second SHELL command, never prompt content, so an auto-allowed call can steer the review
-    session's text. What bounds that steering surface is (2)/(3) below plus the sidecar's own
-    session boundaries: skewed prose can degrade a review's focus, but the sidecar stays
-    read-only and its findings are adjudicated by the parent before anything acts on them, so
-    steering never silently converts to writes; (2) the
-    argument char class below excludes every shell metacharacter, so nothing in the forwarded args
-    can escape into a second command or reshape what gets sent to `claude -p`; (3) the shim itself
-    rejects `--fix` anywhere in its args, so even the sidecar's native reviewer can't be told to
-    edit the tree -- read-only in both transport and destination.
-  - A second command can ride along via three vectors, all of which are closed here for all three
-    patterns:
-      1. inline metacharacters -- ; & | (sequencing/pipe), ` $ (substitution), < > (redirection),
-         \\ (escape/line-continuation): excluded from the argument character class.
-      2. a raw newline or carriage return -- these ARE shell statement separators, identical in
-         effect to ';'. The argument whitespace class is [ \t] (spaces/tabs only, NOT \\s, which
-         also matches \\n), AND main() rejects any multi-line command outright before either
-         regex is even consulted. So "ballast-extract\\nrm -rf ~" (or ballast-mode's equivalent)
-         can never auto-allow.
-      3. a trailing-newline match artifact -- avoided by using re.fullmatch rather than .match()
-         (with .match(), a `$` anchor is satisfied *before* a final newline).
-  - Prefix hazard: all three patterns are matched with re.fullmatch, so a longer command name that
-    merely STARTS WITH one of these three names -- `ballast-modes`, `ballast-statusline`,
-    `ballast-reviewer`, etc. -- can never match. fullmatch requires the ENTIRE command string to be
-    consumed; after the literal name, the only continuation the grammar accepts is [ \t]+
-    (whitespace) or end of string, so a bare trailing letter like the `s` in `ballast-modes` (or
-    `er` in `ballast-reviewer`) leaves unconsumed input and fails the match. This is inherent to
-    using DISTINCT fullmatch patterns per name rather than one that risks blurring the boundary
-    (e.g. a naive `ballast-(?:extract|mode|review)s?` alternation) -- it is why this file keeps
-    `_SAFE_EXTRACT`, `_SAFE_MODE`, and `_SAFE_REVIEW` as three separate compiled regexes.
-  - Anything that doesn't match any of the three narrow shapes (typos, path-qualified invocations, piped
-    output, chained commands, multi-line commands, PowerShell syntax) is NOT auto-allowed -- it
-    falls through to Claude Code's normal permission handling exactly as if this hook weren't
-    installed. That is the fail-closed direction for the ALLOW decision: worst case is an extra
-    permission prompt, never a skipped one.
+TRUST BOUNDARY. This hook only ever keeps a SECOND command from riding along; what each shim may do
+is bounded by that script's OWN contract, not by anything here:
+  - `ballast-extract` (session-postmortem/scripts/extract.py): read-only except `digest`, which
+    writes only the fixed filenames `digest.md` + `manifest.json`, and only into a dir it created
+    or already owns (`--out` selects a directory, never a filename). No network, no git.
+  - `ballast-mode` (statusline/mode-state.py): validates `mode` (`[a-z0-9-]{1,32}`) and
+    `--session <sid>` (`[0-9a-fA-F-]{8,64}`) against strict fullmatch allowlists before any
+    filesystem op -- neither charset can contain `/`, `\\`, or `..` -- and every write lands under
+    `~/.claude/ballast/modes/`. Worst case is a wrong status-line chip, not an arbitrary write.
+  - `ballast-review` (bin/ballast-review): the largest blast radius -- it spawns a headless
+    `claude -p` session. It pins the prompt to START with the native `/code-review` command and
+    rejects `--fix` anywhere in its args. Residual, stated honestly: free-form prose after the
+    level DOES reach the sidecar as skill arguments, so an auto-allowed call can steer the review's
+    text -- but the sidecar stays read-only and its findings are adjudicated by the parent, so
+    steering never converts to writes.
+  - `ballast-sweep` (skills/harness-sweep/scripts/sweep.py): writes the fixed `bundle.md` +
+    `manifest.json` under a dir it derives itself, plus `advance`'s rewrite of the
+    `<home>/postmortem/SWEEP-STATE.md` watermark registry it owns. That one write is manifest-
+    driven from disk, so sweep.py validates first: default-mode manifests only, projects already
+    present in SWEEP-STATE only (never adding a row), every watermark fullmatching the
+    report-basename shape with neither a newline nor the ` · ` field separator; any violation
+    refuses the whole run. No network, no git, no shelling out.
+  - Deliberately NOT allowlisted: `ballast-statusline` (statusline/install.py) edits
+    `~/.claude/settings.json` directly, so it stays behind the normal prompt, bare or not.
 
-  RESIDUAL (accepted, low risk): the decision keys on the command STRING, not on the resolved
-  binary. So `ballast-extract <arbitrary-readable-path>` is auto-allowed (a read of any
-  transcript-shaped file, OR -- since `bundle` -- a write of the fixed dump filenames into an
-  attacker-chosen EMPTY-or-already-owned directory, bounded as described above), and a hostile
-  `ballast-extract`, `ballast-mode`, or `ballast-review` planted earlier on PATH would run under
-  the same name. All three are bounded by their own script's contract as described above
-  (extract.py read-only except `bundle`'s narrowly-bounded write, mode-state.py's own argument
-  validation, ballast-review's --fix rejection + native-command pinning); tightening to a
-  path-prefix would break legitimate transcript/backup paths, so it's left as-is.
+REGEX INVARIANTS (this fires on every Bash/PowerShell call, so a bug here is a standing
+auto-approval hole -- do not loosen; anything ambiguous must read as "not a match"):
+  - re.fullmatch, never .match or substring containment: the ENTIRE command must be one plain
+    invocation. This also closes the prefix hazard -- `ballast-modes`, `ballast-statusline`,
+    `ballast-reviewer`, `ballast-sweeper` leave unconsumed input and cannot match -- and avoids the
+    trailing-newline artifact `.match()` allows (a `$` anchor is satisfied before a final newline).
+  - FOUR separate compiled patterns, not one alternation: a naive
+    `ballast-(?:extract|mode|review|sweep)s?` would blur that prefix boundary, and per-pattern
+    matching keeps reason selection trivial.
+  - The argument character class excludes every metacharacter that could carry a second command:
+    `; & |` (sequencing/pipe), `` ` `` and `$` (substitution), `< >` (redirection), `\\` (escape).
+  - Argument whitespace is `[ \t]`, deliberately NOT `\\s`: `\\s` matches newline, and a raw
+    newline or CR is itself a shell statement separator. _decide() additionally rejects any
+    multi-line command before either regex is consulted.
+  - Everything that doesn't match (typos, path-qualified invocations, pipes, chains, PowerShell
+    syntax) falls through to the normal permission flow. Worst case is an extra prompt, never a
+    skipped one.
 
-Input: the hook JSON payload on stdin (Claude Code's standard PreToolUse shape), containing at
-least tool_name and tool_input.command (Bash) or tool_input (PowerShell forms vary -- we only
-special-case the Bash `command` field; anything else exits 0 untouched).
+RESIDUAL (accepted): the decision keys on the command STRING, not the resolved binary -- so
+`ballast-extract <any-readable-path>` is allowed, and a hostile shim planted earlier on PATH would
+run under the same name. Each is bounded by its own contract above; tightening to a path prefix
+would break legitimate transcript/backup paths.
 
-Output: if the opt-in marker is absent, exit 0 with no output for every input -- unconditionally,
-before the command is even matched. If the marker is present: on match, a JSON object on stdout
-with hookSpecificOutput.permissionDecision = "allow" and a human-readable reason (Claude Code
-surfaces this instead of prompting); on no match OR ANY error, exit 0 with no output -- silent,
-fail-open, defers to normal permission flow. The whole decision runs under a broad try/except so a
-malformed payload can never crash a hook that fires on every Bash/PowerShell call.
+Input: the PreToolUse JSON payload on stdin. Only the Bash tool's `tool_input.command` is
+special-cased; anything else exits 0 untouched.
+
+Output: marker absent -> exit 0 with no output, unconditionally, before the command is matched.
+Marker present -> on match, the allow JSON on stdout (Claude Code surfaces the reason instead of
+prompting); on no match OR ANY error, exit 0 with no output -- fail-open, deferring to the normal
+permission flow. The whole decision runs under a broad try/except so a malformed payload can never
+crash a hook that fires on every Bash/PowerShell call.
 """
 import json
 import os
@@ -143,36 +87,27 @@ def home_root():
 
 def _standing_grants_enabled():
     """True only if the user deliberately opted in via <home_root>/ballast/allow-standing-grants.
-    Fails CLOSED (returns False) on ANY error -- the inverse of this file's usual fail-open
-    direction, because here the risky output IS the allow decision itself: a bug that made this
-    return True by accident would silently reinstate a standing grant nobody asked for. Failing
-    closed only ever costs an extra permission prompt, matching this file's existing doctrine
-    everywhere else."""
+    Fails CLOSED on ANY error: a bug that returned True by accident would silently reinstate a
+    standing grant nobody asked for, while failing closed only ever costs an extra prompt."""
     try:
         return os.path.isfile(os.path.join(home_root(), "ballast", "allow-standing-grants"))
     except Exception:
         return False
 
-# All three matched with re.fullmatch (see _decide) so the ENTIRE command must be a single plain
-# invocation of `ballast-extract`, `ballast-mode`, or `ballast-review`, optionally followed by
-# plain arguments. The argument character class excludes every metacharacter that would let a
-# second command ride along:
+# Four separate patterns, applied with re.fullmatch (see _decide) so the ENTIRE command must be one
+# plain invocation plus plain arguments. The argument character class excludes every metacharacter
+# that would let a second command ride along:
 #   ; & |        -- command sequencing / backgrounding / piping
 #   ` $          -- command substitution
-#   < >           -- redirection
+#   < >          -- redirection
 #   \            -- escape / line-continuation
-# Argument whitespace is limited to spaces and tabs ([ \t]) -- deliberately NOT the \s class,
-# because \s also matches newline, and a raw newline is itself a shell statement separator. Any
-# multi-line command is additionally rejected in _decide() before any regex is consulted.
-#
-# THREE SEPARATE compiled patterns (not one alternation) -- deliberate, not merely stylistic: it
-# keeps the per-command permissionDecisionReason trivial to select (see _decide), and it keeps
-# the prefix-hazard reasoning above (ballast-modes / ballast-statusline / ballast-reviewer can't
-# match) obviously true of each pattern in isolation rather than resting on alternation-precedence
-# subtlety.
+# Argument whitespace is [ \t], NOT \s (which also matches newline, a shell statement separator);
+# _decide() rejects multi-line commands outright before any regex runs. See the header's REGEX
+# INVARIANTS for why this is four patterns and not one alternation.
 _SAFE_EXTRACT = re.compile(r"ballast-extract(?:[ \t]+[^;&|<>`$\\]*)?")
 _SAFE_MODE = re.compile(r"ballast-mode(?:[ \t]+[^;&|<>`$\\]*)?")
 _SAFE_REVIEW = re.compile(r"ballast-review(?:[ \t]+[^;&|<>`$\\]*)?")
+_SAFE_SWEEP = re.compile(r"ballast-sweep(?:[ \t]+[^;&|<>`$\\]*)?")
 
 
 def _decide(payload):
@@ -208,7 +143,7 @@ def _decide(payload):
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "allow",
-                "permissionDecisionReason": "ballast's own transcript extractor (bare, unmodified invocation; writes only its own bundle output dir).",
+                "permissionDecisionReason": "ballast's own transcript extractor (bare, unmodified invocation; writes only its own digest output dir).",
             }
         }
     if _SAFE_MODE.fullmatch(cmd):
@@ -233,17 +168,26 @@ def _decide(payload):
                 ),
             }
         }
+    if _SAFE_SWEEP.fullmatch(cmd):
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": (
+                    "ballast's own postmortem-corpus engine (bare, unmodified invocation; writes "
+                    "only its own sweep bundle dir and, on `advance`, the SWEEP-STATE watermark "
+                    "registry it owns)."
+                ),
+            }
+        }
     return None
 
 
 def main():
     try:
-        # OPT-IN GATE, checked ONCE before anything else (cheapest short-circuit; this is the
-        # common no-marker case for any install that hasn't opted in): marker absent -> emit
-        # nothing for this call, full stop, without even parsing the payload. Rationale: an
-        # os.path.isfile stat is cheaper than parsing the stdin JSON payload, so checking it first
-        # is the cheapest path for the common (no-marker) case; an opted-in install pays one extra
-        # stat per call, dwarfed by interpreter startup cost either way.
+        # OPT-IN GATE, checked ONCE before anything else: marker absent -> emit nothing for this
+        # call without even parsing the payload. First because a stat is cheaper than parsing the
+        # stdin JSON, and no-marker is the common case for an install that hasn't opted in.
         if not _standing_grants_enabled():
             return 0
         payload = json.load(sys.stdin)

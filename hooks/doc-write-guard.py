@@ -11,35 +11,27 @@
 #     README, ideas.md, the /.claude/*.md catch-all). A post-write "re-check what you just wrote"
 #     reminder, fired at most once per (session, file). Session-output dirs (.notes, postmortem/s)
 #     are excluded entirely via SESSION_OUTPUT_SEGMENTS -- deterministic session artifacts, not
-#     gated docs (the f646d0d fix; see is_durable).
+#     gated docs (see is_durable).
 #
-# WHY a hard gate for the top tier (provenance): the soft-only PostToolUse design was empirically
-# defeated -- an agent wrote "gate satisfied by construction" straight past two soft reminders. The
-# postmortem chain 2026-06-23 -> 07-07 escalated the miss 5x; a non-blocking nudge cannot force the
-# gate, so the permanent tier now BLOCKS pre-write (mirrors askuserquestion-recommend.py's exit-2
-# point-of-use enforcement). The soft nudge is retained for the reversible ephemeral tier, where a
-# post-write "fix it with a follow-up Edit" reminder is actionable and a block would be overkill.
+# WHY a hard gate for the top tier: a non-blocking nudge cannot force the gate -- the soft-only
+# design was empirically defeated, so the permanent tier BLOCKS pre-write (mirrors
+# askuserquestion-recommend.py's exit-2 point-of-use enforcement). The soft nudge is retained for
+# the reversible ephemeral tier, where "fix it with a follow-up Edit" is actionable.
 #
-# SCOPE (governance review item): the attestation marker is an authoring-discipline record --
-# it self-attests that the durable-docs gate ran THIS session -- not an integrity control. It is
-# NOT tamper-evident and makes no NIST SI-7-style independent-reference claim; treat it as "did
-# the author pause to run the gate", never as proof a doc wasn't altered out-of-band. A user
-# running their OWN doc-governance/integrity regime over paths this guard would otherwise gate
-# (e.g. externally-managed governance files they deliberately re-baseline) can permanently
-# exclude them via ~/.claude/ballast/docguard-exclude -- one fnmatch glob per line, matched
-# case-insensitively against the full normalized path; see load_exclude_patterns() below.
+# SCOPE: the attestation marker is an authoring-discipline record -- "did the author pause to run
+# the gate" -- not an integrity control. It is NOT tamper-evident and is never proof a doc wasn't
+# altered out-of-band. A user running their OWN doc-governance/integrity regime over gated paths
+# can permanently exclude them via ~/.claude/ballast/docguard-exclude -- one fnmatch glob per line,
+# matched case-insensitively against the full normalized path; see load_exclude_patterns().
 #
-# WHY python, not bash (the sibling hooks are bash): the payload's tool_input.file_path is a Windows
-# path full of backslashes. Round-tripping that JSON through `printf | jq/python` in bash corrupts the
-# \-escapes and bash backslash normalization is unreliable. python parses the JSON and normalizes the
-# path natively. Matches the python-hook precedent (askuserquestion-recommend.py, package-install-guard.py).
+# WHY python, not bash (the sibling hooks are bash): tool_input.file_path is a Windows path full of
+# backslashes, and round-tripping that JSON through `printf | jq/python` in bash corrupts the
+# \-escapes. python parses and normalizes the path natively.
 #
-# NOISE CONTROL: PostToolUse de-dupes per (session, file) so it fires at most once per file per session,
-# and prunes its marker cache (shared with the gate markers) so it can't grow without bound. The
-# PreToolUse gate FAILS OPEN on any internal error -- a broken guard must NEVER brick all file writes --
-# but (governance review item) not SILENTLY: every internal-error fail-open path below makes a
-# best-effort systemMessage announcement before returning/exiting, each wrapped in its own
-# try/except so the announce itself can never change the exit code or crash a path that must stay 0.
+# NOISE CONTROL: PostToolUse de-dupes per (session, file) and prunes its marker cache so it can't
+# grow without bound. Every internal-error path FAILS OPEN -- a broken guard must NEVER brick all
+# file writes -- but not silently: each makes a best-effort systemMessage announcement, wrapped in
+# its own try/except so the announce can never change an exit code that must stay 0.
 
 import sys, json, os, hashlib, time, glob, fnmatch
 
@@ -72,11 +64,10 @@ SKILL_REMINDER = ("Authoring or editing a SKILL.md? Run the skill-forge skill fo
 # Soft-tier basenames + segments that mark an ephemeral durable-doc area (hard tier is handled separately).
 DURABLE_BASENAMES = {"claude.md", "agents.md", "projects.md", "memory.md", "skill.md", "ideas.md"}
 DURABLE_SEGMENTS  = {"memory", "specs", "spec", "design", "designs"}
-# R1 fix (postmortem chain 2026-07-09 -> 07-11: 6 false fires, 0 true, across 4 sessions): session-
-# OUTPUT areas are not durable-doc AUTHORING surfaces -- .notes/ distillations (working notes, plans,
-# feedback seeds) and postmortem dirs (reports + generated registry/ledger state like
-# SWEEP-STATE.md) are written by flows that already carry their own discipline (session-postmortem,
-# harness-sweep). Excluded FIRST in is_durable, so the "/.claude/*.md" catch-all can't re-catch them.
+# Session-OUTPUT areas are not durable-doc AUTHORING surfaces -- .notes/ distillations and
+# postmortem dirs (reports plus generated registry state like SWEEP-STATE.md) are written by flows
+# that carry their own discipline (session-postmortem, harness-sweep). Excluded FIRST in is_durable,
+# so the "/.claude/*.md" catch-all can't re-catch them.
 SESSION_OUTPUT_SEGMENTS = {".notes", "postmortem", "postmortems"}
 # Same session-output class, homed under a .claude/ root instead of .notes/: a recurring skill's own
 # digest series, sibling to .claude/postmortem/. Matched as a PAIR with ".claude" -- deliberately NOT
@@ -104,19 +95,14 @@ def is_excluded(p, segs):
 
 
 def load_exclude_patterns():
-    # User exclusion list (governance review item): <home_root>/ballast/docguard-exclude, one
-    # fnmatch glob per line. Blank lines and lines starting with "#" are ignored; every pattern
-    # is backslash->slash normalized and lowercased at load time, mirroring normalize()'s output
-    # shape, so matching is genuinely case- and separator-insensitive regardless of
-    # fnmatch.fnmatch's OS-dependent normcase behavior (case-sensitive on POSIX, case-insensitive
-    # on Windows -- we don't want to depend on that) and of which slash style the user pasted
-    # (an Explorer/PowerShell copy is backslashed, and a synced dotfile read on POSIX gets no
-    # normcase rescue). utf-8-sig: strips a leading BOM when present (Notepad's default UTF-8
-    # flavor), a no-op for BOM-less files -- a BOM left on line 1 would make that pattern
-    # silently never match. Fails open on ANY error, including the missing-file case (the
-    # normal, expected state for most installs) -- no exclusions, guard stays fully active.
-    # Broad try/except, consistent with this file's fail-open-on-own-bugs doctrine; a malformed
-    # or binary exclusion file must never itself become a new way to break every doc write.
+    # User exclusion list: <home_root>/ballast/docguard-exclude, one fnmatch glob per line. Blank
+    # lines and "#" comments are ignored. Every pattern is backslash->slash normalized and
+    # lowercased at load time, mirroring normalize()'s output shape, so matching never depends on
+    # fnmatch.fnmatch's OS-dependent normcase (case-sensitive on POSIX, insensitive on Windows) nor
+    # on which slash style the user pasted. utf-8-sig strips a leading BOM (Notepad's default UTF-8
+    # flavor) that would otherwise make line 1's pattern silently never match. Fails open on ANY
+    # error, including the missing file (the normal state for most installs) -- no exclusions,
+    # guard stays fully active; a malformed exclusion file must never break every doc write.
     # No caching: each event path checks user_excluded at most once per (short-lived) process.
     patterns = []
     try:
@@ -231,19 +217,18 @@ def pre_gate(d):
         print(
             "BLOCKED -- doc-write-guard: %s is a permanent-tier durable doc (CLAUDE.md / AGENTS.md / "
             "a SKILL.md / a .claude commands/*.md / a hook script), and the durable-doc "
-            "authoring gate has not run this session. Run the durable-docs skill before writing it -- or "
-            "the skill-forge skill for SKILL.md craft (its Step 0 runs the same gate) -- whose completion "
-            "writes the attestation marker that unblocks this write. Already ran the gate this session "
-            "(or this is a false match)? Manually attest, in the Bash tool: touch ~/.claude/.cache/docguard/gate-%s"
-            " -- Running your own doc-governance/integrity regime over this path? Permanently exclude it "
-            "via a glob line in ~/.claude/ballast/docguard-exclude."
+            "authoring gate has not run this session. Run the durable-docs skill -- or the skill-forge "
+            "skill for SKILL.md craft, whose Step 0 runs the same gate -- to write the attestation "
+            "marker that unblocks this write. Already ran it this session, or this is a false match? "
+            "Attest in the Bash tool: touch ~/.claude/.cache/docguard/gate-%s. "
+            "Running your own doc-governance/integrity regime over this path? Exclude it with a glob "
+            "line in ~/.claude/ballast/docguard-exclude."
             % (fp, session_id),
             file=sys.stderr,
         )
         return 2
     except Exception:
-        # Fail open -- never brick a write on a guard bug -- but announce it (governance review
-        # item): pre_gate's error path used to be silently return 0 with no trace it ever fired.
+        # Fail open -- never brick a write on a guard bug -- but announced, never silent.
         _announce_error("pre_gate", "write gate skipped")
         return 0
 
@@ -271,15 +256,12 @@ def main():
     try:
         d = json.loads(sys.stdin.read())
     except Exception:
-        # Malformed payload -> never block, never nudge -- but announce (governance review item):
-        # this used to be a silent exit 0.
+        # Malformed payload -> never block, never nudge -- but announced, never silent.
         _announce_error("payload parse", "guard skipped")
         sys.exit(0)
     if not isinstance(d, dict):
         # Valid JSON but not an object -> same fail-open contract (the .get() below would
-        # AttributeError -> exit 1; same class as the askuserquestion-recommend 2026-07-11 fix).
-        # Announced for the same reason as the malformed-payload branch above (same site tag --
-        # both are payload-shape failures caught before event dispatch).
+        # AttributeError -> exit 1). Same site tag: both are pre-dispatch payload-shape failures.
         _announce_error("payload parse", "guard skipped")
         sys.exit(0)
     event = d.get("hook_event_name") or ""
@@ -289,11 +271,8 @@ def main():
         try:
             post_nudge(d)
         except Exception:
-            # An uncaught post_nudge bug used to exit 1 with a traceback (silent to the user,
-            # loud only in a log nobody watches) -- wrap it in the same fail-open + announce
-            # contract as every other error path in this file (governance review item).
-            # No permission-flow clause: post_nudge (PostToolUse) makes no permission decision at
-            # all, so claiming one would be false.
+            # Same fail-open + announce contract as every other error path here. No
+            # permission-flow clause: PostToolUse makes no permission decision to defer.
             _announce_error("post_nudge", "nudge skipped", permission_flow=False)
     sys.exit(0)
 

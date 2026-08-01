@@ -25,7 +25,7 @@ hook header's residual 1.
 HERMETIC (hooks/CLAUDE.md rule): every invocation sets BALLAST_CLAUDE_HOME to a temp dir, so the
 valve marker directory is never the real ~/.claude. Production never sets that var.
 
-Self-locating + standalone: `python hooks/test_process_lifecycle_guard.py`.
+Self-locating + standalone: `python hooks/tests/test_process_lifecycle_guard.py`.
 """
 import json
 import os
@@ -36,7 +36,7 @@ import tempfile
 import time
 import unittest
 
-HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "process-lifecycle-guard.py")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "process-lifecycle-guard.py")
 
 # A stand-in transcript path: the guard derives the valve's session key from its filename stem.
 TRANSCRIPT = "/home/u/.claude/projects/proj/abc-123.jsonl"

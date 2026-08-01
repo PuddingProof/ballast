@@ -4,6 +4,16 @@ Consumer-visible changes to the ballast plugin. Changes land under **[Unreleased
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-07-31
+
+- Hooks prose pass: injected texts trimmed across the board (subagent-fanout −17%, git-commit-guard review nudge, ballast-principles, plan-authoring, doc-write-guard/askuserquestion stderr) — same constraints, fewer standing tokens
+- harness-sweep v2: full redesign — deterministic `ballast-sweep` corpus engine (parses all report schema generations v0–v5), forked one-context judgment pass pinned to fable/medium, digest quality over runtime; retires the harness-sweep-extractor + harness-sweep-scout agents
+- Hook tests moved from hooks/ into hooks/tests/
+- session-postmortem v5: full redesign — single-pass digest script, forked one-context report, ~3× faster; retires postmortem-extractor + postmortem-priors-scout agents and the --fix flag
+- session-postmortem: `--id` accepts a unique prefix (a report's sid8); an unresolvable explicit id fails loudly instead of silently falling back to the newest cwd transcript
+- session-postmortem: `suggested_slug` descends past dot-dirs (`.claude/`) and pass-through layout dirs (`src/`) to a content-bearing path segment
+- freehand-mode: dropped the pending statusline chip and its settle instruction; the keyword-arm stub and systemMessage are now static (the confirmed chip, raised by the freehand skill on a genuine grant, is unchanged)
+
 ## [0.9.0] — 2026-07-29
 
 Visual-stack redesign: a two-rung review ladder with a cheap default, root-enforced process-lifecycle hygiene, orchestrator-owned origins, and one workflow skill as source of truth.

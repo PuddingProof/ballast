@@ -2,52 +2,48 @@
 # Global PreToolUse hook on the Bash AND PowerShell tools (matcher "Bash|PowerShell", wired in
 # ballast's hooks/hooks.json). Mostly SOFT (reminders, exit 0) -- plus ONE hard block (exit 2): a
 # compound command that chains a rule-guarded git op (commit/push/reset/rebase/bulk-add) past the
-# per-command guards. That compound bypass is the root cause of the "reminder fires after the commit"
-# class of bug -- e.g. `git commit && git log` delivers the nudge bundled with the commit's result.
+# per-command guards.
 #
-# WHY a hook and not a settings `ask` rule: a permission rule can only gate yes/no -- it
-# cannot tell Claude to *do* something. The whole point of this hook is to INJECT the
-# "run a review pass" instruction. A yes/no commit gate, if ever wanted, belongs in `ask`.
+# WHY a hook and not a settings `ask` rule: a permission rule can only gate yes/no -- it cannot tell
+# Claude to *do* something, and injecting the "run a review pass" instruction is the whole point. A
+# yes/no commit gate, if ever wanted, belongs in `ask`.
 #
-# WHY it triggers on `git diff` / `git log`, NOT `git commit`: a non-blocking PreToolUse
-# hook's additionalContext is delivered together with the triggering command's RESULT.
-# Hang it on `git commit` and the reminder arrives AFTER the commit already ran -- useless
-# (that was the long-standing bug: the reminder "fired after the commit"). Hang it on the
-# pre-commit INSPECTION Claude runs first (`git diff` / `git log`) and the reminder lands
-# while Claude is still pre-commit -- in time to actually review before committing.
+# WHY it triggers on `git diff` / `git log`, NOT `git commit`: a non-blocking PreToolUse hook's
+# additionalContext is delivered together with the triggering command's RESULT, so hanging it on
+# `git commit` delivers the reminder AFTER the commit already ran. Hung on the pre-commit
+# INSPECTION Claude runs first, it lands while Claude is still pre-commit -- in time to matter.
 #
 # Jobs:
-#   1) REVIEW NUDGE on `git diff` / `git log` -- run /code-review --fix + /simplify (or the
-#      project's own review skill) before committing; confirm only intended files staged.
+#   1) REVIEW NUDGE on `git diff` / `git log` -- review before committing; confirm only intended
+#      files staged.
 #   2) SHARED-REPO STAGING SAFETY on bulk `git add -A/-u/.`, `--amend`, history `reset`.
 #   3) OFF-SITE PUSH reminder on `git push`.
 #
-# Output is JSON hookSpecificOutput.additionalContext (plain stdout only shows in
-# transcript mode, invisible in normal conversation). Always exit 0 -- never blocks.
+# Output is JSON hookSpecificOutput.additionalContext (plain stdout only shows in transcript mode).
+# Every path exits 0 except the one hard block.
 #
 # Robustness: matches the operation anywhere in the command (covers compound
 # `git add -A && git commit`). Command extraction prefers jq, falls back to the dispatcher-verified
 # Python (BALLAST_PYTHON), then the raw payload; JSON emission uses that same Python.
 #
-# Cross-OS: written to run under bash on Windows (Git Bash), macOS, and Linux. It uses NO GNU-only
-# regex extensions -- word boundaries are POSIX character classes (see $L/$R below), not `\b`, which
-# BSD grep/sed (macOS) treat as a literal 'b'. A \b here would make the guard silently inert on macOS.
+# Cross-OS: runs under bash on Windows (Git Bash), macOS, and Linux, with NO GNU-only regex
+# extensions -- word boundaries are POSIX character classes (see $L/$R below), never `\b`, which
+# BSD grep/sed (macOS) treat as a literal 'b', silently making the guard inert there.
 
 payload="$(cat)"
 
 # FAST-PATH PREFILTER (performance, not semantics): if the raw payload contains no `git` substring
 # at all, nothing downstream can possibly match, so exit before paying for extraction. WHY IT
 # MATTERS: the jq-absent branch below starts a whole PYTHON INTERPRETER, and this hook fires on
-# EVERY Bash/PowerShell call -- the vast majority of which never mention git. That per-call
-# interpreter start made this the #1 timeout hook (12 of 21 timeouts in an observed 83-minute
-# window). The `case`/`exit` below is a shell builtin: zero forks.
-# STRICTLY CONSERVATIVE, and this is the load-bearing argument: it tests the RAW payload, which is
-# a SUPERSET of every string any downstream check inspects -- the extracted command is a substring
-# of the payload, and the line-57 fallback already scans this same raw payload verbatim. So no
-# payload that could have matched downstream is skipped here, and no new over-match class is
-# introduced (a `git` mention in a `description` field merely reaches the existing logic, exactly
-# as before). Matching bare `git` rather than `git ` on purpose: wider than any downstream pattern,
-# keeping the superset property intact even if a check is later loosened.
+# EVERY Bash/PowerShell call -- the vast majority of which never mention git; that per-call
+# interpreter start once made this the #1 timeout hook. The `case`/`exit` below is a builtin: zero forks.
+# STRICTLY CONSERVATIVE, and this is the load-bearing argument: it tests the RAW payload, a SUPERSET
+# of every string any downstream check inspects -- the extracted command is a substring of the
+# payload, and the fallback below scans this same raw payload verbatim. So no payload that could
+# have matched downstream is skipped here, and no new over-match class is introduced (a `git`
+# mention in a `description` field merely reaches the existing logic). Matching bare `git` rather
+# than `git ` on purpose: wider than any downstream pattern, keeping the superset property intact
+# even if a check is later loosened.
 case "$payload" in
   *git*) ;;
   *) exit 0 ;;
@@ -56,11 +52,10 @@ esac
 # Extract tool_input.command (present for Bash and PowerShell tools) so a `description`
 # mentioning git can't cause a false reminder. Prefer jq; else the dispatcher-verified Python
 # (BALLAST_PYTHON, exported by run.sh -- a working Python 3, never the Windows Store stub). If
-# NEITHER is available, fall back to scanning the raw payload. That last fallback is the fix for a
-# silent-no-op bug: the old code hardcoded bare `python`, so on a box with no jq and a stubbed
-# `python` the command came back empty and the WHOLE guard (including the exit-2 hard block) went
-# dead. Scanning the raw payload over-matches slightly (a git mention in a description) but
-# fail-safe (more guarding) beats fail-silent for a safety hook.
+# NEITHER is available, fall back to scanning the raw payload: without it, a box with no jq and a
+# stubbed `python` yields an empty command and the WHOLE guard (exit-2 hard block included) goes
+# silently dead. The fallback over-matches slightly (a git mention in a description), but fail-safe
+# (more guarding) beats fail-silent for a safety hook.
 extracted=1
 if command -v jq >/dev/null 2>&1; then
   cmd="$(printf '%s' "$payload" | jq -r '.tool_input.command // ""' 2>/dev/null)"
@@ -126,7 +121,7 @@ cmd_noargmsg="$(printf '%s' "$cmd" | sed -E \
 if [ "$extracted" = 1 ] \
    && printf '%s' "$cmd_noargmsg" | grep -qE '(&&|\|\||;)[[:space:]]*git[[:space:]]' \
    && printf '%s' "$cmd_noargmsg" | grep -qE "${L}git commit${R}|${L}git push${R}|${L}git rebase${R}|${L}git reset${R}.*(--hard|--soft|--mixed|--keep)|${L}git add[[:space:]]+(-A${R}|--all${R}|-u${R}|--update${R}|\.([[:space:]]|\$))"; then
-  echo "BLOCKED (compound bypass): a rule-guarded git op (commit / push / reset --hard|soft|mixed / rebase / bulk add -A|-u|.) is chained inside a compound command, which slips it past the per-command git guard. Re-run it as its OWN command -- the working dir persists between calls, so put 'cd' on a separate line and commit by path. Benign compounds are fine; only guarded ops must stand alone." >&2
+  echo "BLOCKED (compound bypass): a rule-guarded git op (commit / push / reset --hard|soft|mixed / rebase / bulk add -A|-u|.) is chained inside a compound command, which slips it past the per-command git guard. Re-run it as its OWN command -- the working dir persists between calls, so put 'cd' on a separate line and commit by path." >&2
   exit 2
 fi
 
@@ -136,34 +131,27 @@ msgs=()
 #    in time. Conditional wording: harmless if Claude is diffing for a non-commit reason.
 inspecting=0
 { printf '%s' "$cmd" | grep -qE "${L}git diff${R}" || printf '%s' "$cmd" | grep -qE "${L}git log${R}"; } && inspecting=1
-# ...but NOT when the SAME command also commits. A compound like `git commit && git log` (commit, then
-# show the resulting log) would otherwise re-fire the nudge together with the commit's result -- i.e.
-# AFTER the commit already ran. That is the exact "fires after the commit" bug sneaking back in via a
-# post-commit diff/log on the same line. The review nudge is only useful on a STANDALONE pre-commit
-# inspection, so a command that commits suppresses it.
+# ...but NOT when the SAME command also commits: `git commit && git log` would deliver the nudge
+# together with the commit's result, i.e. after the commit already ran. The review nudge is only
+# useful on a STANDALONE pre-commit inspection, so a command that commits suppresses it.
 printf '%s' "$cmd" | grep -qE "${L}git commit${R}" && inspecting=0
-# Sidecar suppression -- retained for the now-DORMANT bin/ballast-review fallback shim. The PRIMARY
-# review path is the inline ballast:code-review skill, which needs no suppression: it runs in the
-# main session (not a sibling headless one), so nudging it is not recursion-shaped. But if the shim
-# is ever run manually it still exports BALLAST_SIDECAR_REVIEW=1 into its headless session's hook
-# processes, and that session must not be nudged to review itself (observed firing 6x per sidecar on
-# the reviewer's own git diff/log calls) -- so suppress the pre-commit nudges there. Everything ABOVE
-# this line stays live on purpose: the compound-chain exit-2 hard block and the amend/reset/push
-# cautions ENFORCE the shim's read-only intent if it ever drifts toward a write -- suppressing the
-# whole guard would disable them.
+# Sidecar suppression, for the now-DORMANT bin/ballast-review shim: run manually it exports
+# BALLAST_SIDECAR_REVIEW=1 into its headless session's hook processes, and that session must not be
+# nudged to review itself. Scoped to the pre-commit nudges ONLY -- the exit-2 hard block and the
+# amend/reset/push cautions above stay live there, enforcing the shim's read-only intent if it ever
+# drifts toward a write. The primary path, the inline ballast:code-review skill, runs in the main
+# session and needs no suppression.
 if [ "$inspecting" -eq 1 ] && [ "${BALLAST_SIDECAR_REVIEW:-}" != "1" ]; then
-  # `ballast:code-review` below keeps its namespace prefix ON PURPOSE -- it disambiguates from
-  # NATIVE /code-review (a real name collision; native is the disable-model-invocation one that
-  # bounces the model). Don't prose-ify it per skills/CLAUDE.md's refer-in-prose convention: that
-  # is for skills whose install form varies, but this fork always ships as the namespaced plugin skill
-  # -- ON INSTALLS THAT HAVE IT: the public-mirror build excludes the skill (IP-gated until its
-  # rewrite), so the nudge text carries an explicit without-it branch instead of pointing every
-  # public consumer at a void. The mention is adjudicated in dev/publish.sh's
-  # REFERENCE_WARN_ALLOWLIST -- graceful-degrade wording here and there must stay in sync.
-  msgs+=("If you're heading toward a commit: run a review pass FIRST. Native /code-review is user-invoke-only now -- invoke the ballast:code-review skill if this install ships it (runs the native-style multi-angle fan-out inline, in this session): \`ballast:code-review <low|medium|high|xhigh|max> [commit-range]\`; installs without it run their own review flow at equivalent depth. Scale the level to the diff, and at a multi-commit checkpoint pass the cumulative range (e.g. \`<base>..HEAD\`) at a heavier level. Add \`--fix\` to apply high-confidence fixes directly, or adjudicate the findings and apply them yourself -- a correct finding is not skippable just for being pre-existing or non-exploitable -- fix if cheap, else log to IDEAS/backlog. Then /simplify on the pending changes (or use this project's own review skills and verification rules). Your own audit / visual / diff-reread passes can justify LOWERING the review level and narrowing scope, but never REPLACE the review pass itself. Docs/meta changes run the durable-docs skill instead. Confirm via git status that only intended files are staged (a concurrent Claude session may share this index). Skip only if the diff is trivial (comments/one-liners), or already reviewed this session.")
+  # `ballast:code-review` below keeps its namespace prefix ON PURPOSE: it disambiguates from NATIVE
+  # /code-review (a real name collision), and this fork always ships as the namespaced plugin skill,
+  # so skills/CLAUDE.md's prose-ify convention (for skills whose install form varies) doesn't apply.
+  # The public-mirror build excludes the skill, hence the explicit without-it branch in the text;
+  # that mention is adjudicated in publish.sh's REFERENCE_WARN_ALLOWLIST (release-bump skill) and
+  # the graceful-degrade wording here and there must stay in sync.
+  msgs+=("If you're heading toward a commit: run a review pass FIRST -- invoke the ballast:code-review skill if this install ships it (native-style multi-angle fan-out, inline in this session): \`ballast:code-review <low|medium|high|xhigh|max> [commit-range]\`; native /code-review is user-invoke-only now, and installs without the skill run their own review flow at equivalent depth. Scale the level to the diff; at a multi-commit checkpoint pass the cumulative range (e.g. \`<base>..HEAD\`) at a heavier level. Add \`--fix\` for high-confidence fixes, or adjudicate and apply them yourself -- pre-existing or non-exploitable is no reason to skip a correct, cheap finding; else log it to IDEAS/backlog. Then /simplify on the pending changes (or this project's equivalent). Your own audit / visual / diff-reread passes can LOWER the level and narrow scope, never REPLACE the review pass. Docs/meta changes run the durable-docs skill instead. Confirm via git status that only intended files are staged (a concurrent Claude session may share this index). Skip only if the diff is trivial (comments/one-liners) or already reviewed this session.")
   # integration-gate reinforcement: a self-discipline skill's description is a weak auto-trigger, so
-  # fire it at the reliable pre-commit moment for multi-part work. Named as prose (not literal Skill()
-  # syntax) so it resolves whether the skill is installed personally or as a namespaced plugin skill.
+  # fire it at the reliable pre-commit moment for multi-part work. Named as prose (not literal
+  # invocation syntax) so it resolves for a personal or a namespaced plugin install alike.
   msgs+=("Multi-part change (built across multiple files / waves / subagents)? Invoke the integration-gate skill to sweep the whole combined diff for cross-cutting bugs before committing -- skip for a single-file edit.")
 fi
 

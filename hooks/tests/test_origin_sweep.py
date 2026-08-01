@@ -15,7 +15,7 @@ HERMETIC (hooks/CLAUDE.md rule) by the same three seams the library documents --
 BALLAST_VISUAL_KILL_LOG, so NO TEST HERE EVER SIGNALS A REAL PROCESS: every reap assertion is an
 assertion about that log file.
 
-Self-locating + standalone: `python hooks/test_origin_sweep.py`.
+Self-locating + standalone: `python hooks/tests/test_origin_sweep.py`.
 """
 import json
 import os
@@ -25,9 +25,9 @@ import tempfile
 import time
 import unittest
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-HOOK = os.path.join(HERE, "origin-sweep.py")
-sys.path.insert(0, HERE)
+HOOKS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # hooks/ — one dir up from tests/
+HOOK = os.path.join(HOOKS, "origin-sweep.py")
+sys.path.insert(0, HOOKS)
 
 import visual_origin_ledger as vol  # noqa: E402
 

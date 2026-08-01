@@ -4,86 +4,72 @@ PreToolUse guard (Bash|PowerShell): in a SUB-AGENT, hard-deny any command that t
 ownership of a PROCESS LIFECYCLE. Main session: pure no-op (exit 0, no output).
 
 WHY IT EXISTS. A leaf that stands up its own service is the orphan factory: it detaches a
-process that outlives the leaf (nothing ever reaps it -- a leaf has no close-out), or it
-foregrounds one and wedges its own command until the tool timeout, then reaches for
-`taskkill`/`kill` on a process nobody owns. The orchestrator -- attended, in the main
-session, with a ledger and a teardown -- is the only caller that can own a process's whole
-life. This guard is the mechanism-level backstop for a rule that prose stated and lost.
+process nothing will reap (a leaf has no close-out), or foregrounds one, wedges its own command
+until the tool timeout, then reaches for `taskkill`/`kill` on a process nobody owns. Only the
+orchestrator -- attended, with a ledger and a teardown -- can own a process's whole life.
 
-DENY SURFACE (semantic center: THE PROCESS OUTLIVES THE LEAF OR REACHES OUTSIDE IT). The
-named verbs below are a starting corpus, not the definition -- extend them as the
-improvisation set moves; the test suite's bypass matrix is where new shapes get pinned.
-  (a) DETACHMENT -- `tool_input.run_in_background: true` is a FIRST-CLASS signal, checked
-      before the command string is even read (detachment is frequently not in the command
-      text at all), plus the command shapes `nohup`, a trailing `&`, `Start-Job`,
-      `Start-Process`, Windows `start`.
-  (b) STANDING-ORIGIN LAUNCHES, FOREGROUND INCLUDED -- dev servers, `python -m http.server`
-      improvisations, `docker compose up`, `make dev`, probe serve/session lifecycle.
-      Foreground is denied too: in a leaf a foreground server just wedges the command until
-      timeout, and the leaf did not get the origin it needed either way.
+DENY SURFACE (semantic center: THE PROCESS OUTLIVES THE LEAF OR REACHES OUTSIDE IT). The named
+verbs are a starting corpus, not the definition -- extend them as the improvisation set moves;
+the test suite's bypass matrix is where new shapes get pinned.
+  (a) DETACHMENT -- `tool_input.run_in_background: true` is a FIRST-CLASS signal, read before
+      the command string (detachment is frequently nowhere in the command text), plus `nohup`,
+      a trailing `&`, `Start-Job`, `Start-Process`, Windows `start`.
+  (b) STANDING-ORIGIN LAUNCHES, FOREGROUND INCLUDED -- dev servers, `python -m http.server`,
+      `docker compose up`, `make dev`, probe serve/session lifecycle. Foreground counts: in a
+      leaf it only wedges the command until timeout, origin still unobtained.
   (c) ALL PROCESS SIGNALLING, WITH NO OWN-CHILD CARVE-OUT -- `kill`, `pkill`, `killall`,
-      `taskkill`, `Stop-Process`, `kill-port`, `docker stop`. A child the leaf foregrounded
-      dies with the leaf's own command, so the legitimate leaf-kill residue is ~empty; a
-      stateless guard cannot verify ownership anyway; and the release valve covers the
-      remainder. The carve-out is absent BY DESIGN -- do not add one.
+      `taskkill`, `Stop-Process`, `kill-port`, `docker stop`. A stateless guard cannot verify
+      ownership, a foregrounded child dies with the leaf's own command anyway, and the valve
+      covers the remainder. The carve-out is absent BY DESIGN -- do not add one.
 
 EXPLICITLY NOT THE DENY SURFACE: transient port binds inside foreground test/build runs
 (`vitest`, `playwright test`, an `npm test` that spawns and reaps an internal server,
-`npm run build`), and search/read commands that merely MENTION a verb. Two mechanisms keep
-those quiet, and both are load-bearing: (1) a segment whose head is a read-only tool
-contributes nothing (`grep -r "Stop-Process" src/`, `cat kill.sh`), and (2) bare `kill`
-matches in COMMAND POSITION only -- it is an ordinary English word, so an anywhere-match on
-it fires on filenames, flags, and prose.
+`npm run build`), and search/read commands that merely MENTION a verb. Two load-bearing
+mechanisms keep those quiet: (1) a segment whose head is a read-only tool contributes nothing
+(`grep -r "Stop-Process" src/`, `cat kill.sh`), and (2) bare `kill` matches in COMMAND POSITION
+only -- an ordinary English word, an anywhere-match would fire on filenames, flags, and prose.
 
-DOMAIN-NEUTRAL BY DESIGN. The rationale is lifecycle/orphan hygiene, not visual or frontend
-policy: most sessions and most projects touch no frontend, and their leaves must never pay
-domain-flavored friction. The deny text says *the orchestrator owns process lifecycle --
-report the missing origin/service and finish with what exists*, and names nothing else.
+DOMAIN-NEUTRAL BY DESIGN: the rationale is lifecycle/orphan hygiene, so no leaf pays
+domain-flavored friction in a project that has none of that domain. The deny text says *the
+orchestrator owns process lifecycle -- report the missing origin/service and finish with what
+exists*, and names nothing else.
 
 POSTURE: hard deny (permissionDecision "deny" + exit 0 -- NOT exit 2), sub-agents only, no
-shadow window. Taking the ladder's top rung up front is earned two ways: the sibling
-`package-install-guard.py` already proved this posture against the same failure class (a leaf
-that cannot resolve its own environment re-tries until the budget is gone), and the
-compensating control for skipping the shadow window is the false-positive corpus in
-`test_process_lifecycle_guard.py` -- which is why that corpus is not optional and why
-non-frontend rows are first-class in it.
+shadow window. The compensating control for skipping that window is the false-positive corpus in
+`test_process_lifecycle_guard.py` -- not optional, and first-class in rows from projects outside
+any one domain.
 
-RELEASE VALVE. A session-scoped marker at <ballast-home>/.cache/ballast-lifecycle/valve-<key>
-(key = the transcript filename stem). Present -> the command is allowed with a ledgered
-warning naming the valve, instead of denied. The valve is the ATTENDED main session's lever:
-the orchestrator creates it after a false positive is surfaced, and a leaf can never actuate
-its own (it is denied the means, and the deny text tells it to report instead). Markers older
-than 2 days are pruned whenever the dir is touched -- the doc-write-guard precedent prunes by
-age, not by session; session scoping lives in the key.
+RELEASE VALVE: a session-scoped marker at <ballast-home>/.cache/ballast-lifecycle/valve-<key>
+(key = the transcript filename stem). Present -> the command is allowed with a ledgered warning
+naming the valve instead of denied. It is the ATTENDED main session's lever: the orchestrator
+creates it after a false positive is surfaced, and a leaf can never actuate its own (denied the
+means, and told to report instead). Markers older than 2 days are pruned on any dir touch.
 
 FAIL-OPEN GUARANTEE. Every path is wrapped: a malformed payload, an unreadable state dir, a
-regex or parse surprise -> exit 0 with no decision, so a bug in this file can never block
-every Bash/PowerShell call. The fail-open is ANNOUNCED (systemMessage), never silent, so a
-persistently-crashing guard is visible rather than quietly dead; the announce is wrapped in
-its own try/except and can never change the exit code.
+regex or parse surprise -> exit 0 with no decision, so a bug here can never block every
+Bash/PowerShell call. The fail-open is ANNOUNCED (systemMessage), never silent; the announce is
+wrapped in its own try/except and can never change the exit code.
 
-CALLER DISCRIMINATION is payload-only, ported verbatim from package-install-guard.py: there
-is no env-var discriminator on the hook path. `agent_type` / `agent_id`, OR'd -- see
-is_subagent(). Any parse surprise resolves False = main session = no-op, which fails toward
-ASK (the native permission flow), never toward denying an attended user.
+CALLER DISCRIMINATION is payload-only (no env-var discriminator exists on the hook path):
+`agent_type` / `agent_id`, OR'd -- see is_subagent(). Any parse surprise resolves False = main
+session = no-op, failing toward the native permission flow, never toward denying an attended user.
 
 NAMED RESIDUAL RISKS (accepted, not bugs -- do not "fix" them silently):
-  1. `npm start` / `npm run start` are NOT denied. `start` is overloaded across ecosystems --
-     a dev server, a plain `node index.js` entry point, a build/test alias -- and the design
-     spec places it in the false-positive corpus. A leaf whose project maps `start` to a dev
-     server therefore slips through; the compensating control is orchestrator-owned origins
-     (the service is handed to the leaf, so it has no reason to run `start` at all).
+  1. `npm start` / `npm run start` are NOT denied: `start` is overloaded across ecosystems (dev
+     server, plain entry point, build/test alias) and sits in the false-positive corpus. A leaf
+     whose project maps `start` to a dev server slips through; the compensating control is
+     orchestrator-owned origins -- the service is handed to the leaf, which then has no reason
+     to run `start` at all.
   2. Quoted bodies are stripped before matching, so a verb hidden in a quoted string is
-     invisible. A shell wrapper (`bash -c "npm run dev"`) is unwrapped first, which closes the
-     obvious form, but not every wrapper shape (a script file the leaf writes then executes,
-     `xargs`, env-var indirection). This guard is a lifecycle backstop, not a sandbox.
-  3. Arbitrary code reached through a tool's own in-process entry points (a dynamically
-     imported scenario or project-authored hook module) never becomes a shell command and is
-     invisible here. Only HALF of it is closed elsewhere: manifest `drive` hooks are skipped
-     under the leaf-mode flag and reported as coverage holes, but running an authored scenario
-     file is a live residual by design (rung 2 is opt-in and orchestrator-adjudicated -- see
-     the probe skill's mode-states reference). Named here so a reader never mistakes this
-     guard for total coverage, and never reads "closed elsewhere" as total either.
+     invisible. `bash -c "npm run dev"` is unwrapped first, but not every wrapper shape is (a
+     script the leaf writes then executes, `xargs`, env-var indirection). A lifecycle backstop,
+     not a sandbox.
+  3. Code reached through a tool's own in-process entry points (a dynamically imported scenario
+     or project-authored hook module) never becomes a shell command and is invisible here. Only
+     HALF is closed elsewhere: manifest `drive` hooks are skipped under the leaf-mode flag and
+     reported as coverage holes, while running an authored scenario file is a live residual by
+     design (rung 2 is opt-in and orchestrator-adjudicated -- see the probe skill's mode-states
+     reference). Read this guard as neither total coverage nor "closed elsewhere".
   4. Verb corpora are heuristics: a launcher nobody has improvised yet is missed until the
      bypass matrix names it, and an exotic project alias could false-fire (valve + report).
 """
@@ -125,9 +111,8 @@ def is_subagent(payload):
     a main-thread agent persona; agent_id only = a forked query. All three are contexts the
     user is not watching, which is exactly the set that must not own a process.
 
-    Any parse surprise -> False -> main session -> no-op: fail toward the native permission
-    flow, never toward denying an attended user. If upstream renames these fields the
-    predicate goes False everywhere and this guard degrades to inert -- fail-open by
+    Any parse surprise -> False -> main session -> no-op. If upstream renames these fields the
+    predicate goes False everywhere and the guard degrades to inert -- fail-open by
     construction, with the prose prohibition (agent bodies, dispatch briefs) as the backstop.
     """
     try:
@@ -422,12 +407,12 @@ def classify(cmd, background):
 # --------------------------------------------------------------------------------------
 # The leaf-facing half of the deny: what to do INSTEAD. Without a stated escape hatch a blocked
 # leaf improvises one (a different runner, a foreground variant, a wrapper) and spins -- the
-# exact loop this guard exists to end. The domain-neutral wording is deliberate: a leaf in a
-# project with no frontend must read this as ordinary lifecycle hygiene, not someone else's
-# policy. %s = this session's valve path.
+# exact loop this guard exists to end. The domain-neutral wording is deliberate: every leaf must
+# read this as ordinary lifecycle hygiene, not as some other domain's policy. %s = this session's
+# valve path.
 LEAF_ESCAPE = (
     "Sub-agents do not own process lifecycle — starting, backgrounding, or signalling a "
-    "process is the main-session orchestrator's call, made once, attended, with a teardown. "
+    "process is the main-session orchestrator's call, made once and attended. "
     "Do NOT retry, reword, or route around this (another runner, a foreground variant, a "
     "wrapper, a background flag) — every form is denied. Instead: use the service or origin "
     "the orchestrator handed you; absent one, report the missing origin/service as a blocked "

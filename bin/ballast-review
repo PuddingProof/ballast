@@ -112,7 +112,7 @@ export BALLAST_SIDECAR_REVIEW=1
 argv=(claude ${claude_flags[@]+"${claude_flags[@]}"} -p "/code-review $*")
 
 # Test seam (hooks/CLAUDE.md convention, mirrors other hooks' *_FAKE / *_ECHO env seams): production
-# never sets this. Lets hooks/test_ballast_review.sh assert the exact command this shim would run
+# never sets this. Lets hooks/tests/test_ballast_review.sh assert the exact command this shim would run
 # WITHOUT actually spawning a real headless claude session (slow, costs tokens, needs a live
 # account) on every test run. Space-joined for assertion simplicity; the prompt is a single argv
 # element in the real exec below.

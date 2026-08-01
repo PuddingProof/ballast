@@ -28,7 +28,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "commit-review-gate.py")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "commit-review-gate.py")
 
 # Fixed base instant + integer-second offsets -> deterministic, monotonically increasing ISO8601
 # timestamps that string-sort exactly like real transcript timestamps (the hook compares them as

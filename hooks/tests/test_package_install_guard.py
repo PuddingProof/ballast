@@ -16,7 +16,7 @@ The heredoc cases pin R2 (2026-07-08): a `git commit -F - <<'EOF' ... EOF`
 message that merely DESCRIBES an install must not false-fire the gate — the hole
 this report's own commit tripped.
 
-Self-locating + standalone: `python hooks/test_package_install_guard.py`.
+Self-locating + standalone: `python hooks/tests/test_package_install_guard.py`.
 """
 import json
 import os
@@ -24,7 +24,7 @@ import subprocess
 import sys
 import unittest
 
-HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "package-install-guard.py")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "package-install-guard.py")
 
 
 def _run(command, **caller):

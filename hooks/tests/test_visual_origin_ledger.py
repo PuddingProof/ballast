@@ -16,7 +16,7 @@ HERMETIC (hooks/CLAUDE.md rule), by three seams, none of which production ever s
                               SUITE EVER SIGNALS A REAL PROCESS; every "reaped" assertion is an
                               assertion about that log.
 
-Self-locating + standalone: `python hooks/test_visual_origin_ledger.py`.
+Self-locating + standalone: `python hooks/tests/test_visual_origin_ledger.py`.
 """
 import json
 import os
@@ -26,12 +26,12 @@ import tempfile
 import time
 import unittest
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)
+HOOKS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # hooks/ — one dir up from tests/
+sys.path.insert(0, HOOKS)
 
 import visual_origin_ledger as vol  # noqa: E402
 
-SHIM = os.path.join(HERE, "..", "bin", "ballast-visual-origin")
+SHIM = os.path.join(HOOKS, "..", "bin", "ballast-visual-origin")
 
 # A synthetic session: an origin process, the claude process that started it, and a shell layer.
 ORIGIN = {"pid": 4242, "ppid": 9000, "start_time": "2026-07-28T10:00:00.0000000Z",

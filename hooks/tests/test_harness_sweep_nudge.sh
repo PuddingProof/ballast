@@ -15,7 +15,7 @@
 # resolve, the hook has nowhere to read from). Self-locating via BASH_SOURCE; exit code = fail count.
 set -u
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOOK="$DIR/harness-sweep-nudge.sh"
+HOOK="$DIR/../harness-sweep-nudge.sh"
 
 # Resolve a working Python 3 the same way run.sh's dispatcher does, and export it so the hook's
 # JSON-emit step uses a real interpreter (never the Windows Store stub). Individual `env` calls

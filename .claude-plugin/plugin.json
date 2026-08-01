@@ -1,19 +1,15 @@
 {
   "name": "ballast",
-  "version": "0.9.0",
+  "version": "0.9.1",
   "description": "Verification-first agentic harness: docs discipline, session postmortems, plan-execution handoff, adversarial audits, secure-by-default guards.",
   "author": {
     "name": "PuddingProof"
   },
   "agents": [
     "./agents/eval-grader.md",
-    "./agents/harness-sweep-extractor.md",
-    "./agents/harness-sweep-scout.md",
     "./agents/plan-executor.md",
     "./agents/plan-executor-light.md",
     "./agents/plan-executor-hard.md",
-    "./agents/postmortem-extractor.md",
-    "./agents/postmortem-priors-scout.md",
     "./agents/visual-glance.md",
     "./agents/visual-reviewer.md"
   ],

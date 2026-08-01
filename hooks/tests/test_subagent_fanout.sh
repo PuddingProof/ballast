@@ -16,11 +16,11 @@
 # new notification-shell demotion, so none of them can silently regress.
 #
 # Payloads are DATA on stdin, so running this file never trips the caller's
-# own hooks. Self-locating: finds subagent-fanout.sh next to this file; runs
+# own hooks. Self-locating: finds subagent-fanout.sh one directory up (hooks/); runs
 # wherever it's checked out. Exit code = # of failures.
 set -u
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOOK="$DIR/subagent-fanout.sh"
+HOOK="$DIR/../subagent-fanout.sh"
 
 # subagent-fanout.sh never shells out to python (pure bash + grep on the raw
 # payload) -- resolving/exporting BALLAST_PYTHON here is a no-op for this

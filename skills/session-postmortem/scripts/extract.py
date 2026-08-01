@@ -1,51 +1,28 @@
 #!/usr/bin/env python
-"""
-session-postmortem extraction helpers.
+"""session-postmortem extraction engine (v5).
 
-All subcommands take a transcript .jsonl path as the first arg.
-Output is plain text on stdout for easy consumption by the skill.
+ONE deterministic pass over a session transcript emits ONE size-capped digest a single
+context can consume directly — replacing the v4 multi-dump bundle + agent fanout.
 
 Usage:
-    python extract.py <subcommand> <transcript-path> [args]
+    python extract.py resolve
+    python extract.py drift <transcript-path>
+    python extract.py digest [--out DIR] [--id SESSION_ID] [--transcript PATH]
+                             [--budget BYTES] [--focus TOPIC]
 
 Subcommands:
-    resolve             Print this session's live transcript + PreCompact archive paths
-                        (from $CLAUDE_CODE_SESSION_ID; takes NO transcript-path arg)
-    compact-check       Exit code 0 = no compaction; 1 = compaction detected
-                        (isCompactSummary recap OR a system/compact_boundary marker)
-    time-window         Print "<min-iso> <max-iso>" timestamps
-    user-msgs           Print real user messages chronologically (turns + AskUserQuestion answers
-                        + /slash echoes + mid-turn steers + autopilot goals; skips tool_results,
-                        isMeta/compact/sidechain/sdk-cli injections, bash-output echoes, task-notes)
-    invocations         Print Skill/Agent/Workflow tool invocations with their results
-    edits               Print Edit/Write/MultiEdit tool calls (timestamp, type, basename)
-    assistant-text      Print assistant text blocks chronologically
-    subagents           Per-subagent roster (agentType/dispatch label/model/tokens/tools, nested
-                        dispatches marked) + main-vs-subagent token split, from the
-                        <uuid>/subagents/ sidecars (pass the LIVE transcript)
-    tool-breakdown      Tool fingerprint: main-vs-subagent call split + MCP-server table (LIVE transcript)
-    topic-slug          Derive a topic slug from edit footprint (basename + folder analysis);
-                        optional argv[3]: newline-separated git diff --name-only list used as a
-                        fallback when tool-edit signal is low (general/src/src-tauri bucket or
-                        materially fewer tool edits than git-changed files)
-    line-count          Print number of jsonl lines (sanity check)
-    stats               §7 Session-Stats body (header-less): window + activity counts + a
-                        transcript-native message.usage token table + per-model split + a subagent
-                        aggregate. No ccusage, no $ cost (cc-dashboard owns cost). Optional
-                        argv[3]/[4]: ISO start/end to bound to a sub-window.
-    drift               Format-drift canary: tally any transcript shape OUTSIDE the known
-                        registries (line-type / system-subtype / attachment-type / commandMode /
-                        promptSource / origin.kind / leading content-tag / user is*-flag).
-                        Prints "kind<TAB>value<TAB>count" rows sorted; "no drift" when clean; exit 0
-    hook-fires          Tally hook_system_message attachment lines (each a ballast conditional
-                        hook's per-fire visibility one-liner) by hook name; markdown block, or
-                        "no hook fires recorded" when none
-    bundle              Run ALL bulk dumps (user-msgs, invocations, edits, assistant-text,
-                        subagents, tool-breakdown, stats, hook-fires) in ONE process, writing each
-                        to <out>/<name>.md plus a manifest.json (metrics + per-dump status).
-                        Requires --out <dir>:
-                            python extract.py bundle <transcript> --out <dir>
+    resolve   Print this session's live transcript + PreCompact archive paths. Resolves from
+              $CLAUDE_CODE_SESSION_ID; falls back to the newest *.jsonl in the cwd-derived
+              projects/<slug>/ dir. Takes NO transcript-path arg.
+    drift     Format-drift canary: tally any transcript shape OUTSIDE the known registries
+              (line-type / system-subtype / attachment-type / commandMode / promptSource /
+              origin.kind / leading content-tag / user is*-flag). Prints "kind<TAB>value<TAB>count"
+              rows sorted; "no drift" when clean; always exits 0.
+    digest    Single-pass digest: writes <out>/digest.md + <out>/manifest.json. --out defaults to
+              ~/.claude/.cache/ballast/digest/<session_id>/.
 """
+import datetime
+import glob
 import json
 import os
 import re
@@ -67,116 +44,6 @@ def load_lines(path):
                 continue
 
 
-# Conservative result-shape detection for the §2 disposition table.
-# A tool_result is treated as a "findings report" only when at least TWO distinct
-# signal categories are present — biased toward leaving ambiguous results in the
-# roster (§2a) rather than forcing a disposition table (§2b).
-_SEVERITY_RE = re.compile(
-    r'\b(critical|severity|issue|issues|warning|warnings|suggestion|suggestions|'
-    r'finding|findings|vulnerab\w*|defect|defects)\b',
-    re.IGNORECASE,
-)
-_FILELINE_RE = re.compile(r'\b[\w./\\-]+\.[A-Za-z0-9]+:\d+\b')   # foo.py:45, src/bar.ts:12
-_NUMBERED_RE = re.compile(r'^\s*\d+[.)]\s+\S', re.MULTILINE)      # "1. ...", "2) ..."
-_TABLE_RE = re.compile(r'\|\s*(#|severity|file|finding|line)\b', re.IGNORECASE)  # md table header
-# JSON-structured findings (e.g. code-review finder agents emit an array of
-# {"file","line","summary","failure_scenario",...} objects — separate fields, no
-# inline "file.py:45"). Curated finding-specific keys so generic JSON doesn't match.
-_JSON_KEY_RE = re.compile(
-    r'"(file|line|severity|summary|finding|findings|message|failure_scenario|suggestion)"\s*:',
-    re.IGNORECASE,
-)
-
-
-def _looks_like_findings(text):
-    """Return True if a tool_result text resembles a structured findings report.
-
-    Conservative: requires >=2 distinct signal categories (severity vocabulary,
-    file:line references, numbered list items, findings-style table header, or
-    JSON finding-keys). A JSON findings array (>=3 distinct finding-specific keys)
-    is sufficient on its own. When unsure, returns False so the invocation stays
-    in the roster.
-    """
-    if not text or len(text.strip()) < 40:
-        return False
-    # Strong, self-sufficient signal: a JSON findings report (file + line + summary…).
-    json_keys = {m.group(1).lower() for m in _JSON_KEY_RE.finditer(text)}
-    if len(json_keys) >= 3:
-        return True
-    signals = 0
-    if _SEVERITY_RE.search(text):
-        signals += 1
-    if _FILELINE_RE.search(text):
-        signals += 1
-    if _NUMBERED_RE.search(text):
-        signals += 1
-    if _TABLE_RE.search(text):
-        signals += 1
-    if len(json_keys) >= 2:   # weaker JSON signal contributes one category
-        signals += 1
-    return signals >= 2
-
-
-def _compact_markers(path):
-    """Return (summaries, boundaries) — timestamp lists for the two compaction-event shapes Claude
-    Code emits (both coexist):
-      - `isCompactSummary == true` — the injected "This session is being continued…" recap that
-        rides a plain type=="user" line (the original, field-keyed marker; `_is_real_user_msg`
-        gates the same field);
-      - a `type == "system"` line with `subtype == "compact_boundary"` — the newer STRUCTURED
-        boundary marker CC writes at the compaction point.
-    Extracted so `compact_check` (exit-code + printed markers) and bundle's `compacted` boolean
-    metric (no exit-code semantics) share one detection pass instead of two copies drifting.
-    """
-    summaries = []   # isCompactSummary recap timestamps
-    boundaries = []  # system/compact_boundary timestamps
-    for d in load_lines(path):
-        if d.get('isCompactSummary') is True:
-            summaries.append(d.get('timestamp', ''))
-        # `elif` is safe: the recap is a user line and the boundary is a system line — a single
-        # line is never both, so this can't double-count one event.
-        elif d.get('type') == 'system' and d.get('subtype') == 'compact_boundary':
-            boundaries.append(d.get('timestamp', ''))
-    return summaries, boundaries
-
-
-def compact_check(path):
-    """Exit 1 if a compaction marker is found; otherwise exit 0. Print whichever marker(s) fired.
-
-    Either shape from `_compact_markers` is sufficient. Emitting both timestamp lists lets the
-    skill recover the boundary from whichever form this transcript used.
-    """
-    summaries, boundaries = _compact_markers(path)
-    if summaries or boundaries:
-        parts = []
-        if summaries:
-            parts.append(f"isCompactSummary at: {', '.join(summaries)}")
-        if boundaries:
-            parts.append(f"compact_boundary at: {', '.join(boundaries)}")
-        print('COMPACTED — ' + '; '.join(parts))
-        sys.exit(1)
-    sys.exit(0)
-
-
-def _time_window(path):
-    """Return (min_ts, max_ts) across all entries' timestamps, or (None, None) if none are
-    present. Shared by the `time-window` subcommand and bundle's manifest metrics."""
-    timestamps = [d.get('timestamp', '') for d in load_lines(path)]
-    timestamps = [t for t in timestamps if t]
-    if not timestamps:
-        return None, None
-    return min(timestamps), max(timestamps)
-
-
-def time_window(path):
-    """Print min and max timestamps across all entries."""
-    lo, hi = _time_window(path)
-    if lo is None:
-        print("ERROR: no timestamps found")
-        sys.exit(1)
-    print(f"{lo} {hi}")
-
-
 def _text_from_content(content):
     """Flatten a message/attachment content value (str | list-of-blocks | None) to plain text."""
     if isinstance(content, list):
@@ -186,6 +53,12 @@ def _text_from_content(content):
     return str(content)
 
 
+# ---------------------------------------------------------------------------
+# User-turn gate — COMPAT SURFACE. `hooks/commit-review-gate.py` imports this module and calls
+# `load_lines`, `_user_prompt`, and `_CMD_NAME_RE` directly; these are ported verbatim from v4 and
+# must keep their names, signatures, and admit/drop decisions.
+# ---------------------------------------------------------------------------
+
 def _ask_answer(d):
     """If `d` is an AskUserQuestion ANSWER turn, return its non-empty answers dict; else None.
 
@@ -193,10 +66,9 @@ def _ask_answer(d):
     `type=="user"` line whose top-level `toolUseResult` carries `answers` (a {question:
     selection} dict) plus `questions`. The line also rides a `tool_result` content block, so the
     generic tool-result gates in `_is_real_user_msg` would drop it — but it IS a genuine user turn
-    (the option the user chose, exactly the §4 signal a postmortem wants), so it is admitted before
-    those gates. A CANCELLED dialog logs `answers == {}` (falsy) and is correctly NOT admitted.
-    Mirrors cc-dashboard parse.rs::is_ask_answer and the cc-user-prompts engine's 4th positive
-    user-shape (verified on real transcripts: toolUseResult keys `answers`/`questions`/`annotations`).
+    (the option the user chose), so it is admitted before those gates. A CANCELLED dialog logs
+    `answers == {}` (falsy) and is correctly NOT admitted. Mirrors cc-dashboard
+    parse.rs::is_ask_answer and the cc-user-prompts engine's 4th positive user-shape.
     """
     if d.get('type') != 'user':
         return None
@@ -209,13 +81,13 @@ def _ask_answer(d):
 
 
 def _format_answers(ans):
-    """Render an AskUserQuestion answers dict as one terse line for user_msgs."""
+    """Render an AskUserQuestion answers dict as one terse line."""
     return '[AskUserQuestion answer] ' + '; '.join(f'{q} → {sel}' for q, sel in ans.items())
 
 
 # Slash-command echo parsing — shared by `_user_prompt` (ENG-5: a /slash IS a user turn, mirroring
 # the cc-user-prompts engine `_from_user`/`_slash` + cc-dashboard `parse.rs::is_real_user_turn` SSoT,
-# which both count every slash echo) and `invocations` (the §2(a) roster). The leading
+# which both count every slash echo) and the digest's slash-command inventory. The leading
 # <command-name> / <command-message> ordering varies by client, so search for either; <command-args>
 # is optional.
 _CMD_NAME_RE = re.compile(r'<command-name>\s*([^<]+?)\s*</command-name>')
@@ -250,30 +122,23 @@ def _is_real_user_msg(d):
         hook-injected context, skill base-dir injections);
       - a post-compaction recap: `isCompactSummary == true` (the "This session is being
         continued…" block injected as a plain `type=="user"` line — it is NOT isMeta-flagged, so
-        it slips every other gate; verified present directly in projects/ transcripts, not just
-        compact-backups/; `compact_check` reads the same field);
+        it slips every other gate);
       - a sidechain replay: `isSidechain == true` (a dispatched subagent prompt replayed as the
-        subagent's first user turn — lives in the subagents/ sidecars, ~0 in the main transcript,
-        but gated anyway as cheap insurance against an inlined / future-format one);
-      - a headless eval probe: `entrypoint == "sdk-cli"` (skill-forge / skill-creator `claude -p`
-        RED/GREEN runs — `type=="user"` but harness-authored, not the person);
+        subagent's first user turn — lives in the subagents/ sidecars);
+      - a headless eval probe: `entrypoint == "sdk-cli"` (`claude -p` RED/GREEN runs — `type=="user"`
+        but harness-authored, not the person);
       - a tool result: a top-level `toolUseResult` / `sourceToolUseID` field or a `tool_result`
         content block — EXCEPT an AskUserQuestion answer (`_ask_answer`), which rides a
         toolUseResult yet IS a real turn and is admitted before that gate;
-      - a background-task notice: `origin.kind == "task-notification"` (a NON-meta user line, the
-        user-line twin of the attachment form in `_attachment_prompt`; present since ~2026-05);
+      - a background-task notice: `origin.kind == "task-notification"` (a NON-meta user line);
       - a `!`-mode shell OUTPUT echo (a `<local-command…>` wrapper, `<bash-stdout>` / `<bash-stderr>`).
         The `<bash-input>` the user TYPED is deliberately NOT excluded — it is a real user action.
         (A `<command-name>` / `<command-message>` SLASH echo is NOT excluded either — ENG-5: a /slash
-        IS a user turn, counted by both SSoT parsers; `_user_prompt` renders it to a clean `/name
-        args`. Filtering slash echoes here on substance would just re-create the §7-vs-dashboard drift.)
+        IS a user turn, counted by both SSoT parsers.)
 
     GUARDRAIL: `promptSource` ("typed" / "sdk" / "system" / "queued") is a TRANSPORT channel, NOT a
     human-vs-machine signal — never gate on it. Treating `sdk` as non-human hid ~790 genuine VS Code
     turns in the sibling parser; the human axis is `entrypoint` + structural origin, never promptSource.
-
-    Takes the FULL line dict so it can apply these line-level gates. Mid-turn queued steers and
-    autopilot goals are a separate `type=="attachment"` shape — see `_attachment_prompt`.
     """
     if d.get('isMeta') is True:
         return False
@@ -299,10 +164,7 @@ def _is_real_user_msg(d):
     ):
         return False
     text = _text_from_content(content).strip()
-    # Output-echo gates only. A <command-name>/<command-message> SLASH echo is NOT dropped here —
-    # ENG-5: the SSoT (cc-user-prompts `_slash`, cc-dashboard `is_real_user_turn`) counts every slash
-    # echo as a real turn, so we must too; `_user_prompt` renders it to a clean `/name args`. These
-    # three are pure machine output the SSoT also drops (`leads_with_output_tag`).
+    # Output-echo gates only — pure machine output the SSoT also drops (`leads_with_output_tag`).
     if text.startswith(('<local-command', '<bash-stdout', '<bash-stderr')):
         return False
     return True
@@ -314,20 +176,15 @@ def _attachment_prompt(d):
     Two `type=="attachment"` shapes carry real user input (a fail-CLOSED allow-list — there are
     many attachment subtypes and only these are the person speaking):
       - `attachment.type == "queued_command"` with `commandMode == "prompt"` → a mid-turn STEER
-        typed while the agent worked (the high-signal "no, do X instead" §4 correction). Body in
-        `attachment.prompt`. EXCLUDED: `task-notification` / any other commandMode, AND a synthetic
-        `origin.kind == "auto-continuation"` echo — the harness's "Goal set: …" reply to a goal-set,
-        which is NOT user-typed and would otherwise be emitted as a spurious steer AND counted,
-        duplicating the goal already surfaced via `goal_status` (verified: across the corpus only the
-        "Goal set:" echoes carry that origin.kind; genuine steers have `human` or no origin).
+        typed while the agent worked. Body in `attachment.prompt`. EXCLUDED: `task-notification` /
+        any other commandMode, AND a synthetic `origin.kind == "auto-continuation"` echo — the
+        harness's "Goal set: …" reply to a goal-set, which is NOT user-typed and would otherwise be
+        emitted as a spurious steer, duplicating the goal already surfaced via `goal_status`.
       - `attachment.type == "goal_status"` → an autonomous-mode GOAL/condition the user set in
         autopilot (text in `attachment.condition`). Logged as met=false / met=true bookends that
-        repeat the same condition, so `user_msgs` dedups by condition. High-signal input for the
-        §2(a) autonomy verdict
-        (verified on a real autopilot session: attachment keys `condition`/`met`/`sentinel`/`type`).
+        repeat the same condition, so callers dedup by condition.
 
-    Returns the marker so callers can tag the line and apply per-kind policy: steers count as
-    prompts; goals are display-only (see `_count_tool_calls`) since the bookends would double-count.
+    Returns the marker so callers can tag the line and apply per-kind policy.
     """
     if d.get('type') != 'attachment':
         return None
@@ -352,10 +209,8 @@ def _user_prompt(d):
 
     The single source of truth for "did the user say something here", unifying the user shapes —
     a standalone `type=="user"` turn, an AskUserQuestion answer, a `/slash`-command echo, a mid-turn
-    `type=="attachment"` queued steer, and an autopilot goal — so `user_msgs` and `_count_tool_calls`
-    never drift on what counts. `marker` is None for a standalone prose turn / answer, else a label
-    ('slash-command' | 'mid-turn steer' | 'autopilot goal') the callers use to tag the line and apply
-    counting policy. A 'slash-command' counts as a turn (SSoT parity, ENG-5); a goal does not.
+    `type=="attachment"` queued steer, and an autopilot goal. `marker` is None for a standalone prose
+    turn / answer, else a label ('slash-command' | 'mid-turn steer' | 'autopilot goal').
     """
     t = d.get('type')
     if t == 'user':
@@ -376,1032 +231,116 @@ def _user_prompt(d):
     return None
 
 
-def _user_msg_entries(path):
-    """Yield (ts, marker, text) for every entry `user_msgs` prints, in the same order/inclusion.
-
-    Extracted so `bundle`'s `user_turns` metric can count from the EXACT same iteration `user_msgs`
-    renders from (D1: "user_turns MUST equal the number of entries user-msgs emits") rather than a
-    separately-maintained approximation that could drift from it.
-    """
-    seen_goals = set()
-    for d in load_lines(path):
-        p = _user_prompt(d)
-        if p is None:
-            continue
-        text, marker = p
-        if marker == 'autopilot goal':
-            key = text.strip()
-            if key in seen_goals:   # met=false / met=true bookends repeat the same condition
-                continue
-            seen_goals.add(key)
-        yield d.get('timestamp', ''), marker, text
-
-
-def user_msgs(path):
-    """Print real user messages with timestamps, in chronological order.
-
-    Covers every shape `_user_prompt` recognizes: standalone `type=="user"` turns,
-    AskUserQuestion answers, `(slash-command)` echoes, mid-turn `(mid-turn steer)` prompts, and
-    `(autopilot goal)` conditions — the last deduped by condition text since the goal is logged as
-    met=false / met=true bookends. Markered shapes are exactly the high-signal signals a §4 / §2(a)
-    post-mortem cares about (steers → §4 corrections; goals → the §2(a) autonomy verdict). (All shapes
-    resolved by `_user_prompt`, entries enumerated by `_user_msg_entries`.)
-    """
-    for ts, marker, text in _user_msg_entries(path):
-        suffix = f' ({marker})' if marker else ''
-        print(f'--- {ts}{suffix} ---')
-        print(text.strip())
-        print()
-
-
-def invocations(path):
-    """Print Skill/Agent/Workflow invocations + their tool_result, plus user-typed slash commands.
-
-    - Model-invoked Skill/Agent/Workflow calls are paired with their tool_result. Each block
-      header is tagged `findings-shape: yes|no` (see _looks_like_findings) so the skill knows
-      whether to build a §2 disposition table for it. (A Workflow pairs with its launch
-      tool_result "Workflow launched in background…"; its FINDINGS arrive later when the
-      background task completes — read the `assistant-text` near the task-notification
-      timestamp for them, NOT a user message: task-notifications are `attachment` lines, not
-      user turns, and aren't emitted by any subcommand.)
-    - User-typed slash commands (e.g. `/code-review`) appear as `<command-name>` echoes in user
-      messages with no paired tool_result; they are emitted as standalone `slash-command` lines
-      so §2's roster captures user-invoked skills too.
-
-    Note: inline Skills often return only "Launching skill: ..." here — their actual analysis
-    appears in later assistant-text near the invocation timestamp.
-    """
-    # Slash-echo regexes are module-level (`_CMD_NAME_RE`/`_CMD_ARGS_RE`) — shared with `_slash_echo`
-    # so the roster here and the user-turn count in `_user_prompt` parse the same shape (ENG-5).
-    # FIFO queue of (ts, name, label, args, tool_use_id) for invocations awaiting a tool_result.
-    # A single API response can emit MULTIPLE Skill/Agent/Workflow tool_use blocks (e.g. parallel
-    # Agent dispatch), logged as consecutive assistant lines BEFORE any tool_result — a single-slot
-    # tracker would let each overwrite the previous and silently drop all but the last (~50% of
-    # Agent dispatches in multi-agent sessions). We queue them and pair each tool_result with its
-    # invocation by tool_use_id (exact), falling back to FIFO order for legacy lines that lack one.
-    pending = []
-    for d in load_lines(path):
-        t = d.get('type')
-        ts = d.get('timestamp', '')
-        msg = d.get('message', {})
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get('content', [])
-
-        # (b) User-typed slash-command echoes (content may be a string or a list of blocks).
-        # A compact-summary recap (`isCompactSummary`) QUOTES prior `<command-name>` blobs verbatim,
-        # so without this gate every compact boundary re-mints phantom slash-command rows for
-        # commands typed pre-compact (verified live 2026-07-20: two phantom `/code-review` entries at
-        # exactly the two compact-boundary timestamps). `_is_real_user_msg` already drops the recap
-        # from user-turn counting; mirror that gate here.
-        if t == 'user' and d.get('isCompactSummary') is not True:
-            text_blob = _text_from_content(content)
-            for m in _CMD_NAME_RE.finditer(text_blob):
-                # Some command echoes already include the leading slash (e.g. "/compact"),
-                # others don't ("code-review") — normalize so we always print exactly one.
-                name = m.group(1).strip().lstrip('/')
-                am = _CMD_ARGS_RE.search(text_blob)
-                cargs = am.group(1).strip() if am else ''
-                suffix = f' {cargs}' if cargs else ''
-                print(f'=== [{ts}] slash-command: /{name}{suffix} ===')
-                print('(user-typed command echo — no tool_result; analysis follows in assistant-text)')
-                print()
-
-        if not isinstance(content, list):
-            continue
-        # (a) Model-invoked Skill/Agent/Workflow calls paired with their tool_result.
-        for c in content:
-            if not isinstance(c, dict):
-                continue
-            if t == 'assistant' and c.get('type') == 'tool_use':
-                name = c.get('name', '')
-                if name in ('Skill', 'Agent', 'Workflow'):
-                    inp = c.get('input', {})
-                    if not isinstance(inp, dict):
-                        inp = {}
-                    # Workflow's real name lives in its script's meta block (not the tool input),
-                    # so fall back to name/description, then to the script's first line.
-                    label = (inp.get('skill', '') or inp.get('name', '') or inp.get('description', '')
-                             or (inp.get('script') or '')[:60].split('\n')[0].strip())
-                    args = inp.get('args', '') or inp.get('subagent_type', '')
-                    pending.append((ts, name, label, args, c.get('id')))
-            elif t == 'user' and c.get('type') == 'tool_result' and pending:
-                tuid = c.get('tool_use_id')
-                if tuid is not None:
-                    # Exact pairing; if this result isn't for a tracked invocation (it's a
-                    # Read/Bash/etc. result interleaved in the same user message), skip it.
-                    idx = next((i for i, p in enumerate(pending) if p[4] == tuid), None)
-                    if idx is None:
-                        continue
-                else:
-                    idx = 0  # legacy line with no tool_use_id → best-effort FIFO
-                inv_ts, inv_name, inv_label, inv_args, _ = pending.pop(idx)
-                rc = _text_from_content(c.get('content', '')).strip()
-                shape = 'yes' if _looks_like_findings(rc) else 'no'
-                print(f'=== [{inv_ts}] {inv_name}: {inv_label} ({inv_args}) | findings-shape: {shape} ===')
-                print(rc)
-                print()
-
-
-def edits(path):
-    """Print Edit/Write/MultiEdit tool calls in chronological order."""
-    for d in load_lines(path):
-        if d.get('type') != 'assistant':
-            continue
-        msg = d.get('message', {})
-        content = msg.get('content', [])
-        if not isinstance(content, list):
-            continue
-        for c in content:
-            if not isinstance(c, dict) or c.get('type') != 'tool_use':
-                continue
-            name = c.get('name', '')
-            if name not in ('Edit', 'Write', 'MultiEdit'):
-                continue
-            fp = c.get('input', {}).get('file_path', '')
-            ts = d.get('timestamp', '')
-            print(f'{ts} {name} {os.path.basename(fp)} ({fp})')
-
-
-def assistant_text(path):
-    """Print assistant text blocks chronologically (excludes tool calls). Useful for spotting catches/reasoning."""
-    for d in load_lines(path):
-        if d.get('type') != 'assistant':
-            continue
-        msg = d.get('message', {})
-        content = msg.get('content', [])
-        if not isinstance(content, list):
-            continue
-        for c in content:
-            if not isinstance(c, dict) or c.get('type') != 'text':
-                continue
-            text = c.get('text', '').strip()
-            if len(text) < 20:
-                continue
-            ts = d.get('timestamp', '')
-            print(f'--- {ts} ---')
-            print(text)
-            print()
-
-
-def _bucket_winner(counts):
-    """Return the plurality bucket from a Counter, or 'general' if empty or tied.
-
-    A tie for the most-edited bucket is genuinely ambiguous — no single topic.
-    Shared by both the tool-edit and git-files branches of topic_slug so the two
-    passes can't diverge on tie-breaking.
-    """
-    if not counts:
-        return 'general'
-    ranked = counts.most_common()
-    top, top_count = ranked[0]
-    if len(ranked) > 1 and ranked[1][1] == top_count:
-        return 'general'
-    return top
-
-
-def _bucket_paths(paths, cwd, ignored_buckets):
-    """Count slugified first-segment buckets for a list of file paths relative to cwd.
-
-    Shared by the tool-edit and git-files branches of topic_slug:
-    - Paths outside cwd (different Windows drive, or a ../-prefixed relpath) are skipped.
-    - Paths whose first segment falls in ignored_buckets are skipped.
-    - Root-level files use their stem; deeper paths use the first directory segment.
-    - CamelCase / PascalCase boundaries are hyphenated BEFORE lowercasing so acronym
-      runs survive intact (e.g. OpenMeteoAPI -> open-meteo-api, not open-meteo-a-p-i).
-
-    Returns a Counter of slugified bucket names.
-    """
-    counts = Counter()
-    for fp in paths:
-        if not fp:
-            continue
-        try:
-            rel = os.path.relpath(os.path.abspath(fp), cwd)
-        except ValueError:
-            continue  # different Windows drive — outside the project
-        rel = rel.replace('\\', '/')
-        if rel == '..' or rel.startswith('../'):
-            continue  # outside the project root
-        parts = [p for p in rel.split('/') if p and p != '.']
-        if not parts:
-            continue
-        first = parts[0]
-        # Root-level file (e.g., IDEAS.md) — use its stem; subdir paths use the dir name.
-        raw = os.path.splitext(first)[0] if len(parts) == 1 else first
-        # Slugify BEFORE lowercasing so camelCase/PascalCase boundaries survive (e.g.
-        # OpenMeteoAPI -> open-meteo-api, TURZX -> turzx). The split keeps acronym runs
-        # together (no "a-p-i"); a previous version slugified an already-lowercased string,
-        # so the camelCase rule never fired.
-        bucket = re.sub(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])', '-', raw).lower()
-        if bucket in ignored_buckets:
-            continue
-        counts[bucket] += 1
-    return counts
-
-
-def topic_slug(path, git_files_raw=None):
-    """Derive a topic slug from edit footprint, bucketed by the first path segment
-    relative to the current working directory (the project root — the skill runs
-    inline from there).
-
-    Strategy:
-    1. For each Edit/Write/MultiEdit, compute the file path relative to cwd.
-    2. Bucket by the first path segment (top-level folder, or the file's stem for
-       a root-level file like IDEAS.md). Edits outside cwd, and edits in throwaway
-       scratch dirs (.debug/), are skipped.
-    3. Anchor on the dominant (plurality) bucket — the most-edited top-level area.
-       Only fall back to "general" when the top two buckets tie (genuinely
-       ambiguous) or there are no qualifying edits.
-
-    Git-files fallback (optional `git_files_raw` param; CLI: 3rd positional arg): a
-    newline-separated list of changed filenames (e.g. `git diff --name-only` output) supplied by
-    the SKILL.md caller from the session's in-scope commit range. It patches the blind spot (ENG-4)
-    where a bulk PowerShell/Bash operation (WriteAllText, Rename-Item, a shell script) rewrites many
-    files WITHOUT leaving Edit/Write/MultiEdit traces in the transcript — so the tool
-    footprint under-counts and the slug collapses to `general`. The override fires only when:
-      (a) the tool-edit bucket is in the low-signal set {general, src, src-tauri} — generic
-          structural paths that aggregate everything rather than name the topic, OR
-      (b) git changed strictly >3x as many files as tool edits touched, AND >=5 git files are
-          present (the >=5 floor guards against flipping a representative, non-low-signal tool
-          slug on just a handful of git files);
-    AND the git bucket is NOT itself low-signal (no improvement -> no override).
-    The pure-shell, zero-tool-edit session fires through (a) — its tool slug is `general`, which is
-    low-signal — independent of the (b) floor.
-    Stdout stays a single word; stderr carries a one-line note when git files drive the
-    slug, so the caller knows the fallback fired without breaking the stdout contract.
-
-    This is a heuristic — the skill body may override it from a brainstorm spec match.
-    """
-    cwd = os.path.abspath(os.getcwd())
-    # Throwaway scratch dirs never represent the session topic; excluding them keeps
-    # a few debug-script edits from diluting the real work down to "general".
-    ignored_buckets = {'.debug'}
-    # Low-signal tool-edit buckets: 'src'/'src-tauri' are common monorepo layouts where
-    # EVERY file sits under src/, so the bucket is unhelpful as a slug; 'general' is already
-    # the no-qualifying-edits fallback. Mirrors SKILL.md step 9's "generic source bucket" list.
-    LOW_SIGNAL_BUCKETS = {'general', 'src', 'src-tauri'}
-
-    # --- Tool-edit paths from the transcript ---
-    tool_paths = []
-    for d in load_lines(path):
-        if d.get('type') != 'assistant':
-            continue
-        msg = d.get('message', {})
-        content = msg.get('content', [])
-        if not isinstance(content, list):
-            continue
-        for c in content:
-            if not isinstance(c, dict) or c.get('type') != 'tool_use':
-                continue
-            if c.get('name') not in ('Edit', 'Write', 'MultiEdit'):
-                continue
-            fp = c.get('input', {}).get('file_path', '')
-            if fp:
-                tool_paths.append(fp)
-
-    tool_counts = _bucket_paths(tool_paths, cwd, ignored_buckets)
-    tool_total = sum(tool_counts.values())   # qualifying tool edits (for the gap check)
-    tool_slug = _bucket_winner(tool_counts)
-
-    # --- Git-files fallback: git_files_raw is an optional newline-separated list of changed
-    # file paths (`git diff --name-only` output), fed by the SKILL.md caller from the
-    # session's commit range (main() forwards the CLI's 3rd positional arg here; bundle() calls
-    # this directly with a real parameter, no argv involved). ---
-    # strip() handles CRLF endings from Windows git output (a trailing \r breaks relpath).
-    git_files = [f.strip() for f in (git_files_raw or '').splitlines() if f.strip()]
-
-    if git_files:
-        git_counts = _bucket_paths(git_files, cwd, ignored_buckets)
-        git_slug = _bucket_winner(git_counts)
-        # (a) Low-signal tool bucket — a generic structural path, not topic-bearing.
-        low_signal = tool_slug in LOW_SIGNAL_BUCKETS
-        # (b) Material gap — git changed STRICTLY >3x as many files as tool edits touched. The
-        #     >=5-file floor avoids flipping a representative (non-low-signal) tool slug on a few
-        #     git files; `tool_total * 3 < len(git_files)` is the strict >3x test and is safe at
-        #     tool_total == 0 (0 < any positive). The zero-edit session is handled by (a), not here.
-        material_gap = len(git_files) >= 5 and tool_total * 3 < len(git_files)
-        if (low_signal or material_gap) and git_slug not in LOW_SIGNAL_BUCKETS:
-            print(git_slug)
-            print(f'(git-diff fallback: {len(git_files)} changed files, {tool_total} tool edits)',
-                  file=sys.stderr)
-            return
-
-    print(tool_slug)
-
-
-def _count_lines(path):
-    """Return the transcript's jsonl line count. Shared by `line_count` and bundle's
-    `transcript_lines` metric."""
-    with open(path, encoding='utf-8') as f:
-        return sum(1 for _ in f)
-
-
-def line_count(path):
-    """Print transcript line count for sanity check."""
-    print(_count_lines(path))
-
-
-# ENG-1 (schema v2): the ccusage dependency AND the manual pricing fallback (_price_for /
-# _estimate_cost / _opus_is_legacy + the per-model rate tables) were REMOVED. §7 is now
-# transcript-native — token VOLUME from message.usage (`_usage_tokens` / `_usage_by_model`, the
-# same source §2(c) uses, so §7 reconciles with §2(c) instead of ccusage's session-dependent
-# sidecar rollup), with NO blended $ cost estimate. cc-dashboard owns cost analysis. This also
-# dropped the `shell=True` ccusage subprocess (and its UUID-interpolation guard) entirely.
-
-
-# Canonical UUID shape: 8-4-4-4-12 hex.
-_UUID_RE = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
-
-
-def _session_uuid_from_path(path):
-    """Extract the session UUID from a transcript filename (used for the resume-chain merge and
-    sidecar-dir resolution; the former ccusage `--id` use was removed with ENG-1).
-
-    Live transcripts are "<uuid>.jsonl"; PreCompact archives (written by a user-side
-    PreCompact archiver, if configured) are "<timestamp>_<trigger>_<uuid>.jsonl".
-    Match the trailing canonical UUID in either form; fall back to the bare stem
-    if no UUID is present (best effort).
-    """
-    stem = os.path.splitext(os.path.basename(path))[0]
-    m = _UUID_RE.search(stem)
-    return m.group(0) if m else stem
-
-
-def _count_tool_calls(path, start_ts=None, end_ts=None):
-    """Return (tool_use Counter, user_prompts, assistant_responses) within an optional sub-window.
-
-    - user_prompts uses the canonical rule: genuine user turns + AskUserQuestion answers + `/slash`
-      echoes (ENG-5: SSoT parity — both sibling parsers count them) (excludes tool-results, isMeta /
-      isCompactSummary / isSidechain / sdk-cli injections, bash-OUTPUT echoes, task-notifications)
-      PLUS mid-turn queued_command/prompt steers. Autopilot GOALS are
-      surfaced by `user_msgs` but NOT counted here — they repeat as met=false/met=true bookends and
-      are success conditions, not conversational turns. See `_is_real_user_msg` / `_attachment_prompt`.
-    - assistant_responses counts DISTINCT assistant `message.id` values — a single API response is
-      logged as ~2.4 content-block lines, so counting lines would overstate real model responses
-      (it would be "assistant lines", not "turns"). Keyless lines (no id) are counted individually.
-
-    Optional start_ts / end_ts (ISO strings) bound counts to a sub-window.
-    """
-    tools = Counter()
-    user_prompts = 0
-    response_ids = set()
-    keyless_responses = 0
-    for d in load_lines(path):
-        ts = d.get('timestamp', '')
-        if start_ts and ts < start_ts:
-            continue
-        if end_ts and ts >= end_ts:
-            continue
-        p = _user_prompt(d)
-        if p is not None:
-            if p[1] != 'autopilot goal':   # goals are display-only signal (dup bookends), not turns
-                user_prompts += 1
-            continue
-        if d.get('type') == 'assistant':
-            msg = d.get('message', {})
-            if not isinstance(msg, dict):
-                continue
-            mid = msg.get('id')
-            if mid:
-                response_ids.add(mid)
-            else:
-                keyless_responses += 1
-            content = msg.get('content', [])
-            if isinstance(content, list):
-                for c in content:
-                    if isinstance(c, dict) and c.get('type') == 'tool_use':
-                        tools[c.get('name', '?')] += 1
-    return tools, user_prompts, len(response_ids) + keyless_responses
-
-
-def stats(path, start_ts=None, end_ts=None):
-    """Emit a markdown-ready Session stats footer — TRANSCRIPT-NATIVE (no ccusage, no $ cost).
-
-    Token VOLUME comes from `message.usage` via `_usage_tokens` / `_usage_by_model` (deduped by
-    message.id), the SAME source §2(c) uses — so §7 reconciles with §2(c) instead of ccusage's
-    session-dependent sidecar rollup (which excluded subagents on a forked-UUID session but
-    included them otherwise — the v1 inconsistency ENG-1 removes). No billed cost — cc-dashboard
-    owns cost analysis.
-
-    Optional `start_ts` (CLI: 3rd positional arg): ISO start timestamp to bound the analysis to a
-    sub-window (e.g. "just the post-mortem run"); `end_ts` (CLI: 4th arg): ISO end. The activity
-    counts AND the token table honor the bound. main() forwards the CLI's extra positional args
-    here; bundle() calls this directly with no sub-window (dumps always run against the full
-    live transcript).
-    """
-    # Transcript-derived activity counts (sub-window-bounded if args provided)
-    tools, user_prompts, assistant_responses = _count_tool_calls(path, start_ts, end_ts)
-
-    # Time window from transcript
-    timestamps = [d.get('timestamp', '') for d in load_lines(path)]
-    timestamps = [t for t in timestamps if t]
-    if not timestamps:
-        print('_No timestamps in transcript._')
-        return
-    session_start = min(timestamps)
-    session_end = max(timestamps)
-    # Window to display: sub-window if bounded, else full session
-    display_start = start_ts or session_start
-    display_end = end_ts or session_end
-
-    # Output markdown footer — the §7 BODY only, NO `## 7. Session Stats` heading. The report
-    # template (and the extractor's §7 return section) own that heading; emitting it here too put
-    # TWO `## 7.` headers in the extractor's digest, forcing the orchestrator to dedup at assembly
-    # (caught on the v1 maiden run). The body starts at the window line.
-    if start_ts or end_ts:
-        print(f'**Sub-window:** {display_start} → {display_end}  _(of full session {session_start} → {session_end})_')
-    else:
-        print(f'**Window:** {session_start} → {session_end}')
-    print(f'**User prompts:** {user_prompts}')
-    print(f'**Assistant responses:** {assistant_responses}')
-    # "main-thread" scope label disambiguates from §2(b)'s combined main+subagent total (the
-    # §7 activity counts are main-transcript-only; §2(b)/(c) cover the subagents).
-    print(f'**Tool calls (main-thread):** {sum(tools.values())} total')
-    if tools:
-        # Top 8 by call volume, with a labeled remainder so the breakdown reconciles with the
-        # stated total above (a silently-truncated list summing to less than the total reads as a bug).
-        shown = tools.most_common(8)
-        top = ', '.join(f'{n}×{c}' for n, c in shown)
-        rest = sum(tools.values()) - sum(c for _, c in shown)
-        if rest:
-            top += f', +{len(tools) - 8} more ×{rest}'
-        print(f'  - {top}')
-    print()
-
-    # Token volume — main-thread message.usage, deduped by message.id (== what §2(c) sums for main).
-    tok = _usage_tokens(path, start_ts, end_ts)
-    print('**Token usage** (main-thread, raw message.usage volume):')
-    print()
-    print('| Type | Tokens |')
-    print('|---|---:|')
-    print(f'| Input | {tok["input"]:,} |')
-    print(f'| Output | {tok["output"]:,} |')
-    print(f'| Cache creation | {tok["cache_create"]:,} |')
-    print(f'| Cache read | {tok["cache_read"]:,} |')
-    print(f'| **Total** | **{tok["total"]:,}** |')
-    print()
-
-    # Per-model attribution — transcript-native (message.model × message.usage), NOT a ccusage
-    # artifact: it always was sourced from the transcript, so it survives the ccusage removal intact.
-    by_model = _usage_by_model(path, start_ts, end_ts)
-    if by_model:
-        models_str = ', '.join(f'{_short_model(m)} ({t:,})' for m, t in by_model.items())
-        print(f'**Models (main-thread):** {models_str}')
-        print()
-
-    # Subagent aggregate — the fanout volume §2(c) details per-agent. Resolves when stats is run on
-    # the LIVE transcript (sidecars live beside it via `_subagent_dirs`); naturally empty for a
-    # compact-archive path. One bridge line; the per-agent table stays in §2(c) (no duplication).
-    sub_total = 0
-    n_agents = 0
-    for sidedir in _subagent_dirs(path):
-        for a in _collect_subagents(sidedir):
-            sub_total += a['tokens']
-            n_agents += 1
-    if n_agents:
-        print(f'**Subagent tokens:** {sub_total:,} across {n_agents} agent(s) — per-agent breakdown in §2(c).')
-        print()
-
-    print('_Token counts are raw message.usage volume (main thread), deduped by message.id — not '
-          'billed cost. Subagent split is in §2(c). Billed cost analysis → cc-dashboard._')
-
-
 # ---------------------------------------------------------------------------
-# Subagent & tooling parsing (§2 "Subagent & Tooling Evaluation").
-#
-# A session that dispatches subagents (Agent tool / Workflow fan-out) gets a sibling
-# sidecar dir beside the LIVE transcript: `<uuid>/subagents/**` holding each dispatched
-# agent's own transcript (`agent-<id>.jsonl`) + an `agent-<id>.meta.json` (the agentType),
-# nested under `workflows/wf_<id>/` for Workflow fan-outs. extract.py historically only ever
-# opened the single main transcript, so subagent token spend + tool calls were invisible to
-# §2 (and pre-ENG-1 were rolled into §7's ccusage total only when ccusage happened to find the
-# sidecars — the session-dependent inconsistency §7 now sidesteps). These helpers port the read half of
-# cc-dashboard's `collect_nested_activity` / `collect_subagents` (core/parse.rs, tools.rs):
-# content-free (names/types/token-counts only, never an agent's prompt or description), with
-# the two correct dedup keys — message.id for usage tokens, tool_use block id (`toolu_*`) for
-# tool counts (the 2026-06-11 cc-dashboard finding: sidecars never re-log, so block-id dedup is
-# 0% overcount while message-id dedup would UNDERcount tools).
-#
-# Two further parities (ENG-6): the sidecar walk REFUSES to follow reparse points (symlinks /
-# junctions) via `_is_reparse_point` + a no-follow scandir walk (mirroring discovery.rs / parse.rs
-# `file_type()` no-follow), and the DISPLAYED roster is capped at `_AGENT_SAMPLE_CAP` (12,
-# cc-dashboard's agent_sample_cap) while the dispatched COUNT + token split stay exact over all
-# agents. A forked/resumed UUID's sidecars are merged across the resume chain (ENG-3, `_subagent_dirs`).
+# User-turn KIND ladder (ported from the cc-user-prompts engine) layered ON TOP of the gate above:
+# the gate decides IS-a-turn, the ladder decides WHICH KIND and renders the displayed text. Kinds:
+# typed | bash_input | queued_steer | slash_command | ask_answer | goal.
 # ---------------------------------------------------------------------------
 
-# Display cap for the subagent roster TABLE — mirrors cc-dashboard's `agent_sample_cap` (mod.rs).
-# The dispatched COUNT, the by_type tally, and the main-vs-subagent token split stay EXACT over all
-# agents; only the rendered rows are sampled (top-N by token spend) once the roster exceeds this.
-_AGENT_SAMPLE_CAP = 12
+# `!`-mode shell command the user typed, wrapped <bash-input …>cmd</bash-input>.
+_BASH_INPUT_RE = re.compile(r'<bash-input[^>]*>(.*?)</bash-input>', re.DOTALL)
+# A leading IDE editor-context element, stripped off a single-string content block while keeping
+# any trailing user prose.
+_IDE_ELEMENT_RE = re.compile(r'^\s*<ide_\w+\b[^>]*>.*?</ide_\w+>\s*', re.DOTALL)
+_IDE_CONTEXT_TAGS = ('<ide_opened_file', '<ide_selection', '<ide_diagnostics')
+# Harness-injected <system-reminder> context rides a user line; strip the span(s), keeping only the
+# human's co-resident prose. BOTH patterns anchor the optional leading whitespace as [^\S\n]? (at
+# most ONE horizontal space), NOT \s* — a \s* prefix is a ReDoS multi-anchor (O(n²) on a rejected
+# tag after a whitespace run). Closed spans first, then a dangling/truncated OPEN token.
+_SYSTEM_REMINDER_RE = re.compile(r'[^\S\n]?<system-reminder\b.*?</system-reminder>\s*', re.DOTALL)
+_SYSTEM_REMINDER_OPEN_RE = re.compile(r'[^\S\n]?<system-reminder\b.*$', re.DOTALL)
 
 
-def _is_reparse_point(path):
-    """True if `path` is a symlink OR (Windows) a junction / mount point — ANY reparse point.
+def _strip_system_reminders(text):
+    """Remove harness-injected <system-reminder> context, keeping only the human's co-resident
+    prose. Handles closed spans, a dangling/truncated open token, and the leftover whitespace."""
+    if '<system-reminder' not in text:
+        return text
+    text = _SYSTEM_REMINDER_RE.sub(' ', text)
+    if '<system-reminder' in text:                 # an unclosed/dangling open token
+        text = _SYSTEM_REMINDER_OPEN_RE.sub('', text)
+    return text
 
-    `os.path.islink()` returns False for Windows JUNCTIONS (the common `mklink /J` / Drive-junction
-    case), so it MISSES the reparse points a stray (or planted) link could use to redirect a sidecar
-    read outside the trusted ~/.claude/projects tree. We read the no-follow `lstat` and test the
-    Windows reparse-point file attribute — which catches junctions AND symlinks; both
-    `st_file_attributes` and `stat.FILE_ATTRIBUTE_REPARSE_POINT` exist on Python 3.8+ Windows builds —
-    falling back to the POSIX symlink-mode bit. Fails CLOSED: an unstattable path is treated as a
-    reparse point and refused. Mirrors cc-dashboard discovery.rs / parse.rs, which refuse to traverse
-    a reparse point via each dir-entry's own no-follow `file_type()`.
+
+def _is_context_block(c):
+    """True for a harness-injected editor-context block (not the user's prose)."""
+    return (isinstance(c, dict) and c.get('type') == 'text'
+            and c.get('text', '').lstrip().startswith(_IDE_CONTEXT_TAGS))
+
+
+def _clean_prose(text):
+    """Strip injected spans from an already-flat prose string. Reminder-strip FIRST: the IDE
+    pattern anchors on a LEADING element, so a leading reminder would otherwise hide it.
+
+    The IDE strip LOOPS: a single editor context can inject several elements back to back
+    (`<ide_opened_file>…</ide_opened_file><ide_selection>…</ide_selection>real prompt`), and a
+    one-shot strip leaks the rest as literal XML into the VERBATIM user-turn display. Bounded at
+    10 iterations — real injections are 1-3 elements, and the bound keeps a pathological string
+    from turning the strip super-linear."""
+    text = _strip_system_reminders(text)
+    for _ in range(10):
+        stripped = _IDE_ELEMENT_RE.sub('', text, count=1)
+        if stripped == text:
+            break
+        text = stripped
+    return text.strip()
+
+
+def _clean_content(content):
+    """Displayed (cleaned) form of a user line's content: harness-injected <system-reminder> spans
+    and ide_* editor context removed, everything the human typed kept. Blocks join on newlines
+    (distinct blocks are distinct lines), unlike the gate's space-joining `_text_from_content`."""
+    if isinstance(content, list):
+        parts = [c.get('text', '') if isinstance(c, dict) else str(c)
+                 for c in content if not _is_context_block(c)]
+        return _strip_system_reminders('\n'.join(p for p in parts if p)).strip()
+    if content is None:
+        return ''
+    return _clean_prose(str(content))
+
+
+def _render_ask(d, ans):
+    """Render an AskUserQuestion answer turn as `Q: …` / `A: …` pairs, in the dialog's own question
+    order (extra answer keys, if any, trail it)."""
+    tur = d.get('toolUseResult')
+    questions = tur.get('questions') if isinstance(tur, dict) else None
+    order = [q.get('question', '') for q in questions
+             if isinstance(q, dict)] if isinstance(questions, list) else []
+    lines = []
+    for k in dict.fromkeys([*order, *ans]):
+        if k in ans:
+            lines.append(f'Q: {k}\nA: {ans[k]}')
+    return '\n'.join(lines) or _format_answers(ans)
+
+
+def _user_turn(d):
+    """Return (kind, displayed_text) for a genuine user turn, else None.
+
+    Gate = `_user_prompt` (the compat surface, unchanged); this only classifies + cleans what the
+    gate already admitted, so the turn SET here is identical to the one the hook consumes.
     """
-    try:
-        st = os.lstat(path)
-    except OSError:
-        return True  # can't stat it -> untrusted, refuse (fail closed)
-    # Windows: the reparse-point bit covers BOTH junctions and symlinks (islink only catches symlinks).
-    # On POSIX `st_file_attributes` / the constant are absent -> getattr yields 0 and this is a no-op.
-    attrs = getattr(st, 'st_file_attributes', 0)
-    if attrs & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0):
-        return True
-    return stat.S_ISLNK(st.st_mode)  # POSIX fallback: a plain symlink
-
-
-def _walk_sidecar_files(root, suffix):
-    """Return sorted paths of files under `root` whose name ends with `suffix`, at any depth,
-    WITHOUT following reparse points (symlinks / junctions).
-
-    The no-follow analogue of `glob.glob('**/*', recursive=True)`, which FOLLOWS symlinked dirs —
-    and `os.walk` wouldn't prune Windows junctions either (they aren't symlinks). Manual `os.scandir`
-    recursion: a reparse-point directory is pruned (never descended) and a reparse-point file is
-    skipped, so a planted `agent-*.meta.json` / `agent-*.jsonl` link can't redirect a read out of the
-    projects tree. Sorted to preserve the previous `sorted(glob(...))` deterministic order. Mirrors
-    cc-dashboard's per-dir-entry no-follow `file_type()` discipline (discovery.rs / parse.rs).
-    """
-    results = []
-
-    def _recurse(d):
-        try:
-            entries = list(os.scandir(d))
-        except OSError:
-            return
-        for e in entries:
-            # Refuse symlinks AND Windows junctions outright; `follow_symlinks=False` also classifies
-            # the entry by ITSELF (not its target), so a reparse-point dir reads as a non-dir here.
-            if _is_reparse_point(e.path):
-                continue
-            if e.is_dir(follow_symlinks=False):
-                _recurse(e.path)
-            elif e.is_file(follow_symlinks=False) and e.name.endswith(suffix):
-                results.append(e.path)
-
-    if os.path.isdir(root) and not _is_reparse_point(root):
-        _recurse(root)
-    return sorted(results)
-
-
-def _subagent_dir(path):
-    """The subagents/ sidecar dir for a main transcript: `<uuid>.jsonl` -> `<uuid>/subagents/`.
-
-    Sidecars live beside the LIVE transcript (`projects/<proj>/<uuid>/subagents/`). For a compact
-    ARCHIVE path (in compact-backups/) this dir won't exist — pass the LIVE transcript to the
-    `subagents` / `tool-breakdown` subcommands so the sidecars resolve.
-    """
-    return os.path.splitext(path)[0] + os.sep + 'subagents'
-
-
-def _session_uuid_chain(path):
-    """The resume-chain UUIDs for a transcript: the filename UUID plus any distinct top-level
-    `sessionId` values its lines carry. A session that forks/resumes its UUID mid-run can keep a
-    PRIOR UUID on replayed historical lines, so the SET of sessionIds present IS the chain.
-
-    Scoped STRICTLY to this transcript (we read only its own lines, never the sibling files), so an
-    unrelated session is never swept in. Filename UUID first, then any others in first-seen order.
-    `sessionId` is filtered through `_UUID_RE.fullmatch`, which drops the `bridge-session` line's
-    `bridgeSessionId` (a `cse_*` cloud id, not a local sidecar UUID) and any malformed value.
-
-    EMPIRICAL (2026-06-27 audit of 400 local transcripts — 364 live + 36 compact-backups): every
-    line's sessionId equals the filename UUID; no fork is present on disk in this CC build, so this
-    returns a single UUID and the sidecar merge below is a no-op today. It is a forward-compatible
-    guard: if a future build retains the OLD sessionId on resume-replayed lines, the set becomes the
-    real chain and `_subagent_dirs` recovers the otherwise-under-counted agents.
-    """
-    chain = [_session_uuid_from_path(path)]
-    for d in load_lines(path):
-        if not isinstance(d, dict):
-            continue
-        sid = d.get('sessionId')
-        # Canonical UUIDs only, and only ones not already in the chain (the filename UUID + the
-        # vast majority of lines repeat it; a fork would contribute the extra prior UUID(s)).
-        if isinstance(sid, str) and sid not in chain and _UUID_RE.fullmatch(sid):
-            chain.append(sid)
-    return chain
-
-
-def _subagent_dirs(path):
-    """Every EXISTING `<uuid>/subagents` sidecar dir for this transcript's resume chain.
-
-    A forked/resumed UUID splits sidecars across `<old-uuid>/subagents/` + `<new-uuid>/subagents/`;
-    this resolves both. The chain UUIDs come from `_session_uuid_chain` (this transcript's own lines
-    only — never a glob of `projects/<proj>/`, so no unrelated session's sidecars leak in). Returns
-    the existing dirs in chain order (filename UUID first), de-duplicated.
-
-    The no-fork case yields exactly the single legacy `_subagent_dir(path)` dir, so callers behave
-    identically to before. (An archive path still yields the legacy result: its stem-derived primary
-    dir doesn't exist, and a single-sessionId archive adds no further chain UUIDs — pass the LIVE
-    transcript to actually resolve sidecars, as the subcommand docs already require.)
-    """
-    parent = os.path.dirname(path)
-    dirs = []
-    # chain[0] is the filename UUID — reuse the canonical single-dir helper so the sidecar-location
-    # convention (`<uuid>.jsonl` -> `<uuid>/subagents`) is defined in exactly one place.
-    primary = _subagent_dir(path)
-    if os.path.isdir(primary):
-        dirs.append(primary)
-    # Any further chain UUIDs (a prior/forked session) resolve to sibling dirs in the same
-    # projects/<proj>/ folder. Strictly the chain — never a wildcard over the dir.
-    for u in _session_uuid_chain(path)[1:]:
-        d = os.path.join(parent, u, 'subagents')
-        if os.path.isdir(d) and d not in dirs:
-            dirs.append(d)
-    return dirs
-
-
-def _usage_tokens(path, start_ts=None, end_ts=None):
-    """Sum message.usage tokens across a transcript's assistant lines, deduped by message.id.
-
-    One API response logs as several content-block lines that can repeat the SAME usage, so we take
-    the MAX per (message.id, field) — a response is counted once, never summed across its lines
-    (mirrors ccusage / cc-dashboard dedup). Reads the RAW transcript usage fields (`input_tokens`,
-    `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`) — NOT ccusage's
-    camelCase. Returns {input, output, cache_create, cache_read, total} (raw volume, not billed cost).
-
-    Optional start_ts / end_ts (ISO strings) bound the sum to a sub-window (used by `stats` for the
-    "just the post-mortem run" case); unbounded by default, so the §2(c) / subagent callers that
-    pass only `path` are unchanged.
-    """
-    fields = (('input', 'input_tokens'), ('output', 'output_tokens'),
-              ('cache_create', 'cache_creation_input_tokens'), ('cache_read', 'cache_read_input_tokens'))
-    per_id = {}
-    keyless = {'input': 0, 'output': 0, 'cache_create': 0, 'cache_read': 0}
-    for d in load_lines(path):
-        if d.get('type') != 'assistant':
-            continue
-        ts = d.get('timestamp', '')
-        if start_ts and ts < start_ts:
-            continue
-        if end_ts and ts >= end_ts:
-            continue
-        msg = d.get('message')
-        if not isinstance(msg, dict):
-            continue
-        u = msg.get('usage')
-        if not isinstance(u, dict):
-            continue
-        mid = msg.get('id')
-        target = per_id.setdefault(mid, {'input': 0, 'output': 0, 'cache_create': 0, 'cache_read': 0}) \
-            if mid else keyless
-        for k, raw in fields:
-            v = u.get(raw, 0) or 0
-            if mid:
-                if v > target[k]:
-                    target[k] = v
-            else:
-                target[k] += v
-    agg = dict(keyless)
-    for slot in per_id.values():
-        for k in agg:
-            agg[k] += slot[k]
-    agg['total'] = sum(agg[k] for k in ('input', 'output', 'cache_create', 'cache_read'))
-    return agg
-
-
-def _usage_by_model(path, start_ts=None, end_ts=None):
-    """Per-model token volume {model_id: total_tokens} from message.model × message.usage, deduped
-    by message.id (a response logs as several lines repeating the same usage — take MAX per
-    (id, field), then sum each response's four fields under its model). Models in first-seen order;
-    zero-token models dropped.
-
-    Transcript-native — this per-model attribution always came from the transcript, NOT ccusage, so
-    it survives the ENG-1 ccusage removal. By construction `sum(by_model.values())` ==
-    `_usage_tokens(path, start_ts, end_ts)['total']` for the same bounds (same dedup, just partitioned
-    by model), which §7 relies on and a unit test pins.
-    """
-    fields = ('input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens')
-    per_id = {}   # message.id -> {'model': str, <field>: max-seen}
-    keyless = {}  # model -> running token total for id-less assistant lines
-    order = []    # model ids in first-seen order (preserves display order)
-    for d in load_lines(path):
-        if d.get('type') != 'assistant':
-            continue
-        ts = d.get('timestamp', '')
-        if start_ts and ts < start_ts:
-            continue
-        if end_ts and ts >= end_ts:
-            continue
-        msg = d.get('message')
-        if not isinstance(msg, dict):
-            continue
-        u = msg.get('usage')
-        if not isinstance(u, dict):
-            continue
-        model = msg.get('model') or '?'
-        if model not in order:
-            order.append(model)
-        mid = msg.get('id')
-        if mid:
-            slot = per_id.setdefault(mid, {'model': model, **{f: 0 for f in fields}})
-            for f in fields:
-                v = u.get(f, 0) or 0
-                if v > slot[f]:
-                    slot[f] = v
-        else:
-            keyless[model] = keyless.get(model, 0) + sum((u.get(f, 0) or 0) for f in fields)
-    by_model = {m: 0 for m in order}
-    for slot in per_id.values():
-        by_model[slot['model']] = by_model.get(slot['model'], 0) + sum(slot[f] for f in fields)
-    for m, t in keyless.items():
-        by_model[m] = by_model.get(m, 0) + t
-    return {m: t for m, t in by_model.items() if t}
-
-
-def _tool_histogram(path, seen=None):
-    """Counter of tool_use names across a transcript's assistant lines, deduped by tool_use block id.
-
-    block-id dedup (NOT message.id) is correct for tools: one response logs many distinct calls on
-    separate lines. `seen`, if given, is a shared block-id set so a main+subagent sweep never
-    double-counts a block id across files (block ids are unique across transcripts, so this is
-    belt-and-suspenders).
-    """
-    seen = seen if seen is not None else set()
-    tools = Counter()
-    for d in load_lines(path):
-        if d.get('type') != 'assistant':
-            continue
-        msg = d.get('message', {})
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get('content', [])
-        if not isinstance(content, list):
-            continue
-        for c in content:
-            if isinstance(c, dict) and c.get('type') == 'tool_use':
-                bid = c.get('id')
-                if bid is not None:
-                    if bid in seen:
-                        continue
-                    seen.add(bid)
-                tools[c.get('name', '?')] += 1
-    return tools
-
-
-def _first_assistant_model(path):
-    """First assistant `message.model` in a transcript (the agent's model tier); '?' if none."""
-    for d in load_lines(path):
-        if d.get('type') == 'assistant':
-            msg = d.get('message')
-            if isinstance(msg, dict) and msg.get('model'):
-                return msg['model']
-    return '?'
-
-
-def _short_model(m):
-    """Trim a model id to its family-version for display: `claude-opus-4-8[1m]` -> `opus-4-8`."""
-    if not m or m == '?':
-        return '?'
-    return m.replace('claude-', '').split('[')[0]
-
-
-def _sanitize_label(desc):
-    """Collapse a raw `description` string into one safe markdown-table cell.
-
-    Whitespace/newlines collapse to single spaces (a multi-line description would otherwise break
-    the table's one-row-per-line shape); `|` is replaced with `/` rather than backslash-escaped —
-    the label is a short 3-5 word dispatch phrase, not prose where a literal pipe is meaningful, so
-    a clean substitution reads better than escape noise. Truncated to 60 chars with a trailing `…`
-    so one long label can't blow out the table's width.
-    """
-    s = re.sub(r'\s+', ' ', desc).strip().replace('|', '/')
-    if len(s) > 60:
-        s = s[:60].rstrip() + '…'
-    return s
-
-
-def _collect_subagents(sidedir):
-    """Walk a subagents/ dir -> per-agent dicts {agent_type, model, tokens, tool_count, tools,
-    label, depth}.
-
-    Each agent is an `agent-*.meta.json` paired with its `agent-*.jsonl` transcript, at any depth
-    (incl. `workflows/wf_*/`). Reads `agentType`, `description`, and `spawnDepth` from the meta.
-    `description` is the ORCHESTRATOR's own 3-5 word dispatch label (e.g. "Extract rain-proof 07-23
-    reports A") — NOT the agent's prompt or first-user-turn body, which stay unread; that half of
-    cc-dashboard's allow-list discipline (never read what the DISPATCHED agent said or was told to
-    do beyond this label) is unchanged. The label is deliberately surfaced despite the previous
-    stricter posture: a roster keyed on agentType alone made a real cost diagnosis impossible (12×
-    plan-executor rows were indistinguishable), the label is orchestrator-authored metadata rather
-    than user content or file content, and a postmortem report already quotes the session's own
-    turns verbatim — so the marginal disclosure is nil against the diagnostic value of finally being
-    able to tell dispatches apart. `journal.jsonl` and other non-agent files have no meta.json and
-    are skipped. The meta is size-capped at 64 KB (parse.rs parity). The walk REFUSES to follow
-    reparse points (symlinks / junctions) via `_walk_sidecar_files`, and re-checks the DERIVED
-    `.jsonl` sibling before opening it, so a planted link can't redirect a read outside the trusted
-    ~/.claude/projects tree (parse.rs no-follow parity). Returns ALL agents UNCAPPED — the display
-    cap (`_AGENT_SAMPLE_CAP`) is applied in `subagents()` so the dispatched count + token split stay
-    exact.
-    """
-    agents = []
-    for meta_path in _walk_sidecar_files(sidedir, '.meta.json'):
-        agent_type = 'agent'
-        label = ''
-        depth = 1
-        try:
-            if os.path.getsize(meta_path) <= 65536:
-                with open(meta_path, encoding='utf-8') as f:
-                    m = json.load(f)
-                if isinstance(m, dict):
-                    if isinstance(m.get('agentType'), str) and m['agentType'].strip():
-                        agent_type = m['agentType'].strip()
-                    desc = m.get('description')
-                    if isinstance(desc, str) and desc.strip():
-                        label = _sanitize_label(desc)
-                    # bool is an int subclass in Python — exclude it explicitly so `"spawnDepth":
-                    # true` doesn't silently pass the isinstance check. Absent/garbage (missing key,
-                    # non-int, <=0) falls back to depth 1 (top-level dispatch).
-                    sd = m.get('spawnDepth')
-                    if isinstance(sd, int) and not isinstance(sd, bool) and sd > 0:
-                        depth = sd
-        except (OSError, json.JSONDecodeError):
-            pass
-        jsonl = meta_path[:-len('.meta.json')] + '.jsonl'
-        tokens, tools, model = {'total': 0}, Counter(), '?'
-        # The .jsonl is a DERIVED sibling path (not a walked dir-entry), so re-check it isn't a
-        # planted reparse point before opening — mirrors parse.rs first_model_in_file's symlink guard.
-        if os.path.exists(jsonl) and not _is_reparse_point(jsonl):
-            tokens = _usage_tokens(jsonl)
-            tools = _tool_histogram(jsonl)
-            model = _first_assistant_model(jsonl)
-        agents.append({'agent_type': agent_type, 'model': model, 'label': label, 'depth': depth,
-                       'tokens': tokens['total'], 'tool_count': sum(tools.values()), 'tools': tools})
-    return agents
-
-
-def _split_mcp(name):
-    """`mcp__server__tool` -> ('server', 'tool'); a non-MCP tool -> (None, name). Mirrors
-    tools.rs::split_mcp: strip the `mcp__` prefix, split on the FIRST `__`."""
-    if name.startswith('mcp__'):
-        server, sep, tool = name[len('mcp__'):].partition('__')
-        return (server, tool if sep else '')
-    return (None, name)
-
-
-def subagents(path):
-    """Print the per-subagent roster (agentType, dispatch label, model, tokens, tool calls) + the
-    main-vs-subagent token split — the fanout spend §7's main-thread token table breaks out via its
-    subagent-aggregate line. The dispatch label (from meta's `description`, see `_collect_subagents`)
-    disambiguates rows that would otherwise all share the same agentType (e.g. N× plan-executor); a
-    nested dispatch (`spawnDepth` > 1) is marked inline on the agent-type cell. Pass the LIVE
-    transcript (sidecars live beside it). Merges every sidecar dir in the session's resume chain
-    (`_subagent_dirs`, ENG-3) so a forked/resumed UUID doesn't under-count agents, and caps the
-    DISPLAYED roster at `_AGENT_SAMPLE_CAP` (ENG-6) while the count + token split stay exact. Prints
-    a one-liner when the session dispatched none."""
-    # ENG-3: a session that forks/resumes its UUID mid-run splits its sidecars across
-    # `<old-uuid>/subagents/` + `<new-uuid>/subagents/`. Merge every resume-chain dir; each agent's
-    # meta/jsonl pair is unique to its dir, so the rosters simply concatenate (no dedup needed).
-    dirs = _subagent_dirs(path)
-    agents = []
-    for d in dirs:
-        agents.extend(_collect_subagents(d))
-    if not agents:
-        print('_No subagents dispatched (no sidecar dir for this transcript)._')
-        return
-    agents.sort(key=lambda a: a['tokens'], reverse=True)
-    main_tokens = _usage_tokens(path)['total']
-    sub_total = sum(a['tokens'] for a in agents)
-    combined = main_tokens + sub_total
-    share = (sub_total / combined * 100) if combined else 0
-    by_type = Counter(a['agent_type'] for a in agents)
-    print(f'**Subagents dispatched:** {len(agents)} ('
-          + ', '.join(f'{n}× {t}' for t, n in by_type.most_common()) + ')')
-    print(f'**Token split:** main {main_tokens:,} + subagents {sub_total:,} = {combined:,} '
-          f'({share:.0f}% in subagents)')
-    print('_Raw transcript usage-token volume (deduped by message.id); not billed cost. §7\'s token '
-          'table is the SAME main-thread source, so this split reconciles with it; cost analysis → cc-dashboard._')
-    # When the chain merged more than one sidecar dir, surface the UUIDs (dir = <parent>/<uuid>/subagents)
-    # so the reader knows a fork was stitched back together — otherwise the count would look unexplained.
-    if len(dirs) > 1:
-        merged = ', '.join(os.path.basename(os.path.dirname(d)) for d in dirs)
-        print(f'_Merged subagent sidecars from {len(dirs)} resume-chain UUIDs: {merged} '
-              '(session forked/resumed its UUID mid-run)._')
-    print()
-    print('| Agent type | Dispatch label | Model | Tokens | Tool calls | Top tools |')
-    print('|---|---|---|---:|---:|---|')
-    # ENG-6: cap the DISPLAYED roster at _AGENT_SAMPLE_CAP rows (top-N by token spend; `agents` is
-    # already sorted desc) — matches cc-dashboard's agent_sample_cap. The dispatched count, by_type
-    # tally, and token split above all stay computed over ALL agents; only the table is sampled, and
-    # only when the roster actually exceeds the cap.
-    for a in agents[:_AGENT_SAMPLE_CAP]:
-        top = ', '.join(f'{n}×{c}' for n, c in a['tools'].most_common(4)) or '—'
-        # A nested dispatch (an agent spawned BY a subagent, not directly by the orchestrator) is
-        # otherwise invisible in this roster — mark it inline on the agent-type cell (↳ + depth)
-        # rather than adding a whole extra column, to keep the table narrow.
-        agent_col = f"↳ {a['agent_type']} (depth {a['depth']})" if a['depth'] > 1 else a['agent_type']
-        label = a['label'] or '—'
-        print(f"| {agent_col} | {label} | {_short_model(a['model'])} | {a['tokens']:,} | {a['tool_count']} | {top} |")
-    if len(agents) > _AGENT_SAMPLE_CAP:
-        print(f'_(showing top {_AGENT_SAMPLE_CAP} of {len(agents)} by token spend; '
-              f'the count + token split above cover all.)_')
-
-
-def tool_breakdown(path):
-    """Print the session's tool fingerprint: a main-vs-subagent split of tool-call counts and an
-    MCP-server table (server / distinct tools / calls) when any `mcp__` tool fired. Pass the LIVE
-    transcript so the sidecars resolve. Walks every sidecar dir in the resume chain (`_subagent_dirs`,
-    ENG-3) so a forked/resumed UUID doesn't under-count. Complements §7's flat tool counter with
-    attribution."""
-    seen = set()
-    main_tools = _tool_histogram(path, seen)
-    sub_tools = Counter()
-    # ENG-3 + ENG-6: merge across ALL resume-chain sidecar dirs via a no-follow walk (refuses
-    # symlinks/junctions; replaces glob('**/*.jsonl'), which would follow a symlinked dir). The shared
-    # `seen` block-id set spans every file, so a block id is counted once even across dirs. journal.jsonl
-    # is a log, not an agent transcript, so it's skipped.
-    for sidedir in _subagent_dirs(path):
-        for jsonl in _walk_sidecar_files(sidedir, '.jsonl'):
-            if os.path.basename(jsonl) == 'journal.jsonl':
-                continue
-            sub_tools.update(_tool_histogram(jsonl, seen))
-    combined = main_tools + sub_tools
-    n_main, n_sub = sum(main_tools.values()), sum(sub_tools.values())
-    print(f'**Tool calls:** {n_main + n_sub} total — {n_main} main + {n_sub} across subagents')
-    if combined:
-        # Top 10 with a labeled remainder so the list reconciles with the total above.
-        shown = combined.most_common(10)
-        line = ', '.join(f'{n}×{c}' for n, c in shown)
-        rest = sum(combined.values()) - sum(c for _, c in shown)
-        if rest:
-            line += f', +{len(combined) - 10} more ×{rest}'
-        print('  - ' + line)
-    servers = {}
-    for name, c in combined.items():
-        server, tool = _split_mcp(name)
-        if server is not None:
-            s = servers.setdefault(server, {'tools': set(), 'calls': 0})
-            s['tools'].add(tool)
-            s['calls'] += c
-    if servers:
-        print()
-        print('**MCP servers used:**')
-        print()
-        print('| Server | Distinct tools | Calls |')
-        print('|---|---:|---:|')
-        for server in sorted(servers, key=lambda s: servers[s]['calls'], reverse=True):
-            s = servers[server]
-            print(f'| {server} | {len(s["tools"])} | {s["calls"]} |')
-
-
-# `ballast: <hook-name> <sep> <clause>` up to the FIRST separator, where <sep> is either an em
-# dash or a plain '--' (at least one hook emits '--' with a variable clause tail, e.g.
-# "ballast: dev-process-nudge -- 1 process already referencing this project" — without the '--'
-# alternative each distinct clause fragmented into its own fallback tally key instead of counting
-# under the hook name). Some real fires have no separator at all (e.g. "⚓ ballast: principles
-# loaded") — that's the genuine D2 fallback case (tally by the full line), not a regex bug to chase.
-_HOOK_FIRE_NAME_RE = re.compile(r'ballast:\s*(.+?)\s*(?:—|--)')
-
-
-def _hook_fire_name(content):
-    """Extract the `<name>` from a hook_system_message content line's `ballast: <name> — <clause>`
-    segment, or None if that segment isn't present (caller falls back to the full line)."""
-    if not isinstance(content, str):
+    p = _user_prompt(d)
+    if p is None:
         return None
-    m = _HOOK_FIRE_NAME_RE.search(content)
-    return m.group(1).strip() if m else None
-
-
-def hook_fires(path):
-    """Tally `hook_system_message` attachment lines (each a ballast conditional hook's per-fire
-    visibility one-liner — `{content, hookName, hookEvent, toolUseID}`, characterized live
-    2026-07-10, registered in KNOWN_ATTACHMENT_TYPES below) by hook name.
-
-    `content` is the user-visible message, typically `<emoji> ballast: <hook-name> — <clause>`.
-    When it matches that shape, `<hook-name>` is the tally key; otherwise the full content line is
-    (fail-soft: an unexpected shape is still counted under its own text rather than dropped or
-    crashing the dump — see `_hook_fire_name`). Prints 'no hook fires recorded' when the transcript
-    has none. This reads an already-registered attachment type — it does not touch the KNOWN_*
-    drift registries below.
-    """
-    counts = Counter()
-    for d in load_lines(path):
-        if d.get('type') != 'attachment':
-            continue
-        att = d.get('attachment')
-        if not isinstance(att, dict) or att.get('type') != 'hook_system_message':
-            continue
-        content = att.get('content')
-        if not isinstance(content, str) or not content.strip():
-            continue
-        name = _hook_fire_name(content) or content.strip()
-        counts[name] += 1
-    if not counts:
-        print('no hook fires recorded')
-        return
-    print('**Hook fires:**')
-    print()
-    for name, c in counts.most_common():
-        print(f'- {name}: {c}')
-    print(f'- **Total:** {sum(counts.values())}')
+    text, marker = p
+    if marker == 'autopilot goal':
+        return 'goal', _clean_prose(text)
+    if marker == 'mid-turn steer':
+        return 'queued_steer', _clean_prose(text)
+    if marker == 'slash-command':
+        return 'slash_command', text          # already rendered to `/name args` by the gate
+    ans = _ask_answer(d)
+    if ans is not None:
+        return 'ask_answer', _render_ask(d, ans)
+    msg = d.get('message')
+    disp = _clean_content(msg.get('content') if isinstance(msg, dict) else None)
+    if disp.startswith('<bash-input'):
+        m = _BASH_INPUT_RE.search(disp)
+        cmd = (m.group(1) if m else '').strip()
+        return 'bash_input', '!' + cmd        # re-prefix `!` to mirror what was typed
+    if d.get('promptSource') == 'queued':     # type-ahead steer that landed on a user line
+        return 'queued_steer', disp
+    return 'typed', disp
 
 
 # ---------------------------------------------------------------------------
@@ -1473,8 +412,8 @@ KNOWN_ATTACHMENT_TYPES = frozenset({
     # `hook_system_message` — characterized live 2026-07-10: the attachment record for a hook's own
     # `systemMessage` one-liner (the per-fire visibility line ballast hooks emit) —
     # `{content, hookName, hookEvent, toolUseID}`. Carrier is `type="attachment"` so turn counting
-    # already skips it; not turn/usage-bearing. Likely future v3 input for inventorying hook fires
-    # per session. Added per extend-never-delete.
+    # already skips it; not turn/usage-bearing. Consumed by the digest's hook inventory.
+    # Added per extend-never-delete.
     'hook_system_message',
     # `task_status` — characterized live 2026-07-22 (sighted 2026-07-20): a background-task status
     # record — `{taskId, taskType, description, status, deltaSummary, outputFilePath}`. Sibling of
@@ -1482,6 +421,12 @@ KNOWN_ATTACHMENT_TYPES = frozenset({
     # on queued_command), but a distinct attachment type; carrier is `type="attachment"` so turn
     # counting already skips it. Added per extend-never-delete.
     'task_status',
+    # `read_truncation_notice` — characterized live 2026-07-30 (v5 bench, self-detected by the first
+    # v5 digest run): the banner injected when a Read hits the token cap —
+    # `{banner, toolUseID}`, banner text carries file/lines/cap and next-page guidance. Carrier is
+    # `type="attachment"` so turn counting already skips it; digest surfaces truncated reads via the
+    # anomalies section, not as a turn. Added per extend-never-delete.
+    'read_truncation_notice',
     # `mcp_instructions_delta` — REAL as of 2026-07-21 (registered 2026-07-22): MCP server
     # connect/disconnect churn emits `{addedBlocks, addedNames, removedNames}` (verified ×3 in one
     # transcript, claude-in-chrome attach/detach). The 2026-07-07 PHANTOM classification (zero
@@ -1599,9 +544,7 @@ def _observe_drift(acc, d):
         _observe_origin(acc, d.get('origin'))
         # Leading content-tag axis. GUARD (mirrors drift.rs is_tool_result_line): SKIP this axis on a
         # user line carrying a tool_result block — its inner OUTPUT or a co-resident text block can
-        # open with '<…' (an MCP tool returning '<result>…'), which would mint spurious drift. The
-        # parsed-dict flatten makes this belt-and-suspenders (a tool_result block has no `text` key),
-        # but keeping the explicit guard matches drift.rs and covers the co-resident-prose case.
+        # open with '<…' (an MCP tool returning '<result>…'), which would mint spurious drift.
         msg = d.get('message')
         content = msg.get('content') if isinstance(msg, dict) else None
         if not (isinstance(content, list) and any(
@@ -1620,14 +563,18 @@ def _collect_drift(path):
     return acc
 
 
+def _drift_rows(acc):
+    """Sort a drift accumulator into display rows: kind asc / count desc / value asc."""
+    return sorted(acc.items(), key=lambda kv: (kv[0][0], -kv[1], kv[0][1]))
+
+
 def drift(path):
     """Format-drift canary: print a per-axis tally of every transcript shape OUTSIDE the known
     registries, one `kind<TAB>value<TAB>count` row, sorted by kind asc / count desc / value asc.
     Pure diagnostic — ALWAYS exits 0; the presence of rows (anything other than the literal
     'no drift') is the signal the orchestrator keys the report caveat off. Prints 'no drift' when
     clean so a human running it sees an explicit all-clear."""
-    acc = _collect_drift(path)
-    rows = sorted(acc.items(), key=lambda kv: (kv[0][0], -kv[1], kv[0][1]))
+    rows = _drift_rows(_collect_drift(path))
     if not rows:
         print('no drift')
         sys.exit(0)
@@ -1636,62 +583,1152 @@ def drift(path):
     sys.exit(0)
 
 
-# SR-1 (D1): the eight bulk dumps `bundle` runs in one process, in the order they're written to
-# `<out>/<name>.md` and reported on stdout. Kept as one ordered list rather than reusing
-# SUBCOMMANDS so bundle's dump set can't silently drift if a future non-bulk subcommand (e.g.
-# `topic-slug`, which takes an extra argv) is added to that dict.
-_BUNDLE_DUMPS = [
-    ('user-msgs', user_msgs),
-    ('invocations', invocations),
-    ('edits', edits),
-    ('assistant-text', assistant_text),
-    ('subagents', subagents),
-    ('tool-breakdown', tool_breakdown),
-    ('stats', stats),
-    ('hook-fires', hook_fires),
-]
+# ---------------------------------------------------------------------------
+# Transcript resolution (`resolve`)
+# ---------------------------------------------------------------------------
+
+# Canonical UUID shape: 8-4-4-4-12 hex.
+_UUID_RE = re.compile(r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+
+# Claude Code names each session's transcript dir ~/.claude/projects/<slug>/, where <slug> is the
+# session-LAUNCH cwd with every path-structural character flattened to a single '-' (drive colon,
+# BOTH separators, '.', and spaces). FORWARD-ONLY: the encoding is many-to-one, so a slug can never
+# be reversed to a path — we only encode a real cwd and compare. Ported from the cc-user-prompts
+# engine (corpus-verified against real cwd<->slug pairs).
+_SLUG_FLATTEN_RE = re.compile(r'[:.\\/ ]')
 
 
-def bundle(path, out_dir):
-    """Run every dump in `_BUNDLE_DUMPS` once against `path`, writing each to
-    `<out_dir>/<name>.md`, plus a `manifest.json` (D1 — SR-1 one-shot bundle extraction). The
-    orchestrator runs this ONE inline invocation instead of ~7 serial `ballast-extract` round-trips
-    and dispatches leaves against the resulting files, never re-invoking extract.py per dump.
+def encode_cwd_to_slug(cwd):
+    """Flatten a cwd to its Claude Code projects/ dir slug (see _SLUG_FLATTEN_RE)."""
+    return _SLUG_FLATTEN_RE.sub('-', cwd or '')
 
-    Bounded-write rule: `out_dir` is created (parents ok) if it doesn't exist. If it exists, is
-    non-empty, and has no `manifest.json`, refuse (exit 2) rather than write into a directory this
-    tool didn't create. A prior `manifest.json` marks the re-run case — but the re-run allowance
-    keys on that manifest belonging to THIS transcript, not merely existing: its `transcript` field
-    is parsed and compared to `os.path.abspath(path)` (a parse failure counts as a mismatch); on
-    mismatch, refuse (exit 2) rather than silently overwrite a different transcript's bundle dir
-    with a stale `diffs/` subdir left mismatched to the new report. A matching manifest overwrites
-    in place (the SR-6 partial-redispatch path reuses the same bundle dir).
 
-    Per-dump isolation: each dump runs in its own try/except; a failure is recorded as
-    `status: "error"` (with the exception text) in the manifest, and the loop continues — one
-    broken dump never blocks the other seven. Invariant: `status: "ok"` iff `<out_dir>/<name>.md`
-    on disk is from THIS run — on failure, any file a PREVIOUS run left at that path is
-    best-effort deleted so file state never contradicts the manifest.
+def _session_uuid_from_path(path):
+    """Extract the session UUID from a transcript filename.
 
-    The metrics block (transcript_lines/user_turns/time_window/compacted) runs in its own
-    try/except, independent of the per-dump loop above: on failure the manifest is still written,
-    with `metrics` present but null-valued and a `metrics_error` key carrying the exception text,
-    so a crash here never strands dumps already on disk with no manifest.json (which would trip
-    the bounded-write refusal on the next run with no recovery path). Exit 0 iff every dump AND the
-    metrics block succeeded, else exit 1 (with a one-line stderr summary of what failed).
-
-    stdout on success (D1): the manifest path, one status line per dump, then a final one-line
-    metrics summary — the orchestrator picks its scaling tier from THIS tool result, without
-    needing to read the manifest file itself.
+    Live transcripts are "<uuid>.jsonl"; PreCompact archives (written by a user-side PreCompact
+    archiver, if configured) are "<timestamp>_<trigger>_<uuid>.jsonl". Match the trailing canonical
+    UUID in either form; fall back to the bare stem if no UUID is present (best effort).
     """
-    import contextlib
-    import datetime
-    import io
+    stem = os.path.splitext(os.path.basename(path))[0]
+    m = _UUID_RE.search(stem)
+    return m.group(0) if m else stem
 
+
+def _resolve_transcript(session_id=None, home=None, cwd=None):
+    """Resolve this session's transcript. Returns {uuid, live, archives, via, error}.
+
+    Deterministic paths, in order:
+      1. `via == 'env'` — the session UUID (explicit `--id` or $CLAUDE_CODE_SESSION_ID) names
+         `~/.claude/projects/*/<uuid>.jsonl` exactly.
+      2. `via == 'id_prefix'` — explicit `--id` only: unique-prefix match on the same tree
+         (reports print the 8-char short id, so that is what a user pastes back).
+      3. `via == 'cwd_newest'` — no explicit `--id`: derive the project dir from cwd via
+         `encode_cwd_to_slug` and take the newest-mtime `*.jsonl` directly in it.
+    An explicit `--id` that matches nothing (or more than one session) never falls back —
+    `live` stays None and `error` carries the message, because silently digesting a
+    different session is worse than failing. `home` / `cwd` are parameters (not reads)
+    so resolution is testable against a fake tree.
+    """
+    home = home or os.path.expanduser('~')
+    explicit = bool((session_id or '').strip())
+    uuid = (session_id or os.environ.get('CLAUDE_CODE_SESSION_ID', '')).strip()
+    projects = os.path.join(home, '.claude', 'projects')
+    live, via, error = None, None, None
+    if uuid:
+        hits = sorted(glob.glob(os.path.join(projects, '*', glob.escape(uuid) + '.jsonl')))
+        if hits:
+            live, via = hits[0], 'env'
+        elif explicit:
+            hits = sorted(glob.glob(os.path.join(projects, '*', glob.escape(uuid) + '*.jsonl')))
+            if len(hits) == 1:
+                live, via = hits[0], 'id_prefix'
+                uuid = _session_uuid_from_path(live)
+            elif not hits:
+                error = (f"--id '{uuid}' matched no transcript under {projects} "
+                         "(explicit ids never fall back to another session)")
+            else:
+                error = (f"--id '{uuid}' is ambiguous — {len(hits)} matches: "
+                         + ', '.join(os.path.basename(h) for h in hits))
+    if live is None and not explicit:
+        pdir = os.path.join(projects, encode_cwd_to_slug(os.path.abspath(cwd or os.getcwd())))
+        cands = glob.glob(os.path.join(pdir, '*.jsonl'))
+        if cands:
+            live, via = max(cands, key=os.path.getmtime), 'cwd_newest'
+            if not uuid:
+                uuid = _session_uuid_from_path(live)
+    # Archive filenames are "<timestamp>_<trigger>_<uuid>.jsonl"; the timestamp prefix sorts
+    # chronologically, so a plain sort gives oldest->newest.
+    archives = sorted(glob.glob(os.path.join(home, '.claude', 'compact-backups',
+                                             f'*_{uuid}.jsonl'))) if uuid else []
+    return {'uuid': uuid, 'live': live, 'archives': archives, 'via': via, 'error': error}
+
+
+def resolve():
+    """Print the current session's live transcript path + any PreCompact archives.
+
+    Output (stdout):
+        UUID: <uuid>
+        VIA: env | cwd_newest
+        LIVE: <path or (not found)>
+        ARCHIVES (oldest->newest): one indented path per line, or "ARCHIVES: (none)"
+    """
+    r = _resolve_transcript()
+    if r['live'] is None:
+        print('ERROR: no transcript found (CLAUDE_CODE_SESSION_ID unset/unresolvable and no '
+              'session .jsonl under the cwd-derived projects dir)', file=sys.stderr)
+        sys.exit(1)
+    print(f"UUID: {r['uuid']}")
+    print(f"VIA: {r['via']}")
+    print(f"LIVE: {r['live']}")
+    if r['archives']:
+        print('ARCHIVES (oldest->newest):')
+        for a in r['archives']:
+            print(f'  {a}')
+    else:
+        print('ARCHIVES: (none)')
+
+
+# ---------------------------------------------------------------------------
+# Subagent sidecar roster — a session that dispatches subagents gets a sibling sidecar dir beside
+# the LIVE transcript: `<uuid>/subagents/**` holding each agent's own transcript (`agent-<id>.jsonl`)
+# + an `agent-<id>.meta.json` (agentType/description/spawnDepth), nested under `workflows/wf_<id>/`
+# for Workflow fan-outs. Content-free (names/types/token counts only). The walk REFUSES to follow
+# reparse points (symlinks / junctions), mirroring cc-dashboard discovery.rs / parse.rs.
+# ---------------------------------------------------------------------------
+
+# Display cap for the subagent roster TABLE — mirrors cc-dashboard's `agent_sample_cap`. The
+# dispatched COUNT and the token totals stay EXACT over all agents; only rendered rows are sampled.
+_AGENT_SAMPLE_CAP = 12
+
+
+def _is_reparse_point(path):
+    """True if `path` is a symlink OR (Windows) a junction / mount point — ANY reparse point.
+
+    `os.path.islink()` returns False for Windows JUNCTIONS, so it MISSES the reparse points a stray
+    (or planted) link could use to redirect a sidecar read outside the trusted ~/.claude/projects
+    tree. Fails CLOSED: an unstattable path is treated as a reparse point and refused.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return True  # can't stat it -> untrusted, refuse (fail closed)
+    attrs = getattr(st, 'st_file_attributes', 0)
+    if attrs & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0):
+        return True
+    return stat.S_ISLNK(st.st_mode)  # POSIX fallback: a plain symlink
+
+
+def _walk_sidecar_files(root, suffix):
+    """Sorted paths of files under `root` ending with `suffix`, at any depth, WITHOUT following
+    reparse points (symlinks / junctions) — `glob('**/*')` follows symlinked dirs and `os.walk`
+    wouldn't prune Windows junctions either."""
+    results = []
+
+    def _recurse(d):
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            return
+        for e in entries:
+            if _is_reparse_point(e.path):
+                continue
+            if e.is_dir(follow_symlinks=False):
+                _recurse(e.path)
+            elif e.is_file(follow_symlinks=False) and e.name.endswith(suffix):
+                results.append(e.path)
+
+    if os.path.isdir(root) and not _is_reparse_point(root):
+        _recurse(root)
+    return sorted(results)
+
+
+def _subagent_dir(path):
+    """The subagents/ sidecar dir for a main transcript: `<uuid>.jsonl` -> `<uuid>/subagents/`."""
+    return os.path.splitext(path)[0] + os.sep + 'subagents'
+
+
+def _subagent_dirs(path, chain=()):
+    """Every EXISTING `<uuid>/subagents` sidecar dir for this transcript's resume chain.
+
+    A forked/resumed UUID splits sidecars across `<old-uuid>/subagents/` + `<new-uuid>/subagents/`.
+    `chain` is the set of sessionIds seen ON THIS transcript's own lines (collected by the digest's
+    single pass — never a glob of projects/<proj>/, so no unrelated session's sidecars leak in).
+    """
+    parent = os.path.dirname(path)
+    dirs = []
+    primary = _subagent_dir(path)
+    if os.path.isdir(primary):
+        dirs.append(primary)
+    for u in chain:
+        d = os.path.join(parent, u, 'subagents')
+        if os.path.isdir(d) and d not in dirs:
+            dirs.append(d)
+    return dirs
+
+
+def _sanitize_label(desc):
+    """Collapse a raw `description` string into one safe markdown-table cell (whitespace collapsed,
+    `|` -> `/`, 60-char cap) — the orchestrator-authored dispatch label, never the agent's prompt."""
+    return _cut(desc.replace('|', '/'), 60)
+
+
+def _short_model(m):
+    """Trim a model id to its family-version for display: `claude-opus-4-8[1m]` -> `opus-4-8`."""
+    if not m or m == '?':
+        return '?'
+    return m.replace('claude-', '').split('[')[0]
+
+
+def _split_mcp(name):
+    """`mcp__server__tool` -> ('server', 'tool'); a non-MCP tool -> (None, name). Mirrors
+    tools.rs::split_mcp: strip the `mcp__` prefix, split on the FIRST `__`."""
+    if name.startswith('mcp__'):
+        server, sep, tool = name[len('mcp__'):].partition('__')
+        return (server, tool if sep else '')
+    return (None, name)
+
+
+_USAGE_FIELDS = ('input_tokens', 'output_tokens', 'cache_creation_input_tokens',
+                 'cache_read_input_tokens')
+
+
+def _scan_sidecar(jsonl):
+    """ONE pass over a subagent sidecar transcript -> (total_tokens, tool Counter, model).
+
+    Usage is deduped by message.id (MAX per field — a response logs as several lines repeating the
+    same usage); tool calls are deduped by tool_use BLOCK id (sidecars never re-log, and message-id
+    dedup would UNDERcount tools). Three separate passes in v4; one here — sidecar bytes dominate
+    the digest's wall time on fanout-heavy sessions.
+    """
+    per_id, keyless, tools, seen = {}, 0, Counter(), set()
+    model = '?'
+    for d in load_lines(jsonl):
+        if d.get('type') != 'assistant':
+            continue
+        msg = d.get('message')
+        if not isinstance(msg, dict):
+            continue
+        if model == '?' and msg.get('model'):
+            model = msg['model']
+        u = msg.get('usage')
+        if isinstance(u, dict):
+            vals = [u.get(f, 0) or 0 for f in _USAGE_FIELDS]
+            mid = msg.get('id')
+            if mid:
+                slot = per_id.setdefault(mid, [0, 0, 0, 0])
+                for i, v in enumerate(vals):
+                    if v > slot[i]:
+                        slot[i] = v
+            else:
+                keyless += sum(vals)
+        content = msg.get('content')
+        if isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict) and c.get('type') == 'tool_use':
+                    bid = c.get('id')
+                    if bid is not None:
+                        if bid in seen:
+                            continue
+                        seen.add(bid)
+                    tools[c.get('name', '?')] += 1
+    return keyless + sum(sum(s) for s in per_id.values()), tools, model
+
+
+def _collect_subagents(sidedir):
+    """Walk a subagents/ dir -> per-agent dicts {agent_type, model, tokens, tool_count, label, depth}.
+
+    Each agent is an `agent-*.meta.json` paired with its `agent-*.jsonl`, at any depth (incl.
+    `workflows/wf_*/`). `description` is the ORCHESTRATOR's own dispatch label — the agent's prompt
+    and first user turn stay unread. The meta is size-capped at 64 KB (parse.rs parity); the DERIVED
+    `.jsonl` sibling is re-checked for reparse points before opening. Returns ALL agents UNCAPPED.
+    """
+    agents = []
+    for meta_path in _walk_sidecar_files(sidedir, '.meta.json'):
+        agent_type, label, depth = 'agent', '', 1
+        try:
+            if os.path.getsize(meta_path) <= 65536:
+                with open(meta_path, encoding='utf-8') as f:
+                    m = json.load(f)
+                if isinstance(m, dict):
+                    if isinstance(m.get('agentType'), str) and m['agentType'].strip():
+                        agent_type = m['agentType'].strip()
+                    desc = m.get('description')
+                    if isinstance(desc, str) and desc.strip():
+                        label = _sanitize_label(desc)
+                    # bool is an int subclass — exclude it so `"spawnDepth": true` can't pass.
+                    sd = m.get('spawnDepth')
+                    if isinstance(sd, int) and not isinstance(sd, bool) and sd > 0:
+                        depth = sd
+        except (OSError, json.JSONDecodeError):
+            pass
+        jsonl = meta_path[:-len('.meta.json')] + '.jsonl'
+        tokens, tools, model = 0, Counter(), '?'
+        if os.path.exists(jsonl) and not _is_reparse_point(jsonl):
+            tokens, tools, model = _scan_sidecar(jsonl)
+        agents.append({'agent_type': agent_type, 'model': model, 'label': label, 'depth': depth,
+                       'tokens': tokens, 'tool_count': sum(tools.values())})
+    return agents
+
+
+# ---------------------------------------------------------------------------
+# Pricing — a small offline table ported from cc-dashboard core/pricing.rs (which mirrors ccusage).
+# APPROXIMATE, ccusage-aligned snapshot 2026-07: prices drift, and this deliberately SKIPS the
+# >200k tiering and the fast-speed multiplier (both no-ops on standard Claude Code data). USD per
+# MILLION tokens: (input, output, cache_write_5m, cache_read); 1-hour cache writes bill at 2x base
+# input. An UNKNOWN model still has its tokens counted — its cost is reported as null, never guessed.
+# ---------------------------------------------------------------------------
+
+_CACHE_1H_INPUT_MULT = 2.0
+
+
+def _price_for(model):
+    """(input, output, cache_write_5m, cache_read) USD per million tokens, or None if no family
+    branch claims this id (the drift/new-launch case — the caller reports a null cost)."""
+    m = (model or '').lower().replace('.', '-').replace('@', '-').split('[')[0]
+    if 'synthetic' in m:
+        return (0.0, 0.0, 0.0, 0.0)
+    if 'fable' in m or 'mythos' in m:
+        return (10.0, 50.0, 12.5, 1.0)
+    if 'opus' in m:
+        # Legacy Opus (3, and the original 4.0/4.1 generation) is $15/$75; everything else Opus is
+        # the modern $5/$25 SKU. Legacy is the CLOSED set so a future Opus minor prices as modern.
+        legacy = '3-opus' in m or re.search(r'opus-4-[01](?!\d)', m) is not None
+        return (15.0, 75.0, 18.75, 1.5) if legacy else (5.0, 25.0, 6.25, 0.5)
+    if 'haiku' in m:
+        if 'haiku-3-5' in m or '3-5-haiku' in m:
+            return (0.8, 4.0, 1.0, 0.08)
+        if 'haiku-3' in m or '3-haiku' in m:
+            return (0.25, 1.25, 0.3, 0.03)
+        return (1.0, 5.0, 1.25, 0.1)
+    if 'sonnet' in m:
+        return (3.0, 15.0, 3.75, 0.3)
+    return None
+
+
+def _cost_usd(model, tok):
+    """Estimated USD for one model's deduped token totals, or None for an unpriced model.
+    `tok` keys: input, output, cache_read, cc_5m, cc_1h."""
+    p = _price_for(model)
+    if p is None:
+        return None
+    inp, out, cw5, cr = p
+    return (tok['input'] * inp + tok['output'] * out + tok['cache_read'] * cr
+            + tok['cc_5m'] * cw5 + tok['cc_1h'] * inp * _CACHE_1H_INPUT_MULT) / 1_000_000.0
+
+
+# ---------------------------------------------------------------------------
+# Topic slug (v4 `topic-slug` logic, reused internally for manifest `suggested_slug`)
+# ---------------------------------------------------------------------------
+
+# Pass-through layout dirs: common roots where EVERY file sits under them ('src/…'), so the
+# segment carries layout, not topic — descend past them, like dot-dirs, to a content-bearing one.
+_PASS_THROUGH_DIRS = {'src', 'src-tauri'}
+
+
+def _bucket_winner(counts):
+    """The plurality bucket from a Counter, or 'general' if empty or tied (a tie is genuinely
+    ambiguous — no single topic)."""
+    if not counts:
+        return 'general'
+    ranked = counts.most_common()
+    top, top_count = ranked[0]
+    if len(ranked) > 1 and ranked[1][1] == top_count:
+        return 'general'
+    return top
+
+
+def _bucket_paths(paths, cwd, ignored_buckets):
+    """Count slugified first-content-bearing-segment buckets for file paths relative to cwd.
+    Container segments — dot-dirs (`.claude/`, `.github/`) and `_PASS_THROUGH_DIRS` — carry
+    layout, not topic, so they are descended past; a path through an ignored dir, outside cwd
+    (different drive, or ../-prefixed), or with no content-bearing segment (a bare dotfile) is
+    skipped. A filename segment uses its stem. CamelCase boundaries are hyphenated BEFORE
+    lowercasing so acronym runs survive intact (OpenMeteoAPI -> open-meteo-api, not
+    open-meteo-a-p-i)."""
+    counts = Counter()
+    for fp in paths:
+        if not fp:
+            continue
+        try:
+            rel = os.path.relpath(os.path.abspath(fp), cwd)
+        except ValueError:
+            continue  # different Windows drive — outside the project
+        rel = rel.replace('\\', '/')
+        if rel == '..' or rel.startswith('../'):
+            continue  # outside the project root
+        parts = [p for p in rel.split('/') if p and p != '.']
+        if not parts:
+            continue
+        i = 0
+        while i < len(parts) - 1 and (parts[i].startswith('.')
+                                      or parts[i].lower() in _PASS_THROUGH_DIRS):
+            if parts[i].lower() in ignored_buckets:
+                i = -1
+                break
+            i += 1
+        first = parts[i] if i >= 0 else ''
+        if not first or first.startswith('.'):
+            continue  # ignored dir on the descent, or nothing but dot-segments
+        raw = os.path.splitext(first)[0] if i == len(parts) - 1 else first
+        bucket = re.sub(r'(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])', '-', raw).lower()
+        if bucket in ignored_buckets:
+            continue
+        counts[bucket] += 1
+    return counts
+
+
+def _suggested_slug(paths, project_dir):
+    """Derive a topic slug from the session's edit footprint, bucketed by the first
+    content-bearing path segment relative to the project root (the last record's cwd — the digest may run from anywhere, so it
+    does NOT read os.getcwd() like the v4 subcommand did). Throwaway scratch dirs never represent
+    the topic. A heuristic: the skill body may override it."""
+    if not project_dir:
+        return 'general'
+    return _bucket_winner(_bucket_paths(paths, os.path.abspath(project_dir), {'.debug'}))
+
+
+# ---------------------------------------------------------------------------
+# Digest — the single scan pass + budgeted rendering
+# ---------------------------------------------------------------------------
+
+# `ballast: <hook-name> <sep> <clause>` up to the FIRST separator, where <sep> is an em dash or a
+# plain '--' (at least one hook emits '--' with a variable clause tail). Some real fires have no
+# separator at all ("⚓ ballast: principles loaded") — that's the genuine fallback case (tally by
+# the full line), not a regex bug to chase.
+_HOOK_FIRE_NAME_RE = re.compile(r'ballast:\s*(.+?)\s*(?:—|--)')
+# `git commit` output: "[branch 1a2b3c4] subject" — the sha + subject a Bash result exposes.
+_GIT_COMMIT_OUT_RE = re.compile(r'^\[\S+ ([0-9a-f]{7,40})\] (.+)$', re.MULTILINE)
+# The harness's interrupt marker, on a tool_result or as its own user line.
+_INTERRUPT_MARK = 'Request interrupted by user'
+# A record whose largest single content payload exceeds this is "oversized" (an ANOMALIES signal:
+# one Read/Bash result that alone dominates a context window). Measured on content length, not the
+# raw line — `load_lines` yields parsed dicts only.
+_OVERSIZE_CHARS = 50000
+# Bounds of the oversize probe (`_max_str_len`). Depth 5 is what the two real shapes need:
+# `toolUseResult.file.base64` (a PDF read) and `message.content[].source.data` (a pasted image).
+# The node budget caps how many CONTAINERS the probe descends into, so a pathological record can't
+# turn the scan super-linear.
+_OVERSIZE_DEPTH = 5
+_OVERSIZE_NODES = 2000
+# Per-side retention for a very long user prompt. >= 2x the 4096 per-prompt cap ceiling, so the
+# rendered head+tail elision is always computed from retained text, never from a lossy clip.
+_CLIP_KEEP = 8192
+_EDITING_TOOLS = ('Edit', 'Write', 'MultiEdit', 'NotebookEdit')
+# Timeline degradation ladder: (assistant snippet cap, tool-arg head cap, user per-prompt cap).
+# User cap degrades LAST and only when USER TURNS alone exceeds 40% of budget (see _build_digest);
+# 1024 is the floor — the section is the adjudication source and is never cut below it.
+_LADDER = ((280, 160, 4096), (120, 160, 4096), (120, 80, 4096), (120, 80, 2048), (120, 80, 1024))
+# The ladder's UNDEGRADED user cap — derived, so the two can never drift apart.
+_USER_CAP_MAX = _LADDER[0][2]
+_IDLE_GAP_SEC = 15 * 60
+
+
+def _parse_ts(ts):
+    """ISO timestamp -> epoch seconds (float), or None. Tolerates the trailing 'Z' and sub-second
+    precision beyond microseconds (not every Python build's fromisoformat accepts either)."""
+    if not ts or not isinstance(ts, str):
+        return None
+    t = ts.strip().replace('Z', '+00:00')
+    m = re.match(r'^(.*\.\d{6})\d*(.*)$', t)
+    if m:
+        t = m.group(1) + m.group(2)
+    try:
+        dt = datetime.datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+def _hhmm(ts):
+    """'HH:MM' (UTC) from an ISO timestamp, or '--:--'."""
+    if isinstance(ts, str) and len(ts) >= 16 and ts[10:11] == 'T':
+        return ts[11:16]
+    return '--:--'
+
+
+def _cut(s, cap):
+    """One-line, cap-length rendering of `s` (whitespace collapsed, ellipsis when cut)."""
+    s = re.sub(r'\s+', ' ', s or '').strip()
+    return s if len(s) <= cap else s[:cap].rstrip() + '…'
+
+
+def _clip(text):
+    """(head, tail, total_len) — a bounded retention of a user prompt. Retains 2x the cap ceiling
+    per side so a multi-megabyte paste can't hold the scan's memory hostage while every renderable
+    cap still cuts from real text."""
+    n = len(text)
+    if n <= 2 * _CLIP_KEEP:
+        return text, '', n
+    return text[:_CLIP_KEEP], text[-_CLIP_KEEP:], n
+
+
+def _render_clip(clip, cap):
+    """Render a clipped prompt at `cap` chars: verbatim when it fits, else middle-elided
+    head+tail with an explicit `[... elided N chars ...]` marker. Returns (text, was_elided)."""
+    head, tail, n = clip
+    if n <= cap:
+        return head, False
+    h = cap * 3 // 4
+    t = cap - h
+    tail_src = tail if tail else head
+    return f'{head[:h]}\n\n[... elided {n - h - t} chars ...]\n\n{tail_src[-t:]}', True
+
+
+def _max_str_len(obj, threshold):
+    """True if any string nested up to `_OVERSIZE_DEPTH` levels inside `obj` is longer than
+    `threshold`.
+
+    The oversized-record probe. It walks the PARSED record (never re-serializes it — that would
+    cost a copy of the transcript) and short-circuits on the first hit, with a node budget so a
+    pathological record can't turn the scan super-linear.
+
+    Strings are length-tested AT EXTEND TIME and only CONTAINERS go on the stack: pushing strings
+    onto a LIFO stack let the node budget starve them in a wide record (the last-pushed keys pop
+    first, so an oversized payload under an early key of a 2000+-key record was never reached).
+    The budget now bounds container descents, which is what the super-linear guard was ever about.
+    """
+    if isinstance(obj, str):
+        return len(obj) > threshold
+    stack, budget = [(obj, 0)], _OVERSIZE_NODES
+    while stack and budget > 0:
+        o, d = stack.pop()
+        budget -= 1
+        if d >= _OVERSIZE_DEPTH:
+            continue
+        if isinstance(o, dict):
+            values = o.values()
+        elif isinstance(o, list):
+            values = o[:64]
+        else:
+            continue
+        for v in values:
+            if isinstance(v, str):
+                if len(v) > threshold:
+                    return True
+            elif isinstance(v, (dict, list)):
+                stack.append((v, d + 1))
+    return False
+
+
+def _result_text(content, limit=4096):
+    """Bounded flatten of a tool_result content value — only the head matters (error heads,
+    interrupt markers, git-commit output), and the whole payload can be megabytes."""
+    if isinstance(content, str):
+        return content[:limit]
+    if isinstance(content, list):
+        parts, n = [], 0
+        for c in content:
+            s = c.get('text', '') if isinstance(c, dict) else str(c)
+            if not isinstance(s, str):
+                continue
+            parts.append(s[:limit])
+            n += len(s)
+            if n >= limit:
+                break
+        return ' '.join(parts)[:limit]
+    return '' if content is None else str(content)[:limit]
+
+
+_TOOL_ARG_KEYS = ('command', 'file_path', 'notebook_path', 'pattern', 'path', 'url', 'query',
+                  'prompt', 'args', 'description', 'skill', 'name', 'script')
+
+
+def _tool_arg(inp):
+    """The one representative argument of a tool call (first populated string among the known arg
+    keys), else a compact key list — enough to tell two calls of the same tool apart."""
+    if not isinstance(inp, dict):
+        return ''
+    for k in _TOOL_ARG_KEYS:
+        v = inp.get(k)
+        if isinstance(v, str) and v.strip():
+            return _cut(v, 400)
+    return ', '.join(sorted(inp)[:6])
+
+
+def _hook_fire_name(content):
+    """The `<name>` from a hook_system_message's `ballast: <name> — <clause>` segment, or None
+    (caller falls back to the full line)."""
+    if not isinstance(content, str):
+        return None
+    m = _HOOK_FIRE_NAME_RE.search(content)
+    return m.group(1).strip() if m else None
+
+
+def _scan(path):
+    """THE single pass. Walks the transcript once and returns every fact the digest renders.
+
+    Everything bounded on the way in: assistant snippets and tool args are stored at their maximum
+    renderable cap, tool results are read head-only, user prompts are clipped to `_CLIP_KEEP` per
+    side. So peak memory tracks the number of records, never the transcript's bytes.
+    """
+    s = {
+        'transcript': os.path.abspath(path), 'lines': 0, 'first_ts': '', 'last_ts': '',
+        'users': [], 'events': [], 'kinds': Counter(), 'tools': Counter(), 'tool_errors': Counter(),
+        'skills': Counter(), 'slash': Counter(), 'hooks': Counter(), 'agent_dispatch': Counter(),
+        'mcp': {}, 'edits': Counter(), 'commits': [], 'api_errors': [], 'interrupts': [],
+        'oversized': 0, 'compact_boundaries': 0, 'assistant_ids': set(), 'assistant_keyless': 0,
+        'usage': {}, 'usage_keyless': {}, 'drift': {}, 'chain': [], 'session_id': '',
+        'project_dir': '', 'edit_paths': [],
+    }
+    events, pending, seen_goals = s['events'], {}, set()
+    per_id = s['usage']            # message.id -> {'model': str, field: max-seen}
+    cur_user = 0
+
+    for d in load_lines(path):
+        if not isinstance(d, dict):
+            continue
+        s['lines'] += 1
+        ts = d.get('timestamp', '')
+        if isinstance(ts, str) and ts:
+            if not s['first_ts'] or ts < s['first_ts']:
+                s['first_ts'] = ts
+            if ts > s['last_ts']:
+                s['last_ts'] = ts
+        _observe_drift(s['drift'], d)
+        # One oversize probe per RECORD (not per rendered block): the payload that matters — a 12 MB
+        # PDF read, a pasted image set — rides fields the digest never renders, so measuring only
+        # rendered content would report zero on exactly the records worth flagging.
+        if _max_str_len(d, _OVERSIZE_CHARS):
+            s['oversized'] += 1
+        sid = d.get('sessionId')
+        if isinstance(sid, str) and _UUID_RE.fullmatch(sid) and sid not in s['chain']:
+            s['chain'].append(sid)
+        cwd = d.get('cwd')
+        if isinstance(cwd, str) and cwd:
+            s['project_dir'] = cwd
+
+        # Tool RESULTS pair BEFORE turn classification: one user line can be BOTH a genuine turn and
+        # the result that closes a pending tool_use — an AskUserQuestion ANSWER rides a tool_result
+        # block. Classifying first and `continue`ing left that tool_use pending forever, so its
+        # timeline row read `?` and it inflated `unpaired_tools` (a false ANOMALIES entry). Ordinary
+        # tool-result lines (which the turn gate drops) are unaffected: they pair here instead of at
+        # the tail of the loop, and nothing else in the pass depends on the order.
+        if d.get('type') == 'user':
+            rmsg = d.get('message')
+            rcontent = rmsg.get('content') if isinstance(rmsg, dict) else None
+            if isinstance(rcontent, list):
+                for c in rcontent:
+                    if not isinstance(c, dict) or c.get('type') != 'tool_result':
+                        continue
+                    head = _result_text(c.get('content'))
+                    ev = pending.pop(c.get('tool_use_id'), None)
+                    is_err = bool(c.get('is_error')) or head.lstrip().startswith('<tool_use_error>')
+                    if ev is not None:
+                        ev['done'] = True
+                        if is_err:
+                            ev['err'] = _cut(head, 120)
+                            s['tool_errors'][ev.get('n2', '?')] += 1
+                        if ev.get('git'):
+                            for sha, subject in _GIT_COMMIT_OUT_RE.findall(head):
+                                s['commits'].append((sha, _cut(subject, 100)))
+                    elif is_err:
+                        s['tool_errors']['?'] += 1
+                    if _INTERRUPT_MARK in head[:400]:
+                        s['interrupts'].append(cur_user)
+                        events.append({'k': 'interrupt', 'ep': _parse_ts(ts)})
+
+        turn = _user_turn(d)
+        if turn is not None:
+            kind, text = turn
+            if kind == 'goal':
+                key = text.strip()
+                if key in seen_goals:      # met=false / met=true bookends repeat the condition
+                    continue
+                seen_goals.add(key)
+            cur_user += 1
+            s['users'].append({'n': cur_user, 'ts': ts, 'kind': kind, 'clip': _clip(text)})
+            s['kinds'][kind] += 1
+            if kind == 'slash_command':
+                s['slash'][text.split()[0] if text.split() else text] += 1
+            events.append({'k': 'user', 't': _hhmm(ts), 'ep': _parse_ts(ts), 'n': cur_user,
+                           'kind': kind, 'prev': _cut(text, 100)})
+            if _INTERRUPT_MARK in text[:200]:
+                s['interrupts'].append(cur_user)
+                events.append({'k': 'interrupt', 'ep': _parse_ts(ts)})
+            continue
+
+        t = d.get('type')
+        if d.get('isCompactSummary') is True:
+            s['compact_boundaries'] += 1
+            events.append({'k': 'compact', 'ep': _parse_ts(ts)})
+            continue
+        if t == 'system':
+            st = d.get('subtype')
+            if st == 'compact_boundary':
+                s['compact_boundaries'] += 1
+                events.append({'k': 'compact', 'ep': _parse_ts(ts)})
+            elif st == 'api_error':
+                s['api_errors'].append(_cut(_text_from_content(d.get('content')), 160)
+                                       or 'api_error')
+            continue
+        if t == 'attachment':
+            att = d.get('attachment')
+            if isinstance(att, dict) and att.get('type') == 'hook_system_message':
+                content = att.get('content')
+                if isinstance(content, str) and content.strip():
+                    s['hooks'][_hook_fire_name(content) or content.strip()] += 1
+            continue
+
+        msg = d.get('message')
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get('content')
+
+        if t == 'assistant':
+            mid = msg.get('id')
+            if mid:
+                s['assistant_ids'].add(mid)
+            else:
+                s['assistant_keyless'] += 1
+            u = msg.get('usage')
+            if isinstance(u, dict):
+                cc = u.get('cache_creation')
+                cc5 = cc.get('ephemeral_5m_input_tokens', 0) or 0 if isinstance(cc, dict) else 0
+                cc1h = cc.get('ephemeral_1h_input_tokens', 0) or 0 if isinstance(cc, dict) else 0
+                if not isinstance(cc, dict):
+                    # No TTL breakdown (older records) — price the whole write at the 5m rate.
+                    cc5 = u.get('cache_creation_input_tokens', 0) or 0
+                vals = {'input': u.get('input_tokens', 0) or 0,
+                        'output': u.get('output_tokens', 0) or 0,
+                        'cache_create': u.get('cache_creation_input_tokens', 0) or 0,
+                        'cache_read': u.get('cache_read_input_tokens', 0) or 0,
+                        'cc_5m': cc5, 'cc_1h': cc1h}
+                model = msg.get('model') or '?'
+                if mid:
+                    # Dedup: one API response logs as several content-block lines repeating the
+                    # SAME usage — take the MAX per (message.id, field), never the sum.
+                    slot = per_id.setdefault(mid, {'model': model, **{k: 0 for k in vals}})
+                    for k, v in vals.items():
+                        if v > slot[k]:
+                            slot[k] = v
+                else:
+                    slot = s['usage_keyless'].setdefault(model, {k: 0 for k in vals})
+                    for k, v in vals.items():
+                        slot[k] += v
+            if not isinstance(content, list):
+                continue
+            for c in content:
+                if not isinstance(c, dict):
+                    continue
+                ctype = c.get('type')
+                if ctype == 'text':
+                    txt = c.get('text', '')
+                    if txt.strip():
+                        if txt.lstrip()[:40].startswith('API Error'):
+                            s['api_errors'].append(_cut(txt, 160))
+                        events.append({'k': 'text', 't': _hhmm(ts), 'ep': _parse_ts(ts),
+                                       's': _cut(txt, _LADDER[0][0])})
+                elif ctype == 'tool_use':
+                    name = c.get('name', '?')
+                    inp = c.get('input')
+                    s['tools'][name] += 1
+                    server, tool = _split_mcp(name)
+                    if server is not None:
+                        m = s['mcp'].setdefault(server, {'tools': set(), 'calls': 0})
+                        m['tools'].add(tool)
+                        m['calls'] += 1
+                    arg = _tool_arg(inp)
+                    if name in _EDITING_TOOLS:
+                        fp = (inp or {}).get('file_path') or (inp or {}).get('notebook_path') or ''
+                        if isinstance(fp, str) and fp:
+                            s['edits'][fp] += 1
+                            s['edit_paths'].append(fp)
+                    if name in ('Agent', 'Task'):
+                        atype = (inp or {}).get('subagent_type') or (inp or {}).get('name') or '?'
+                        s['agent_dispatch'][atype] += 1
+                        model = (inp or {}).get('model')
+                        ev = {'k': 'agent', 't': _hhmm(ts), 'ep': _parse_ts(ts),
+                              'n2': f'{atype}|{model}' if isinstance(model, str) and model else atype,
+                              'a': arg}
+                    elif name in ('Skill', 'Workflow'):
+                        label = (inp or {}).get('skill') or (inp or {}).get('name') or name
+                        s['skills'][label] += 1
+                        ev = {'k': 'skill', 't': _hhmm(ts), 'ep': _parse_ts(ts), 'n2': label,
+                              'a': (inp or {}).get('args') or arg}
+                    else:
+                        ev = {'k': 'tool', 't': _hhmm(ts), 'ep': _parse_ts(ts), 'n2': name,
+                              'a': arg, 'done': False, 'err': None}
+                    events.append(ev)
+                    bid = c.get('id')
+                    if bid is not None:
+                        pending[bid] = ev
+                        # Detect against the RAW command, never the 400-char rendered `arg`: a real
+                        # compound (`git add <many paths> && git commit -m …`) puts the commit verb
+                        # well past the cap, and the Commits table would silently miss it.
+                        if name == 'Bash':
+                            raw_cmd = (inp or {}).get('command')
+                            if isinstance(raw_cmd, str) and 'git commit' in raw_cmd:
+                                ev['git'] = True
+            continue
+
+    # Idle gaps — a post-pass over the ordered events, so a >15 min hole in the session reads as a
+    # break rather than as two adjacent lines pretending to be consecutive work.
+    with_idle, prev = [], None
+    for ev in events:
+        ep = ev.get('ep')
+        if ep is not None and prev is not None and ep - prev > _IDLE_GAP_SEC:
+            with_idle.append({'k': 'idle', 'm': int((ep - prev) // 60)})
+        if ep is not None:
+            prev = ep
+        with_idle.append(ev)
+    s['events'] = with_idle
+    s['session_id'] = _session_uuid_from_path(path)
+    s['assistant_responses'] = len(s['assistant_ids']) + s['assistant_keyless']
+    s['transcript_bytes'] = os.path.getsize(path) if os.path.exists(path) else 0
+    s['suggested_slug'] = _suggested_slug(s['edit_paths'], s['project_dir'])
+    s['unpaired_tools'] = len(pending)
+
+    # Subagent sidecars (own files, own passes) — the v4 `subagents` roster, folded into INVENTORY.
+    agents = []
+    for sidedir in _subagent_dirs(path, [u for u in s['chain'] if u != s['session_id']]):
+        agents.extend(_collect_subagents(sidedir))
+    s['agents'] = agents
+    s['subagent_tokens'] = sum(a['tokens'] for a in agents)
+
+    # Per-model totals, deduped by message.id (MAX per field) then summed under each model.
+    models = {}
+    for slot in per_id.values():
+        m = models.setdefault(slot['model'], {k: 0 for k in
+                                              ('input', 'output', 'cache_create', 'cache_read',
+                                               'cc_5m', 'cc_1h')})
+        for k in m:
+            m[k] += slot[k]
+    for model, slot in s['usage_keyless'].items():
+        m = models.setdefault(model, {k: 0 for k in slot})
+        for k in slot:
+            m[k] += slot[k]
+    s['models'] = models
+    return s
+
+
+# --- section renderers (module-level so a failure in one is isolated — and so a test can force
+# --- one to raise and assert the fail-open marker) ------------------------------------------
+
+def _model_rows(scan):
+    """[(model, tokens_dict, est_cost_usd|None)] sorted by total tokens desc."""
+    rows = []
+    for model, tok in scan['models'].items():
+        total = tok['input'] + tok['output'] + tok['cache_create'] + tok['cache_read']
+        rows.append((model, tok, total, _cost_usd(model, tok)))
+    rows.sort(key=lambda r: -r[2])
+    return rows
+
+
+def _sec_session(scan, caps):
+    total_cost = sum(c for _, _, _, c in _model_rows(scan) if c is not None)
+    dur = ''
+    a, b = _parse_ts(scan['first_ts']), _parse_ts(scan['last_ts'])
+    if a is not None and b is not None:
+        mins = int((b - a) // 60)
+        dur = f' ({mins // 60}h {mins % 60}m)'
+    models = ', '.join(f'{_short_model(m)} {t:,} tok'
+                       + (f' ~${c:.2f}' if c is not None else ' (unpriced)')
+                       for m, _, t, c in _model_rows(scan)[:4]) or '—'
+    kinds = ', '.join(f'{k} {n}' for k, n in scan['kinds'].most_common()) or '—'
+    drift_rows = _drift_rows(scan['drift'])
+    project = os.path.basename((scan['project_dir'] or '').rstrip('\\/')) or '?'
+    drift_note = 'none' if not drift_rows else f'{len(drift_rows)} unknown shape(s) — see ANOMALIES'
+    lines = [
+        f"- **Project:** {project} (`{scan['project_dir'] or '?'}`)",
+        f"- **Transcript:** `{scan['transcript']}` — {scan['lines']:,} lines, "
+        f"{scan['transcript_bytes'] / 1048576:.1f} MB",
+        f"- **Window (UTC):** {scan['first_ts'] or '?'} → {scan['last_ts'] or '?'}{dur}",
+        f'- **Models:** {models}',
+        f'- **Est. cost:** ~${total_cost:.2f} (approximate, ccusage-aligned snapshot)',
+        f"- **User turns:** {len(scan['users'])} ({kinds})",
+        f"- **Assistant responses:** {scan['assistant_responses']}",
+        f"- **Tool calls:** {sum(scan['tools'].values())} "
+        f"({sum(scan['tool_errors'].values())} errors)",
+        f"- **Subagents:** {len(scan['agents'])} dispatched, {scan['subagent_tokens']:,} tokens",
+        f"- **Compact boundaries:** {scan['compact_boundaries']}",
+        f"- **Suggested slug:** {scan['suggested_slug']}",
+        f'- **Drift:** {drift_note}',
+    ]
+    if caps.get('focus'):
+        lines.append(f"- **Focus:** {caps['focus']}")
+    return '\n'.join(lines)
+
+
+def _sec_user_turns(scan, caps):
+    """VERBATIM and protected: the adjudication source. Harness-injected <system-reminder>/ide_*
+    spans are stripped from the DISPLAYED text; nothing the user typed is paraphrased or dropped."""
+    cap = caps['user']
+    out = ['_Verbatim user input — the adjudication source. Injected harness spans '
+           '(<system-reminder>, ide_*) stripped; nothing else altered._', '']
+    elided = 0
+    for u in scan['users']:
+        text, was = _render_clip(u['clip'], cap)
+        elided += 1 if was else 0
+        out.append(f"### U{u['n']} [{_hhmm(u['ts'])}] ({u['kind']})")
+        out.append('')
+        out.append(text if text.strip() else '_(empty)_')
+        out.append('')
+    caps['stats']['user_prompts_truncated'] = elided
+    if not scan['users']:
+        out.append('_No user turns in this transcript._')
+    return '\n'.join(out)
+
+
+def _event_line(ev, caps):
+    k = ev['k']
+    if k == 'compact':
+        return '--- COMPACT ---'
+    if k == 'idle':
+        return f"[idle ~{ev['m']}m]"
+    if k == 'interrupt':
+        return '[interrupted]'
+    t = ev.get('t', '--:--')
+    if k == 'user':
+        return f"[{t}] U{ev['n']} ({ev['kind']}) {ev['prev']}"
+    if k == 'text':
+        return f"[{t}] {_cut(ev['s'], caps['assistant'])}"
+    if k == 'agent':
+        return f"[{t}] [Agent: {ev['n2']} → \"{_cut(ev['a'], caps['tool_arg'])}\"]"
+    if k == 'skill':
+        return f"[{t}] [Skill: {ev['n2']} {_cut(ev['a'], caps['tool_arg'])}]".rstrip()
+    status = 'ERR' if ev.get('err') else ('ok' if ev.get('done') else '?')
+    line = f"[{t}] [Tool: {ev['n2']} → {_cut(ev['a'], caps['tool_arg'])} ({status})]"
+    if ev.get('err'):
+        line += f" {ev['err']}"
+    return line
+
+
+def _sec_timeline(scan, caps):
+    lines = [_event_line(ev, caps) for ev in scan['events']]
+    body = '\n'.join(lines)
+    caps['stats']['records_truncated'] = 0
+    limit = caps.get('timeline_max')
+    if limit is not None and len(body.encode('utf-8')) > limit:
+        # Last resort after the cap ladder: keep the session's opening and its ending (where the
+        # verdict-bearing work lives) and elide the middle, reporting the count in `truncation`.
+        keep = max(10, limit // 100)
+        head_n, tail_n = keep * 3 // 5, keep - keep * 3 // 5
+        while head_n + tail_n < len(lines):
+            head = lines[:head_n]
+            tail = lines[len(lines) - tail_n:]
+            dropped = len(lines) - head_n - tail_n
+            body = '\n'.join(head + [f'[... {dropped} timeline events elided ...]'] + tail)
+            if len(body.encode('utf-8')) <= limit:
+                break
+            head_n, tail_n = head_n * 2 // 3, tail_n * 2 // 3
+            if head_n + tail_n < 4:
+                body = f'[... {len(lines)} timeline events elided ...]'
+                dropped = len(lines)
+                break
+        caps['stats']['records_truncated'] = max(0, len(lines) - head_n - tail_n)
+    return '```\n' + body + '\n```' if body else '_No events._'
+
+
+def _table(header, rows, cap=25):
+    """A markdown table with a labeled remainder so a truncated list still reconciles."""
+    if not rows:
+        return '_none_'
+    out = ['| ' + ' | '.join(header) + ' |', '|' + '|'.join(['---'] * len(header)) + '|']
+    for r in rows[:cap]:
+        out.append('| ' + ' | '.join(str(x) for x in r) + ' |')
+    if len(rows) > cap:
+        out.append(f'| _+{len(rows) - cap} more_ | ' + ' | '.join([''] * (len(header) - 1)) + ' |')
+    return '\n'.join(out)
+
+
+def _sec_inventory(scan, caps):
+    parts = ['**Tools**', '', _table(['Tool', 'Calls', 'Errors'],
+                                     [(n, c, scan['tool_errors'].get(n, 0))
+                                      for n, c in scan['tools'].most_common()], cap=30), '']
+    parts += ['**Skills invoked**', '',
+              _table(['Skill', 'Count'], scan['skills'].most_common()), '']
+    agent_rows = {}
+    for a in scan['agents']:
+        key = (a['agent_type'], _short_model(a['model']))
+        slot = agent_rows.setdefault(key, [0, 0])
+        slot[0] += 1
+        slot[1] += a['tokens']
+    rows = sorted(([k[0], k[1], v[0], f'{v[1]:,}'] for k, v in agent_rows.items()),
+                  key=lambda r: -int(r[3].replace(',', '')))
+    parts += ['**Agents dispatched** '
+              f"(main-transcript dispatch calls: {sum(scan['agent_dispatch'].values())})", '',
+              _table(['Agent type', 'Model', 'Count', 'Tokens'], rows, cap=_AGENT_SAMPLE_CAP), '']
+    parts += ['**MCP tools**', '',
+              _table(['Server', 'Distinct tools', 'Calls'],
+                     sorted(((srv, len(v['tools']), v['calls']) for srv, v in scan['mcp'].items()),
+                            key=lambda r: -r[2])), '']
+    parts += ['**Hooks observed**', '',
+              _table(['Hook', 'Fires'], scan['hooks'].most_common()), '']
+    parts += ['**Slash commands**', '',
+              _table(['Command', 'Count'], scan['slash'].most_common()), '']
+    return '\n'.join(parts)
+
+
+def _sec_files(scan, caps):
+    rows = [(p, c) for p, c in scan['edits'].most_common()]
+    parts = [_table(['File', 'Edits'], rows, cap=60), '']
+    if scan['commits']:
+        parts += ['**Commits**', '',
+                  _table(['SHA', 'Subject'], scan['commits'], cap=40)]
+    else:
+        parts += ['**Commits:** _none observed in Bash results_']
+    return '\n'.join(parts)
+
+
+def _sec_anomalies(scan, caps):
+    parts = []
+    if scan['tool_errors']:
+        parts += ['**Tool errors**', '',
+                  _table(['Tool', 'Errors'], scan['tool_errors'].most_common()), '']
+    else:
+        parts += ['**Tool errors:** none', '']
+    if scan['interrupts']:
+        refs = ', '.join(f'U{n}' for n in scan['interrupts'][:40])
+        parts += [f"**Interruptions:** {len(scan['interrupts'])} (after {refs})", '']
+    else:
+        parts += ['**Interruptions:** none', '']
+    if scan['api_errors']:
+        parts += [f"**API/stream errors:** {len(scan['api_errors'])}", '']
+        parts += ['- ' + e for e in scan['api_errors'][:10]] + ['']
+    else:
+        parts += ['**API/stream errors:** none', '']
+    rows = _drift_rows(scan['drift'])
+    if rows:
+        parts += ['**Unknown transcript shapes (drift)**', '',
+                  _table(['Axis', 'Value', 'Count'], [(k, v, c) for (k, v), c in rows]), '']
+    else:
+        parts += ['**Unknown transcript shapes (drift):** none', '']
+    parts += [f"**Oversized records** (a field >{_OVERSIZE_CHARS:,} chars — a PDF/image payload or "
+              f"a giant tool result): {scan['oversized']}"]
+    if scan['unpaired_tools']:
+        parts += ['', f"**Tool calls with no recorded result:** {scan['unpaired_tools']}"]
+    return '\n'.join(parts)
+
+
+_SECTIONS = (
+    ('SESSION', '_sec_session'),
+    ('USER TURNS', '_sec_user_turns'),
+    ('TIMELINE', '_sec_timeline'),
+    ('INVENTORY', '_sec_inventory'),
+    ('FILES TOUCHED', '_sec_files'),
+    ('ANOMALIES', '_sec_anomalies'),
+)
+
+
+def _render_body(scan, caps):
+    """Render every section. FAIL-OPEN: a section generator that raises degrades to a
+    `[section unavailable: …]` marker — a broken section never costs the other five, and never
+    a non-zero exit. Dispatch goes through globals() so a test can force one to raise."""
+    out = []
+    for title, fname in _SECTIONS:
+        try:
+            body = globals()[fname](scan, caps)
+        except Exception as e:                      # noqa: BLE001 — fail-open is the contract
+            body = f'[section unavailable: {e}]'
+        out.append(f'## {title}\n\n{body}\n')
+    return '\n'.join(out)
+
+
+def _compose(manifest, body, slug):
+    """digest.md = title + a fenced copy of the manifest + the section bodies."""
+    return (f'# Session digest — {slug}\n\n```json\n'
+            + json.dumps(manifest, indent=2, sort_keys=False, default=str)
+            + '\n```\n\n' + body)
+
+
+def _build_digest(scan, budget, manifest):
+    """Two-pass budgeted render. Pass 1 measures at default caps; pass 2 walks the degradation
+    ladder (assistant snippet → tool-arg head → user per-prompt cap LAST, and only when USER TURNS
+    alone exceeds 40% of budget). If the file still exceeds the 1.25x hard ceiling after the ladder,
+    the TIMELINE is middle-elided to fit — USER TURNS is never cut below its 1024-char floor, and
+    overflow past the ceiling is allowed for that section alone."""
+    ceiling = int(budget * 1.25)
+    user_full = None
+    text, used = None, None
+    for a_cap, t_cap, u_cap in _LADDER:
+        caps = {'assistant': a_cap, 'tool_arg': t_cap, 'user': u_cap, 'timeline_max': None,
+                'focus': manifest.get('focus'), 'stats': {}}
+        if u_cap < _USER_CAP_MAX:
+            if user_full is None:
+                probe = dict(caps, user=_USER_CAP_MAX, stats={})
+                user_full = len(_sec_user_turns(scan, probe).encode('utf-8'))
+            if user_full <= budget * 0.40:
+                continue   # the protected section isn't the bloat — don't degrade it
+        text, used = _finalize(scan, caps, manifest), caps
+        if len(text.encode('utf-8')) <= budget:
+            break
+    size = len(text.encode('utf-8'))
+    if size > ceiling:
+        timeline = len(_sec_timeline(scan, used).encode('utf-8'))
+        used['timeline_max'] = max(1000, budget - (size - timeline))
+        text = _finalize(scan, used, manifest)
+    manifest['truncation'].update({
+        'budget': budget,
+        'records_truncated': used['stats'].get('records_truncated', 0),
+        'user_prompts_truncated': used['stats'].get('user_prompts_truncated', 0),
+    })
+    return _finalize(scan, used, manifest), used
+
+
+def _finalize(scan, caps, manifest):
+    """Render body + the fenced manifest copy, converging `truncation.digest_bytes` on the file's
+    own byte count (the value is inside the file it measures — a 3-step fixpoint settles it) and
+    writing the settled count back onto `manifest` so digest.md and manifest.json agree."""
+    body = _render_body(scan, caps)
+    trunc = manifest.setdefault('truncation', {})
+    text = _compose(manifest, body, scan['suggested_slug'])
+    for _ in range(3):
+        n = len(text.encode('utf-8'))
+        if trunc.get('digest_bytes') == n:
+            break
+        trunc['digest_bytes'] = n
+        text = _compose(manifest, body, scan['suggested_slug'])
+    return text
+
+
+def _manifest(scan, focus, resolved_via, elapsed):
+    models = {}
+    total_cost = 0.0
+    for model, tok, _, cost in _model_rows(scan):
+        models[model] = {'input': tok['input'], 'output': tok['output'],
+                         'cache_read': tok['cache_read'], 'cache_create': tok['cache_create'],
+                         'est_cost_usd': round(cost, 4) if cost is not None else None}
+        if cost is not None:
+            total_cost += cost
+    a, b = _parse_ts(scan['first_ts']), _parse_ts(scan['last_ts'])
+    return {
+        'schema': 5,
+        'transcript': scan['transcript'],
+        'session_id': scan['session_id'],
+        'project_dir': scan['project_dir'],
+        'resolved_via': resolved_via,
+        'generated_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        'transcript_lines': scan['lines'],
+        'transcript_bytes': scan['transcript_bytes'],
+        'first_ts': scan['first_ts'],
+        'last_ts': scan['last_ts'],
+        'wall_minutes': round((b - a) / 60.0, 1) if (a is not None and b is not None) else None,
+        'user_turns': {'total': len(scan['users']), **dict(scan['kinds'])},
+        'assistant_responses': scan['assistant_responses'],
+        'tool_calls_total': sum(scan['tools'].values()),
+        'subagents': {'count': len(scan['agents']), 'tokens': scan['subagent_tokens']},
+        'compact_boundaries': scan['compact_boundaries'],
+        'models': models,
+        'total_est_cost_usd': round(total_cost, 4),
+        'suggested_slug': scan['suggested_slug'],
+        'git_window': {'since': scan['first_ts'], 'until': scan['last_ts']},
+        'truncation': {'budget': 0, 'digest_bytes': 0, 'records_truncated': 0,
+                       'user_prompts_truncated': 0},
+        'focus': focus,
+        'digest_generation_seconds': elapsed,
+    }
+
+
+def _guard_out_dir(out_dir, transcript):
+    """Bounded-write rule (ported from v4 `bundle`): create `out_dir` if absent; refuse (exit 2) a
+    non-empty dir with no manifest.json, or one whose manifest names a DIFFERENT transcript — never
+    silently overwrite another session's digest. A parse failure counts as a mismatch."""
     if os.path.exists(out_dir) and not os.path.isdir(out_dir):
         print(f'--out path exists and is not a directory: {out_dir}', file=sys.stderr)
         sys.exit(2)
-    manifest_path = os.path.join(out_dir, 'manifest.json')
     if os.path.isdir(out_dir):
         existing = os.listdir(out_dir)
         if existing and 'manifest.json' not in existing:
@@ -1699,213 +1736,112 @@ def bundle(path, out_dir):
                   f'(pass an empty/new dir, or a dir this tool already wrote)', file=sys.stderr)
             sys.exit(2)
         if 'manifest.json' in existing:
-            # E4: a prior manifest.json only licenses the re-run if it belongs to THIS
-            # transcript — otherwise this would silently overwrite a different transcript's
-            # bundle. Tolerate a parse failure by treating it as foreign (refuse) rather than
-            # risking a false "same transcript" match.
             try:
-                with open(manifest_path, encoding='utf-8') as f:
-                    prior_transcript = json.load(f).get('transcript')
+                with open(os.path.join(out_dir, 'manifest.json'), encoding='utf-8') as f:
+                    prior = json.load(f).get('transcript')
             except (OSError, ValueError):
-                prior_transcript = None
-            if prior_transcript != os.path.abspath(path):
-                print(f'{out_dir} already holds a bundle for a different transcript '
-                      f'({prior_transcript!r}) — pass a fresh --out', file=sys.stderr)
+                prior = None
+            if prior != os.path.abspath(transcript):
+                print(f'{out_dir} already holds a digest for a different transcript ({prior!r}) '
+                      f'— pass a fresh --out', file=sys.stderr)
                 sys.exit(2)
     else:
         os.makedirs(out_dir, exist_ok=True)
 
-    files_meta = {}
-    status_lines = []
-    failed = []
-    for name, func in _BUNDLE_DUMPS:
-        buf = io.StringIO()
-        dump_file = os.path.join(out_dir, f'{name}.md')
-        try:
-            with contextlib.redirect_stdout(buf):
-                func(path)
-            text = buf.getvalue()
-            with open(dump_file, 'w', encoding='utf-8') as f:
-                f.write(text)
-            lines = text.count('\n')
-            files_meta[name] = {'file': f'{name}.md', 'lines': lines, 'status': 'ok'}
-            status_lines.append(f'{name}: ok ({lines} lines)')
-        except Exception as e:
-            failed.append(name)
-            # E3: keep file state honest with the manifest — a PREVIOUS run's file must not
-            # survive under an "error" status, since a consumer honoring the manifest would
-            # otherwise pick up good-looking-but-unaccounted data. Best-effort: a delete failure
-            # here must not mask the original dump failure.
-            try:
-                if os.path.exists(dump_file):
-                    os.remove(dump_file)
-            except OSError:
-                pass
-            files_meta[name] = {'file': f'{name}.md', 'lines': 0, 'status': 'error', 'error': str(e)}
-            status_lines.append(f'{name}: error — {e}')
 
-    # Metrics computed once here (independent of per-dump success/failure above) and shared
-    # between the manifest and the final stdout summary line — D1's shared-counting-path
-    # requirement for user_turns (must equal what `user-msgs` itself emits). E2: guarded so a
-    # failure here still lets the manifest land (see docstring) instead of stranding the dumps
-    # already written above with no manifest.json at all.
-    metrics_error = None
-    try:
-        transcript_lines = _count_lines(path)
-        user_turns = sum(1 for _ in _user_msg_entries(path))
-        lo, hi = _time_window(path)
-        summaries, boundaries = _compact_markers(path)
-        compacted = bool(summaries or boundaries)
-        metrics = {
-            'transcript_lines': transcript_lines,
-            'user_turns': user_turns,
-            'time_window': [lo or '', hi or ''],
-            'compacted': compacted,
-        }
-    except Exception as e:
-        metrics_error = str(e)
-        metrics = {
-            'transcript_lines': None,
-            'user_turns': None,
-            'time_window': None,
-            'compacted': None,
-        }
+def digest(out_dir=None, session_id=None, transcript=None, budget=120000, focus=None):
+    """One-pass session digest -> <out>/digest.md + <out>/manifest.json. Exit 0 on success.
 
-    manifest = {
-        'schema': 1,
-        'transcript': os.path.abspath(path),
-        'generated_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        'files': files_meta,
-        'metrics': metrics,
-    }
-    if metrics_error is not None:
-        manifest['metrics_error'] = metrics_error
-    with open(manifest_path, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, indent=2)
-
-    print(manifest_path)
-    for line in status_lines:
-        print(line)
-    if metrics_error is not None:
-        print(f'metrics unavailable: {metrics_error}')
+    Transcript resolution: `--transcript` wins; else the `resolve` logic (session id / env —
+    an explicit `--id` accepts a unique prefix and fails loudly rather than falling back;
+    cwd-newest only when no id was given). `--out` defaults to a per-session cache dir, so the bounded-write
+    guard never trips in normal use while still protecting an explicit shared dir.
+    """
+    import time
+    t0 = time.perf_counter()
+    # `--id` doubles as a transcript path: one documented flag serves both the live-session case and
+    # a bench/scratch run against a copied .jsonl, so the skill body needs no second flag.
+    if not transcript and session_id and (session_id.endswith('.jsonl')
+                                          or os.path.isfile(session_id)):
+        transcript, session_id = session_id, None
+    if transcript:
+        path, via = transcript, 'explicit'
     else:
-        print(f'lines={transcript_lines} user_turns={user_turns} '
-              f'compacted={"yes" if compacted else "no"} window={lo or "?"}..{hi or "?"}')
+        r = _resolve_transcript(session_id)
+        path, via = r['live'], r['via']
+        if path is None:
+            print(r['error'] or 'could not resolve a transcript (no CLAUDE_CODE_SESSION_ID, '
+                  'no --id/--transcript, and no session .jsonl under the cwd-derived projects dir)',
+                  file=sys.stderr)
+            sys.exit(2)
+    if not os.path.exists(path):
+        print(f'Transcript not found: {path}', file=sys.stderr)
+        sys.exit(2)
+    if not out_dir:
+        out_dir = os.path.join(os.path.expanduser('~'), '.claude', '.cache', 'ballast', 'digest',
+                               _session_uuid_from_path(path))
+    _guard_out_dir(out_dir, path)
 
-    if failed:
-        print(f'{len(failed)} dump(s) failed: {", ".join(failed)}', file=sys.stderr)
-    if metrics_error is not None:
-        print(f'metrics computation failed: {metrics_error}', file=sys.stderr)
-    if failed or metrics_error is not None:
-        sys.exit(1)
+    scan = _scan(path)
+    manifest = _manifest(scan, focus, via, None)
+    text, caps = _build_digest(scan, budget, manifest)
+    # Stamp the elapsed time and re-render once so the FENCED copy in digest.md is byte-identical
+    # to manifest.json — the fixpoint in `_finalize` re-settles `digest_bytes` around the change.
+    manifest['digest_generation_seconds'] = round(time.perf_counter() - t0, 3)
+    text = _finalize(scan, caps, manifest)
+    digest_path = os.path.join(out_dir, 'digest.md')
+    with open(digest_path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(text)
+    with open(os.path.join(out_dir, 'manifest.json'), 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, indent=2, default=str)
+    print(digest_path)
+    print(f"lines={scan['lines']} user_turns={len(scan['users'])} "
+          f"digest_bytes={manifest['truncation']['digest_bytes']} budget={budget} "
+          f"seconds={manifest['digest_generation_seconds']}")
     sys.exit(0)
 
 
-def resolve():
-    """Print the current session's live transcript path + any PreCompact archives.
-
-    Resolves the session UUID from the CLAUDE_CODE_SESSION_ID env var (set by Claude
-    Code), so the skill can find "its own" transcript and backups deterministically —
-    no UUID guessing, no cwd-encoding. Takes NO transcript-path argument.
-
-    Output (stdout):
-        UUID: <uuid>
-        LIVE: <path or (not found)>
-        ARCHIVES (oldest->newest): one indented path per line, or "ARCHIVES: (none)"
-    """
-    import glob as _glob
-    uuid = os.environ.get('CLAUDE_CODE_SESSION_ID', '').strip()
-    if not uuid:
-        print('ERROR: CLAUDE_CODE_SESSION_ID not set — fall back to the manual transcript search',
-              file=sys.stderr)
-        sys.exit(1)
-    home = os.path.expanduser('~')
-    live = _glob.glob(os.path.join(home, '.claude', 'projects', '*', f'{uuid}.jsonl'))
-    # Archive filenames are "<timestamp>_<trigger>_<uuid>.jsonl"; the timestamp prefix
-    # sorts chronologically, so a plain sort gives oldest->newest.
-    archives = sorted(_glob.glob(os.path.join(home, '.claude', 'compact-backups', f'*_{uuid}.jsonl')))
-    print(f'UUID: {uuid}')
-    print(f'LIVE: {live[0] if live else "(not found)"}')
-    if archives:
-        print('ARCHIVES (oldest->newest):')
-        for a in archives:
-            print(f'  {a}')
-    else:
-        print('ARCHIVES: (none)')
-
-
-SUBCOMMANDS = {
-    'compact-check': compact_check,
-    'time-window': time_window,
-    'user-msgs': user_msgs,
-    'invocations': invocations,
-    'edits': edits,
-    'assistant-text': assistant_text,
-    'subagents': subagents,
-    'tool-breakdown': tool_breakdown,
-    'topic-slug': topic_slug,
-    'line-count': line_count,
-    'stats': stats,
-    'drift': drift,
-    'hook-fires': hook_fires,
-    # 'bundle' is deliberately NOT in this dict — it takes an extra `--out <dir>` argument that
-    # this single-arg `SUBCOMMANDS[sub](path)` dispatch can't express, so main() special-cases it
-    # the same way it already special-cases `resolve` (no transcript-path arg).
-}
-
-
 def main():
+    # Three subcommands, each with its own argument shape: `resolve` takes none, `digest` takes
+    # flags only, `drift` takes exactly a transcript path.
     if len(sys.argv) < 2:
         print(__doc__, file=sys.stderr)
         sys.exit(2)
     sub = sys.argv[1]
-    # `resolve` takes no transcript-path arg — it discovers paths from the env var.
     if sub == 'resolve':
         resolve()
         return
-    if len(sys.argv) < 3:
+    if sub == 'digest':
+        args, kw = sys.argv[2:], {}
+        flags = {'--out': 'out_dir', '--id': 'session_id', '--transcript': 'transcript',
+                 '--budget': 'budget', '--focus': 'focus'}
+        i = 0
+        while i < len(args):
+            key = flags.get(args[i])
+            if key and i + 1 < len(args):
+                kw[key] = args[i + 1]
+                i += 2
+            else:
+                print(f'Unknown or incomplete digest argument: {args[i]}', file=sys.stderr)
+                sys.exit(2)
+        if 'budget' in kw:
+            try:
+                kw['budget'] = int(kw['budget'])
+            except ValueError:
+                print('--budget must be an integer byte count', file=sys.stderr)
+                sys.exit(2)
+        digest(**kw)
+        return
+    if sub != 'drift' or len(sys.argv) < 3:
+        print(f'Unknown subcommand: {sub}' if sub != 'drift' else 'missing transcript path',
+              file=sys.stderr)
         print(__doc__, file=sys.stderr)
         sys.exit(2)
     path = sys.argv[2]
-
-    # `bundle` is deliberately not in SUBCOMMANDS (see the dict's comment above) — let it through
-    # the unknown-subcommand check here so it reaches its own dispatch below.
-    if sub != 'bundle' and sub not in SUBCOMMANDS:
-        print(f'Unknown subcommand: {sub}', file=sys.stderr)
-        print(__doc__, file=sys.stderr)
-        sys.exit(2)
-    # Shared existence check (E5): both the bundle branch and the generic dispatch below need
-    # it — hoisted once above the branching rather than duplicated per branch.
     if not os.path.exists(path):
         print(f'Transcript not found: {path}', file=sys.stderr)
         sys.exit(2)
-
-    if sub == 'bundle':
-        # `bundle` needs a second positional-ish arg (`--out <dir>`) that the generic
-        # SUBCOMMANDS[sub](path) dispatch below can't carry — parsed here, mirroring `resolve`'s
-        # special-casing above.
-        out_dir = None
-        args = sys.argv[3:]
-        i = 0
-        while i < len(args):
-            if args[i] == '--out' and i + 1 < len(args):
-                out_dir = args[i + 1]
-                i += 2
-            else:
-                i += 1
-        if not out_dir:
-            print('bundle requires --out <dir>', file=sys.stderr)
-            sys.exit(2)
-        bundle(path, out_dir)
-        return
-
-    if sub in ('topic-slug', 'stats'):
-        # These two accept optional extra args (E5: through real parameters, not sys.argv reads
-        # inside the functions themselves) — forward the CLI's extras through positionally.
-        SUBCOMMANDS[sub](path, *sys.argv[3:])
-        return
-
-    SUBCOMMANDS[sub](path)
+    drift(path)
 
 
 if __name__ == '__main__':

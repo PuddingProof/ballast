@@ -11,33 +11,27 @@
 # wrong. The injected text is a pointer-stub: the full protocol lives in the plan-handoff skill,
 # keeping this injection lean (durable-docs: one canonical home, reminders fire point-of-use).
 #
-# CHIP LIFECYCLE (statusline mode-indicator, 2026-07-11 build): unlike freehand/autopilot's
-# keyword-arm (which needs a pending→adjudicate→confirm dance because a regex can't tell USING a
-# word from MENTIONING it), plan approval has no ambiguity to adjudicate — ExitPlanMode firing
-# successfully in PostToolUse literally IS the user approving the plan. So we raise the "exec" chip
-# CONFIRMED directly, no pending stage. The chip is lowered by the model at hand-back time (the
-# `ballast-mode clear exec --session <sid>` instruction appended to the injected text below); if
-# that's ever missed, the renderer's own 24h confirmed-chip TTL is the staleness backstop (never
-# relied on as the primary mechanism — the explicit clear is).
+# CHIP LIFECYCLE (statusline mode-indicator): a successful ExitPlanMode in PostToolUse literally IS
+# the user approving the plan — nothing to adjudicate — so the "exec" chip is raised CONFIRMED
+# directly, with no pending stage. The model lowers it at hand-back via the `ballast-mode clear exec
+# --session <sid>` instruction appended to the injected text below; the renderer's 24h confirmed-chip
+# TTL is only the staleness backstop, never the primary mechanism.
 #
-# MECHANICS: sibling to subagent-fanout.sh (emit JSON on stdout, always exit 0), but now reads the
-# payload (it didn't used to) to extract `session_id` for the chip write and the clear-instruction.
-# Extraction mirrors freehand-mode.sh's `.prompt`-extraction pattern (python -c, rc=1 on ANY parse
-# failure incl. "python not found" -> bash rc 127) so a clean-but-absent field is distinguishable
-# from a genuine parse failure. JSON emission goes through python json.dumps with the handoff text
-# passed via an ENV VAR and the session id via ARGV (not interpolated into a python -c heredoc
-# string directly) — the text contains literal backticks (`plan-executor`, `ballast-mode clear
-# exec ...`) and the sid is payload-controlled, so keeping both out of the python source string
-# sidesteps any backtick/quote-escaping hazard entirely (same discipline as doc-write-guard.py's
-# env-var-for-content convention).
+# MECHANICS: sibling to subagent-fanout.sh (emit JSON on stdout, always exit 0), plus a payload read
+# for the `session_id` the chip write and clear-instruction need. Extraction mirrors
+# freehand-mode.sh's (python -c, rc=1 on ANY parse failure incl. "python not found" -> bash rc 127)
+# so a clean-but-absent field is distinguishable from a genuine parse failure. JSON emission goes
+# through python json.dumps with the handoff text passed via an ENV VAR and the sid via ARGV, never
+# interpolated into the python -c source: the text contains literal backticks and the sid is
+# payload-controlled, so keeping both out of the source string sidesteps any backtick/quote-escaping
+# hazard entirely (same discipline as doc-write-guard.py's env-var-for-content convention).
 #
 # DEGRADATION LADDER (python unavailable, JSON parse fails, OR sid comes back empty): fall back to
 # TODAY'S STATIC HEREDOC VERBATIM — no chip write, no clear-instruction, exactly the pre-chip
 # behavior. This means the handoff paragraph is duplicated (bash variable for the dynamic path;
 # hardcoded inside the static JSON heredoc for the fallback) — accepted, forced by the
-# python-less fallback, same tradeoff freehand-mode.sh's rework already made. The pairing is
-# pinned by hooks/test_plan_handoff.sh asserting both paths share the SAME distinctive sentence —
-# keep them textually identical if you edit the wording.
+# python-less fallback. The pairing is pinned by hooks/tests/test_plan_handoff.sh asserting both
+# paths share the SAME distinctive sentence — keep them textually identical if you edit the wording.
 #
 # Fail-open contract: the mode-state.py write is fail-quiet (`|| true`) and never gates the JSON
 # emission that follows it — a state-write failure (e.g. unwritable state dir) must never cost the

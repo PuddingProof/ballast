@@ -165,11 +165,9 @@ def write_state(path, entries):
 def do_raise(mode, sid, status):
     path = _state_path(sid)
     entries = read_state(path)
-    # A pending raise must never DEMOTE an already-confirmed mode. The keyword hook re-arms on
-    # every matching prompt -- including mere mentions while a genuine grant is standing -- and
-    # stomping confirmed back to pending would visibly downgrade a settled chip on each re-arm
-    # (observed live 2026-07-11: a mention-arm demoted a standing confirmed chip). The re-arm
-    # still refreshes the epoch, so the TTL clock keeps tracking activity.
+    # A pending raise must never DEMOTE an already-confirmed mode: a caller that re-raises a mode
+    # as pending while a genuine grant already stands confirmed must not visibly downgrade a
+    # settled chip. The re-arm case still refreshes the epoch, so the TTL clock tracks activity.
     if status == "pending" and mode in entries and entries[mode][0] == "confirmed":
         status = "confirmed"
     entries[mode] = (status, int(time.time()))
@@ -190,10 +188,9 @@ def do_clear(mode, sid, pending_only=False):
     entries = read_state(path)
     if mode in entries:
         # --pending-only is a guarded clear: it removes the entry ONLY if it is still pending, and
-        # leaves a CONFIRMED grant untouched. The freehand-mode stub uses it for the mere-mention
-        # settle so that a mention adjudicated WHILE a genuine grant is standing can retract its own
-        # pending chip without silently revoking the standing confirmed grant (the silent-grant-loss
-        # seam). A bare clear (pending_only=False) still deletes either status.
+        # leaves a CONFIRMED grant untouched -- lets a caller retract its own pending chip without
+        # risking a silent revoke of a standing confirmed grant under the same mode. A bare clear
+        # (pending_only=False) still deletes either status.
         if pending_only and entries[mode][0] != "pending":
             return  # confirmed grant left standing; exit 0 (idempotent from the caller's view).
         del entries[mode]
