@@ -46,6 +46,25 @@ esac
 # keywords                            -> distinctive fanout vocab; [ -]? allows spaced or hyphenated forms
 # trailing ([^[:alnum:]_/\.-]|$)      -> end, or a non-(path/ext) char; rejects /, \, ., - so paths/filenames don't match
 if printf '%s' "$payload" | grep -iqE '(^|[^[:alnum:]_-])(ultracode|adhd|deep[ -]?research|code[ -]?review|(adversarial[ -]?)?audits?|fan[ -]?out|sub[ -]?agents?|parallel[ -]?agents?)([^[:alnum:]_/\.-]|$)'; then
+  # SESSION COOLDOWN: the table below is ~5KB and its content is static -- re-injecting it on
+  # every keyword prompt (audit data: fanout vocab recurs across a session's prompts) taxes
+  # context with no new information. One marker per session, TTL 2h, so a LONG session (or a
+  # post-compact window, where the earlier injection was summarized away) re-arms. FAIL OPEN:
+  # no sid / no home dir -> no cooldown, fire every time (the pre-cooldown behavior).
+  sid="$(printf '%s' "$payload" | grep -oE '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
+  home_dir="${BALLAST_CLAUDE_HOME:-${HOME:+$HOME/.claude}}"
+  if [ -n "$sid" ] && [ -n "$home_dir" ]; then
+    marker="$home_dir/.cache/ballast-fanout/$sid"
+    # `find -mmin -120` prints the marker only if it exists AND is fresher than the TTL.
+    # A suppressed match leaves no fire-ledger row (no output), so record it here -- audits must
+    # be able to tell "suppressed by cooldown" from "keyword never matched".
+    if [ -n "$(find "$marker" -mmin -120 2>/dev/null)" ]; then
+      printf '%s suppressed sid=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sid" >> "$home_dir/.cache/ballast-fanout/suppressed.log" 2>/dev/null
+      exit 0
+    fi
+    { mkdir -p "$home_dir/.cache/ballast-fanout" && touch "$marker"
+      find "$home_dir/.cache/ballast-fanout" -type f -mmin +2880 -exec rm -f {} + ; } 2>/dev/null
+  fi
   cat <<'JSON'
 {
   "systemMessage": "🪜 ballast: subagent-fanout — tier calibration injected",

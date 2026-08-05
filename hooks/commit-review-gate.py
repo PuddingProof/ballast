@@ -17,7 +17,9 @@ staged diff is genuinely trivial (whitespace-only, or a small comment/blank-only
 not a separate OUT -- it just routes WHICH skill counts as "the review": a code commit accepts the
 code skills; a docs/meta commit accepts durable-docs UNION the code skills (a full code-review
 satisfies a docs commit). One-way ONLY: the code route never accepts durable-docs, since a
-docs-gate pass says nothing about code.
+docs-gate pass says nothing about code. Evaluated BEFORE all of them: a staged set lying entirely
+under `.claude/` or `.notes/` ALLOWs as `session-output` -- deterministic artifacts of flows that
+carry their own discipline, committed by standing rule (see _all_session_output).
 Full design: `.notes`-equivalent brainstorming spec `2026-06-29-review-gated-autonomous-commit.md`
 (re-targeted to ballast paths here; see that doc for the empirical case each rule traces back to).
 
@@ -64,11 +66,14 @@ doc's fanout explicitly killed, empirically, on real transcripts):
     CRLF files, which is why O2's whitespace check below uses `git diff --cached -w --quiet`
     (semantic, ignores line-ending noise) rather than any content-hash comparison.
 
-STATELESS BY DESIGN: no marker files, no per-repo state. Every signal is re-derived at commit time
-from (a) git itself and (b) the append-only transcript (+ PreCompact archives). A marker file is
+STATELESS BY DESIGN (the gate DECISION): no marker files, no per-repo state. Every signal is
+re-derived at commit time from (a) git itself and (b) the append-only transcript (+ PreCompact archives). A marker file is
 per-repo shared state that a CONCURRENT session can misread as its own review (this user routinely
 runs concurrent sessions against the same repo) -- re-deriving from each session's OWN transcript
-path is multi-session-correct by construction, with no TTL/rot to manage.
+path is multi-session-correct by construction, with no TTL/rot to manage. The one marker file this
+hook does keep (the per-SESSION retry marker, see the retry-dedup section) carries no decision
+signal at all -- it only de-duplicates shadow LOG statistics, and being session-keyed it is
+likewise unreadable by a concurrent session.
 
 REUSES `skills/session-postmortem/scripts/extract.py` for transcript line-loading (`load_lines`) and the
 canonical "is this a genuine user turn" rule (`_user_prompt`) rather than writing a second JSONL
@@ -86,11 +91,13 @@ run.sh already uses). hooks.json's real invocation never sets that var, so produ
 resolves the genuine `~/.claude` -- this exists solely so `test_commit_review_gate.py` can point
 every path at a throwaway temp dir instead of writing into the developer's real `~/.claude` state.
 """
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -657,6 +664,38 @@ def _classify_path(path):
     return "code"
 
 
+# Session-OUTPUT areas: deterministic artifacts of a flow that carries its own discipline
+# (postmortem reports, harness-sweep digests, `.notes/` working notes), committed by standing rule.
+# A staged set made up ENTIRELY of them has no review to wait for, so gating it is pure
+# false-positive noise in the shadow dataset -- 307 of the observed WOULD-BLOCKs were docs-only and
+# many were exactly this shape. Segment-matched (not prefix-matched) so a nested session-output dir
+# counts. Deliberately NARROW: README / CLAUDE.md / docs/ are NOT exempt -- the docs discipline is
+# precisely what this gate is here to observe. And `.claude/` is only PARTLY session-output: the
+# `.claude/skills/` and `.claude/commands/` subtrees hold shipped, durable content (real code and
+# permanent-tier docs), so their presence disqualifies the path -- the exemption covers the
+# output-series dirs (postmortem/, per-skill report dirs) and `.notes/` only. The disqualifier is
+# ADJACENCY-scoped: it applies only to a segment sitting IMMEDIATELY AFTER `.claude`, because
+# `skills`/`commands` are common directory names in their own right -- a coincidental
+# `.notes/tool/commands/x.md` is an ordinary working note, not shipped content, and a bare
+# segment-anywhere test would wrongly gate it.
+_SESSION_OUTPUT_ROOTS = {".claude", ".notes"}
+_SESSION_OUTPUT_DISQUALIFIERS = {"skills", "commands"}
+
+
+def _all_session_output(staged_files):
+    """True if EVERY staged path lies under a `.claude/` or `.notes/` segment, with no
+    `skills`/`commands` segment sitting DIRECTLY under a `.claude` segment (shipped content under
+    `.claude/` is not session output; the same dir name elsewhere in the path is coincidental)."""
+    for path, _, _ in staged_files:
+        segs = path.replace("\\", "/").split("/")
+        if not (set(segs) & _SESSION_OUTPUT_ROOTS):
+            return False
+        for i, seg in enumerate(segs):
+            if i > 0 and seg in _SESSION_OUTPUT_DISQUALIFIERS and segs[i - 1] == ".claude":
+                return False
+    return bool(staged_files)
+
+
 def _route(staged_files):
     """ALL staged paths classify docs -> 'docs'; anything else (incl. a docs+code mix) -> 'code'."""
     kinds = {_classify_path(p) for p, _, _ in staged_files}
@@ -992,32 +1031,36 @@ def _o1_core(all_skills, all_edits, all_users, all_reviews, all_echoes, boundary
 
 def _evaluate(command, cwd, transcript_path, session_id):
     """Run gate steps 2-6 (staged set -> merge/cherry-pick -> O2 -> O3 route -> O1) for a command
-    already confirmed to be a standalone git commit. Returns (decision, reason) where decision is
-    the literal string 'ALLOW' or 'WOULD-BLOCK' -- never raises for an ordinary git/transcript
-    condition (those all resolve to a decision); `_TranscriptUnreadable` and any other exception
-    are caught by the caller (main()), which is what makes THIS function's contract "return a
-    decision or raise", not "return a decision or crash".
+    already confirmed to be a standalone git commit. Returns (decision, reason, staged_paths) where
+    decision is the literal string 'ALLOW' or 'WOULD-BLOCK' and staged_paths is the staged path list
+    (None when git couldn't answer) -- the retry-dedup key, kept OUT of the log grammar on purpose.
+    Never raises for an ordinary git/transcript condition (those all resolve to a decision);
+    `_TranscriptUnreadable` and any other exception are caught by the caller (main()), which is what
+    makes THIS function's contract "return a decision or raise", not "return a decision or crash".
     """
     staged_result = _staged_files(cwd, command)
     if staged_result is None:
-        return "WOULD-BLOCK", "git-unavailable"
+        return "WOULD-BLOCK", "git-unavailable", None
     staged, (base_args, pathspecs, source) = staged_result
+    staged_paths = [p for p, _, _ in staged]
     if not staged:
-        return "ALLOW", "empty-staged-diff"
+        return "ALLOW", "empty-staged-diff", staged_paths
+
+    if _all_session_output(staged):
+        return "ALLOW", "session-output", staged_paths
 
     if _in_merge_or_cherry_pick(cwd):
-        return "ALLOW", "merge-or-cherry-pick-in-progress"
+        return "ALLOW", "merge-or-cherry-pick-in-progress", staged_paths
 
     if _cached_diff_empty_ignoring_ws(cwd, base_args, pathspecs):
-        return "ALLOW", "trivial-whitespace-only"
+        return "ALLOW", "trivial-whitespace-only", staged_paths
 
     trivial, churn = _o2_trivial(cwd, staged, base_args, pathspecs)
     if trivial:
-        return "ALLOW", "trivial-churn=%d-comment-or-blank-only" % churn
+        return "ALLOW", "trivial-churn=%d-comment-or-blank-only" % churn, staged_paths
 
     kind = _route(staged)
     accepted = _load_accepted_skills(kind)
-    staged_paths = [p for p, _, _ in staged]
     repo_root = _repo_root(cwd)
 
     (all_commits, all_skills, all_edits, all_users, all_reviews, all_echoes,
@@ -1032,12 +1075,13 @@ def _evaluate(command, cwd, transcript_path, session_id):
     # being mined for the enforce-flip; don't churn the existing line shapes).
     src_suffix = " src=pathspec" if source == "pathspec" else ""
     if ok:
-        return "ALLOW", "reviewed skill=%s staged=%d%s" % (detail, len(staged_paths), src_suffix)
+        return ("ALLOW", "reviewed skill=%s staged=%d%s" % (detail, len(staged_paths), src_suffix),
+                staged_paths)
 
     uncovered = ",".join(sorted(staged_paths)[:5])
     reason = ("need-review kind=%s accepted=%s reason=%s last_review_ts=%s uncovered=%s%s"
               % (kind, "|".join(sorted(accepted)), detail, review_ts or "-", uncovered, src_suffix))
-    return "WOULD-BLOCK", reason
+    return "WOULD-BLOCK", reason, staged_paths
 
 
 def _sanitize_log_field(s):
@@ -1055,13 +1099,98 @@ def _sanitize_log_field(s):
     return s.replace("\r", " ").replace("\n", " ")[:500]
 
 
-def _log(decision, reason, session_id):
+# --- retry dedup (shadow-statistics hygiene, not a decision change) ----------------------------
+# A WOULD-BLOCK doesn't stop anything, so the same commit is routinely re-attempted: the observed
+# log carried 63 same-session repeat-blocks under 60s apart, each double-logged AND double-ghosted
+# (two identical systemMessages for one commit intent). Tagging the repeat `retry=1` keeps the
+# shadow statistics honest -- retries stay countable but no longer inflate the block count or the
+# user-visible ghost line. STRICTLY additive to the line grammar: `retry=1` rides at END of line,
+# after `session=`, so every existing `rc=`/`key=` grepper keeps matching unchanged.
+#
+# MECHANISM: a per-session marker file holding `<staged-set-hash> <unix-epoch>`, deliberately NOT a
+# re-read of the shadow log's own tail. Two reasons, both load-bearing:
+#   - the key is a hash of the FULL sorted staged path list, whereas the log's `uncovered=` field
+#     caps at 5 paths -- two >5-file staged sets differing only PAST that cap are identical in the
+#     log, so a log-derived key would collide and mis-tag a genuine new observation as a retry;
+#   - it is decoupled from the log-line grammar, so the log stays a pure append-only audit trail
+#     rather than a parsed data source no future field rename may disturb.
+# The marker is keyed by session_id, so a concurrent session sharing this repo never reads another
+# session's state -- the same multi-session correctness the module docstring demands.
+_RETRY_WINDOW_SECONDS = 600
+_RETRY_MARKER_MAX_AGE_SECONDS = 2 * 86400
+
+
+def _retry_marker_dir():
+    return _claude_home() / ".cache" / "ballast-gate"
+
+
+def _retry_marker_path(session_id):
+    # session_id is harness-supplied, but it lands in a FILENAME -- sanitize so a surprising value
+    # (separators, traversal) can never write outside the cache dir.
+    sid = re.sub(r"[^A-Za-z0-9_.-]", "_", session_id or "nosession")[:120]
+    return _retry_marker_dir() / ("retry-%s" % sid)
+
+
+def _staged_key(staged_paths):
+    """sha1 over the FULL sorted staged path list (see the section comment: the log's capped
+    `uncovered=` field is not a usable key)."""
+    joined = "\n".join(sorted(staged_paths))
+    return hashlib.sha1(joined.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _prune_retry_markers():
+    """Best-effort reap of retry-* markers older than 2 days, so dead sessions don't accrue.
+    Never raises -- marker hygiene must not affect the hook's outcome."""
+    try:
+        cutoff = time.time() - _RETRY_MARKER_MAX_AGE_SECONDS
+        for f in _retry_marker_dir().glob("retry-*"):
+            try:
+                if f.stat().st_mtime < cutoff:
+                    f.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+def _is_retry(staged_paths, session_id):
+    """True if this session already recorded a WOULD-BLOCK for the IDENTICAL staged set within
+    _RETRY_WINDOW_SECONDS. Fails OPEN (False -> log + ghost as usual) on ANY error or absence:
+    a dedup bug must never suppress a genuine first-time observation."""
+    if not staged_paths:
+        return False  # no stable staged set (git-unavailable, internal-error) -- never dedup it
+    try:
+        stored_key, stored_epoch = _retry_marker_path(session_id).read_text(
+            encoding="utf-8").split()[:2]
+        if stored_key != _staged_key(staged_paths):
+            return False
+        return 0 <= (time.time() - int(stored_epoch)) < _RETRY_WINDOW_SECONDS
+    except Exception:
+        return False
+
+
+def _write_retry_marker(staged_paths, session_id):
+    """(Re)write this session's marker with the current staged-set hash + epoch. Best-effort: a
+    write failure only means the NEXT retry logs un-tagged, never a changed decision."""
+    if not staged_paths:
+        return
+    try:
+        _retry_marker_dir().mkdir(parents=True, exist_ok=True)
+        _retry_marker_path(session_id).write_text(
+            "%s %d" % (_staged_key(staged_paths), int(time.time())), encoding="utf-8")
+    except Exception:
+        pass
+    _prune_retry_markers()
+
+
+def _log(decision, reason, session_id, suffix=""):
     """Append one line to the shadow log. Never raises -- a logging failure must not change the
-    (already-decided, always exit-0-in-shadow) outcome of this hook."""
+    (already-decided, always exit-0-in-shadow) outcome of this hook. `suffix` rides at END of line
+    (currently only " retry=1"), leaving the historical field order byte-identical before it."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     reason = _sanitize_log_field(reason)
     session_id = _sanitize_log_field(session_id) if session_id else session_id
-    line = "%s %s %s session=%s\n" % (ts, decision, reason, session_id or "nosession")
+    line = "%s %s %s session=%s%s\n" % (ts, decision, reason, session_id or "nosession", suffix)
     try:
         log_path = _log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1117,8 +1246,9 @@ def main():
             cwd = os.getcwd()
         transcript_path = payload.get("transcript_path") or ""
 
+        staged_paths = None
         try:
-            decision, reason = _evaluate(command, cwd, transcript_path, session_id)
+            decision, reason, staged_paths = _evaluate(command, cwd, transcript_path, session_id)
         except _TranscriptUnreadable:
             decision, reason = "WOULD-BLOCK", "transcript-unreadable"
         except Exception as e:
@@ -1128,13 +1258,20 @@ def main():
             # the shadow log still surfaces the gap for review, instead of silently vanishing.
             decision, reason = "WOULD-BLOCK", "internal-error:%s" % type(e).__name__
 
-        _log(decision, reason, session_id)
+        retry = False
         if decision == "WOULD-BLOCK":
+            # Read BEFORE the rewrite (the marker is the previous attempt's record), then refresh
+            # it in EVERY WOULD-BLOCK case so a run of retries keeps sliding the window forward.
+            retry = _is_retry(staged_paths, session_id)
+            _write_retry_marker(staged_paths, session_id)
+        _log(decision, reason, session_id, " retry=1" if retry else "")
+        if decision == "WOULD-BLOCK" and not retry:
             # User-visible fire indicator, WOULD-BLOCK only -- an ALLOW is the common case (every
             # reviewed or trivial commit) and printing on every single qualifying commit would be
             # noise; WOULD-BLOCK is the rare, worth-surfacing signal that the eventual enforce-mode
-            # flip would have denied this commit. Still shadow: prints, but does not change the
-            # exit code below.
+            # flip would have denied this commit. Suppressed on a `retry=1` line (see _is_retry):
+            # the same commit re-attempted is one intent, so it gets one ghost. Still shadow:
+            # prints, but does not change the exit code below.
             print(json.dumps({
                 "systemMessage": "👻 ballast: commit-review-gate (shadow) — WOULD have blocked this commit (logged)"
             }))

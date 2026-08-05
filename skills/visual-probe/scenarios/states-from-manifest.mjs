@@ -260,6 +260,11 @@ export const coverageHoles = [];
 // suppress the findings that capture already produced.
 export const suppressions = [];
 
+// The manifest's `verifies` scope disclaimer, republished per run so the harness can carry it into
+// its own output manifest — a leaf quotes it verbatim rather than over-reading a green run. Same
+// module-level live-reference shape as the two arrays above, for the same reason.
+export const meta = { verifies: null };
+
 const holeKeys = new Set();
 function addHole(hole) {
   const key = `${hole.label}|${hole.kind}`;
@@ -280,6 +285,7 @@ export default async (page, h) => {
   // findings nothing in this run produced.
   suppressions.length = 0;
   for (const s of manifest.suppressions || []) suppressions.push(s);
+  meta.verifies = manifest.verifies || null;
   coverageHoles.length = 0;
   holeKeys.clear();
 

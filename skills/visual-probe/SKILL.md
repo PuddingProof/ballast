@@ -4,8 +4,9 @@ description: >-
   The main session's instrument panel for a real rendered browser UI: capture how a frontend
   ACTUALLY renders (never inferred from code) across window sizes / DPI / device-scale, drive an
   interactive UI and assert on its state, or co-drive a shared headed window with the user. Runs a
-  bespoke pinned-Playwright harness on demand — no standing daemon. Six mode paths
-  (shot | drive | states | serve | co-drive | doctor), each with its own reference body.
+  bespoke pinned-Playwright harness on demand — no standing daemon. Fused one-shot verbs
+  (glance | review-capture) and deterministic instruments (measure | crop) alongside the
+  interactive mode paths (shot | drive | states | serve | co-drive | doctor).
 when_to_use: >-
   Load in the MAIN session when you are about to run the harness yourself: "let me see the app",
   "screenshot it", "does this look right", "check the layout / rendering", "why does X look broken
@@ -14,7 +15,7 @@ when_to_use: >-
   is handed an origin URL, an out-dir, and the harness contract in its dispatch brief (the
   visual-verification-gate skill owns that brief), and it owns no process lifecycle. Not for
   non-visual code edits, backend logic, or documentation tasks.
-argument-hint: "shot | drive | states | serve | co-drive | doctor"
+argument-hint: "glance | review-capture | measure | crop | shot | drive | states | serve | co-drive | doctor"
 allowed-tools: Read, Write, Bash, Glob
 ---
 
@@ -63,7 +64,10 @@ Your image-Read path downscales, hiding sub-pixel defects in full-frame thumbnai
 `manifest.json` first — cells, `diverges:true` flags, and `coverageHoles` (states the run could not
 force) — then read ONLY the `.xN.png` magnified crops of divergent or suspect cells. Never judge
 pixels from a full-frame `.png`, and never read a frame merely because you captured it. A coverage
-hole blocks a clean verdict; it is reported, never absorbed.
+hole blocks a clean verdict; it is reported, never absorbed. The fused verbs compose their cells
+into contact sheets (`sheets[]`) that carry the same rule one level up: a sheet settles composition
+and hierarchy, never small-text ink or a non-integer-DSF cell — those escalate to `crop`/`measure`.
+A hole renders INTO the sheet as a labeled placeholder tile, which is never a captured cell.
 
 ## What this harness cannot observe
 
@@ -73,6 +77,30 @@ A clean pass covers only what the method can see — name the blind spots instea
 - One engine's rendering says nothing about another's; a Chromium capture cannot clear a bug the user sees in Firefox.
 - When two sizing/breakpoint mechanisms overlap, probe the zone BETWEEN their thresholds, not just each named checkpoint.
 - Fixtures exercising guards + happy paths still miss the real corpus's typical-longest values — pull real worst-case data in before calling a text-layout control clean.
+
+## Fused verbs and instruments — one process, one browser launch
+
+These do the whole job in a single invocation: preflight, capture, in-page assertions, composition,
+and a budget stamp. They are what a dispatch brief hands a leaf (the gate skill templates the brief;
+this table is the orchestrator's own copy). They REJECT `--cdp` — the reuse gate is what makes one
+launch safe. The fused verbs and `crop` stamp `budget{invocations, invocations_total, verbs,
+launches, stage_ms, wall_ms}` into the manifest, keyed by `--out`, so a claimed cost is checkable
+rather than self-reported: `invocations` counts ONE dispatch's calls (scoped by `--epoch`),
+`invocations_total` the out-dir's whole ledger. With `--states`, the sweep runs against `--url` only
+— extra `--urls` are captured as plain cells.
+
+| Verb | Command |
+|---|---|
+| `glance` | `node $P glance --url <base> [--urls u1,u2] [--matrix M] [--states F --skip-drive-hooks] [--suppressions F] [--settle MS] [--deadline MS] [--epoch ISO] [--baseline CELL] --out <dir>` — viewport-clamped cells, rung-0 at shutter, contact sheets |
+| `glance --wait` | `node $P glance --wait <out-dir> [--since ISO] [--timeout MS]` — stdlib-only poll for a capture fired ahead of a dispatch; `--since` is the dispatch epoch, so evidence older than it keeps polling instead of resolving stale; exit 3 = not ready, run the full verb instead. Valid on `review-capture` output too |
+| `review-capture` | `node $P review-capture --url <base> [--urls …] [--states F] [--matrix M] [--group RE] [--no-dsf-triad] [--settle MS] [--deadline MS] --out <dir>` — matrix sweep with console/pageerror/requestfailed listeners attached per context, DSF triad at native, sheets grouped per route×theme |
+| `measure` | `node $P measure --url <u> [--selector S \| --selectors S1,S2] [--checks contrast,rects,fonts,targets,overflow] --out <dir>` — compact per-check summary to stdout, full record in `measure-<n>.json`; composited-pixel contrast, so it survives gradients and translucency |
+| `crop` | `node $P crop --url <u> --selector S [--matrix M] [--magnify N] --out <dir>` — magnified evidence for one region, post-hoc |
+
+Exit codes are uniform: **0** = normal, including a `--deadline` partial flush (the unshot cells
+become named `coverageHoles`, and partial evidence is still evidence); **1** = blocked, meaning zero
+capture — the fused verbs still write a blocked manifest (`measure`/`crop` have none to write); **2** = usage; **3** = `--wait` timeout. There are no
+retries anywhere: a failed cell is a named hole, never a second attempt.
 
 ## Mode paths
 

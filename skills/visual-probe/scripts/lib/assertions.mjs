@@ -141,13 +141,24 @@ export const RUNG0_PAGE_FN = function collectRung0Findings(options) {
   }
   function rgbStr(c) { return 'rgb(' + Math.round(c.r) + ', ' + Math.round(c.g) + ', ' + Math.round(c.b) + ')'; }
 
-  // Effective background BEHIND an element: nearest painted ancestor color, alpha-composited down
-  // to the canvas (white). A background-image/gradient anywhere in that stack makes the value
-  // unmeasurable — those elements are skipped rather than guessed at (rung 2 measures them).
+  // Effective background BEHIND an element: nearest painted ancestor color, alpha-composited down to
+  // the first OPAQUE one in the stack. THREE ways the value is unresolvable, and every one of them
+  // SKIPS the element rather than guessing:
+  //   • a background-image/gradient anywhere in the stack (rung 2 measures those from pixels);
+  //   • an ancestor that paints its own content — canvas, img, svg, video (the face of the page is
+  //     that element's pixels, not a CSS color);
+  //   • a transparency chain that runs off the top of the document without ever hitting an opaque
+  //     color, i.e. the root itself has no background.
+  // The last one is why this never falls back to white: a dark-faced app whose page color is painted
+  // by a canvas reads as rgb(255,255,255) under that assumption, and every light-on-dark label on it
+  // becomes a phantom AA finding (measured: 90+ false findings in a single run).
+  const SELF_PAINTING_TAGS = { CANVAS: 1, IMG: 1, SVG: 1, VIDEO: 1, PICTURE: 1, OBJECT: 1, EMBED: 1 };
   function effectiveBg(el) {
     const stack = [];
     let node = el;
+    let opaque = null;
     while (node && node.nodeType === 1) {
+      if (SELF_PAINTING_TAGS[String(node.tagName || '').toUpperCase()]) return null;
       // Reuse the census's cached CSSStyleDeclaration where there is one (same pattern as
       // clippingAncestor): ancestor chains are shared across siblings, so a fresh
       // getComputedStyle per hop re-costs the same nodes once per descendant.
@@ -155,11 +166,12 @@ export const RUNG0_PAGE_FN = function collectRung0Findings(options) {
       const cs = rec ? rec.cs : getComputedStyle(node);
       if (cs.backgroundImage && cs.backgroundImage !== 'none') return null;
       const c = parseColor(cs.backgroundColor);
-      if (c && c.a > 0) { stack.push(c); if (c.a >= 0.999) break; }
+      if (c && c.a > 0) { stack.push(c); if (c.a >= 0.999) { opaque = c; break; } }
       node = node.parentElement;
     }
-    let base = { r: 255, g: 255, b: 255, a: 1 };
-    for (let i = stack.length - 1; i >= 0; i--) base = over(stack[i], base);
+    if (!opaque) return null; // nothing painted underneath — unresolvable, never assumed white
+    let base = opaque;
+    for (let i = stack.length - 2; i >= 0; i--) base = over(stack[i], base);
     return base;
   }
 
@@ -271,7 +283,7 @@ export const RUNG0_PAGE_FN = function collectRung0Findings(options) {
     const fg = parseColor(n.cs.color);
     if (!fg || fg.a < 0.1) continue;
     const bg = effectiveBg(n.el);
-    if (!bg) continue; // background-image in the stack — unmeasurable, rung 2's job
+    if (!bg) continue; // no resolvable painted background — unmeasurable, rung 2's job
     const text = fg.a >= 0.999 ? fg : over(fg, bg);
     const size = parseFloat(n.cs.fontSize) || 16;
     const weightRaw = n.cs.fontWeight;
@@ -288,6 +300,18 @@ export const RUNG0_PAGE_FN = function collectRung0Findings(options) {
   // ---- (a) overlap between in-flow siblings ---------------------------------------------------
   // Only static/relative, untransformed, unfloated siblings: absolutely-positioned layering and
   // transforms overlap BY DESIGN, and a float's rect legitimately overlaps the block after it.
+  // Inside an <svg>, overlapping boxes are how the picture is DRAWN — a chart's axis, plot and label
+  // layers intersect by construction, and scanning them produced dozens of spurious pairs per run
+  // (measured: 25+ on chart internals alone). Siblings share a parent, so "both under one <svg>"
+  // is exactly "their parent sits in an SVG subtree" — the whole pair scan is skipped there.
+  function inSvgSubtree(el) {
+    let node = el;
+    while (node && node.nodeType === 1) {
+      if (String(node.tagName || '').toLowerCase() === 'svg') return true;
+      node = node.parentElement;
+    }
+    return false;
+  }
   function overlapEligible(rec) {
     if (!rec.vis) return false;
     const p = rec.cs.position;
@@ -299,6 +323,7 @@ export const RUNG0_PAGE_FN = function collectRung0Findings(options) {
   const parents = new Set();
   for (let i = 0; i < nodes.length; i++) if (nodes[i].el.parentElement) parents.add(nodes[i].el.parentElement);
   parents.forEach(function (parent) {
+    if (inSvgSubtree(parent)) return; // layered vector paint, not a collision
     const kids = [];
     const children = parent.children;
     if (children.length > MAX_CHILDREN) return; // long lists: pair scan is not worth the cost
@@ -405,7 +430,12 @@ export function aggregateRung0(records, suppressions = []) {
     invalid.push(...(res.invalidSuppressions || []));
     const stem = `${rec.label}__${rec.cell}`.replace(/[^\w.@-]/g, '_');
     for (const f of res.findings) {
-      const key = JSON.stringify([f.check, f.selector, f.capped ? 'capped' : f.description]);
+      // A capped ROLLUP row carries no selector (it stands for findings never enumerated), so a key
+      // without the cell collapses every state's rollup into the first one seen and silently drops
+      // the other cells' counts. Rollups key on the cell; real findings still group across cells.
+      const key = f.capped
+        ? JSON.stringify([f.check, stem, 'capped', f.description])
+        : JSON.stringify([f.check, f.selector, f.description]);
       const hit = byKey.get(key);
       if (hit) { if (!hit.cells.includes(stem)) hit.cells.push(stem); continue; }
       const entry = { check: f.check, selector: f.selector, description: f.description, cells: [stem], measured: f.measured || {}, suppressed: !!f.suppressed };

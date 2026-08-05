@@ -4,6 +4,47 @@ Consumer-visible changes to the ballast plugin. Changes land under **[Unreleased
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-08-05
+
+Visual-stack v2: the harness does the deterministic work in single fused invocations; the agents run fixed few-turn protocols over composed evidence.
+
+- Added `probe.mjs glance`: preflight + viewport-clamped capture + rung-0 assertions + contact-sheet compose + budget stamp in ONE process and ONE browser launch
+- Added `probe.mjs review-capture`: matrix sweep with console/pageerror/requestfailed listeners built in and sheets grouped per route×theme — retires the hand-authored console pass
+- Added `probe.mjs measure`: deterministic contrast/rects/fonts/targets/overflow JSON — retires per-run hand-authored measurement scenarios
+- Added `probe.mjs crop`: post-hoc magnified evidence for a named selector
+- Added `probe.mjs glance --wait <out-dir>`: stdlib-only poll for a capture fired ahead of a dispatch; exit 3 means run the verb yourself
+- Added `--deadline MS`: a hard stop flushes a partial manifest with the unshot cells as named holes; `blocked` now means zero capture only
+- Coverage holes render into contact sheets as labeled placeholder tiles, and are never counted as captured cells
+- The fused verbs and `crop` stamp `budget` (invocation counts, per-stage and total wall-clock) into the manifest, keyed by `--out`
+- `budget` splits `invocations` (this dispatch's calls, scoped by the new `--epoch ISO`) from `invocations_total` (the out-dir's whole ledger)
+- `glance --wait` gains `--since <ISO>`: a manifest generated before the dispatch epoch keeps polling instead of resolving stale (fused manifests now stamp `generatedAt`); with no `--since`, a 120s grace stands in
+- Fused verbs clear a previous cycle's `mosaic*.png` before composing, and contact sheets are written through a rename like the manifest
+- Fused manifests stamp per-cell `belowFoldPx` — page height a viewport-clamped run never saw is named, not silent
+- `--states` with extra `--urls` sweeps states against the base `--url` only; the extra targets are captured as plain cells
+- A failed `crop` records in `cropHoles[]` instead of `coverageHoles[]`: it makes that one question indeterminate, never a coverage gap
+- `review-capture` truncates each console entry to 300 chars, caps the channel at 50 entries, and counts the overflow
+- `review-capture` carries a state manifest's `verifies` scope disclaimer into its own manifest
+- No-retry doctrine across the harness: a failed capture resolves to a named hole, never a second attempt
+- rung-0 contrast now SKIPS any element whose effective background cannot be resolved to a painted solid (canvas/img/svg/gradient ancestor, or a root with no background) instead of assuming white
+- rung-0 overlap no longer flags pairs sharing an `<svg>` ancestor — layered vector paint is not a collision
+- Fused manifests inline the top 12 rung-0 rows per check kind with selectors truncated to 120 chars; the full list lands in `<out>/rung0.json` and `rung0Overflow` names what was trimmed
+- `probe.mjs measure` prints a compact per-check summary plus the full JSON's path to stdout instead of the whole payload
+- visual-glance: rewritten to a fixed four-turn protocol reading contact sheets; adds a `needs_fixture` verdict earned only by a manifest `cannotForce` hit
+- visual-reviewer: rewritten around the fused verbs and instruments — mode budgets, facet-split as full mode's default shape, no Write grant
+- visual-verification-gate: session dispatch pin, shadow dispatcher preflight, capture-ahead, and RMA-scoped re-verify in the canonical verdict table
+- Added `ballast-visual-origin pin`: freezes origin/out-dir/state-manifest/matrix/native-cell/suppressions/settle plus a newest-frontend-edit stamp into `vp-context.json`; `pin --check` re-stats it and logs WOULD-BLOCK without ever blocking
+- `pin --check` verifies the origin inside the pin's OWN session ledger — another session serving the same URL no longer validates a dead pin
+- Visual dispatch briefs carry a dispatch epoch, declared holes, the native cell and a suppressions slot; both rungs carry declared holes into their verdict scope
+- statusline: project tag now renders near-white (was dim gray) — promoted above the gray model/ctx segments
+- adversarial-audit: reports now land in `.claude/adversarial-audit/` (was `.notes`); Phase 0 still reads legacy `.notes` audit reports
+- plan-handoff: the fresh-session execution row points at the project's own plan location instead of hardcoding `.notes`
+- git-commit-guard: the review nudge now fires once per commit cycle instead of on every `git diff`/`git log`
+- subagent-fanout and plan-authoring: injections now fire once per 2h per session
+- doc-write-guard: soft nudges rate-limited to one per 3 minutes per session (SKILL.md reminders exempt)
+- cooldown-suppressed hook fires are recorded to per-hook `suppressed.log` audit trails
+- commit-review-gate (shadow): session-output-only commits (`.claude`, `.notes`) now ALLOW, and same-session retries are tagged `retry=1` with no repeat ghost
+- inline-churn-nudge: now nudges live at 20+ consecutive main-session in-line edits, once per session
+
 ## [0.9.1] — 2026-07-31
 
 - Hooks prose pass: injected texts trimmed across the board (subagent-fanout −17%, git-commit-guard review nudge, ballast-principles, plan-authoring, doc-write-guard/askuserquestion stderr) — same constraints, fewer standing tokens

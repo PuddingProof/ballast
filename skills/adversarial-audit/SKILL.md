@@ -3,7 +3,7 @@ name: adversarial-audit
 description: >-
   Orchestrate a comprehensive multi-agent adversarial audit of an entire codebase — parallel
   review lenses (broad + deep), per-finding adversarial verification, triaged fixes with
-  checkpointed commits, and a dated .notes report with disposition tracking.
+  checkpointed commits, and a dated report in .claude/adversarial-audit/ with disposition tracking.
 when_to_use: >-
   Use when the user asks for a comprehensive / periodic / ground-up codebase audit, an
   adversarial or multi-lens review of the whole project, "fresh senior eyes on the code", a
@@ -27,8 +27,8 @@ Mimic a panel of senior engineers putting fresh, skeptical eyes on the whole pro
 | Arg | Shape |
 |---|---|
 | `quick` | 4–6 lenses · verify only 🔴/🟠 candidates · no counter-review lane · report may be terminal-only |
-| `standard` (default) | 8–10 lenses · verify every finding · counter-review over the cumulative diff · `.notes` report |
-| `deep` | 10–13 lenses incl. conditional ones · verify every finding · counter-review + convergence re-audit of fixed areas · `.notes` report |
+| `standard` (default) | 8–10 lenses · verify every finding · counter-review over the cumulative diff · written report |
+| `deep` | 10–13 lenses incl. conditional ones · verify every finding · counter-review + convergence re-audit of fixed areas · written report |
 
 `--report-only` stops after the Phase 5 report with no fixes applied; otherwise fixing is the default. `focus:` pins extra weight (a dedicated lens + verifier attention) on the named areas or lenses.
 
@@ -36,7 +36,7 @@ Mimic a panel of senior engineers putting fresh, skeptical eyes on the whole pro
 
 Do this before the Phase 1 lens fanout; skipping it is how audits re-propose vetoed ideas and mis-scale. Steps 1–3 are cheap-leaf reads: dispatch them to a Haiku/Sonnet grounding leaf (usually one; split only if the material is large) and consume its compact grounding pack instead of reading the sources yourself. Steps 4–5 are your judgement.
 
-1. **Standing decisions** — the leaf reads prior audit reports (`.notes/*audit*.md` and `.notes/archive/*audit*.md` — a closed report moves to the archive, and its vetoes still bind), `IDEAS.md`, and recent postmortems, and returns every veto and by-design ruling **quoted verbatim with its source** — a paraphrase loses the exact ruling you must pin. Pin them into every finder and verifier prompt: a declined item re-proposed is a defect of *this* audit.
+1. **Standing decisions** — the leaf reads prior audit reports (`.claude/adversarial-audit/*.md`, plus legacy homes `.notes/*audit*.md` and `.notes/archive/*audit*.md` — old reports may still live there, and a closed report's vetoes still bind wherever it sits), `IDEAS.md`, and recent postmortems, and returns every veto and by-design ruling **quoted verbatim with its source** — a paraphrase loses the exact ruling you must pin. Pin them into every finder and verifier prompt: a declined item re-proposed is a defect of *this* audit.
 2. **Census** — deterministic commands (file counts, LOC by area, entry points, test surface), returned as the numbers plus the commands that produced them, so lens scoping and findings carry real magnitudes. The leaf also notes the stack, test/build commands, and any project-local audit or review skills — compose with those rather than duplicating them.
 3. **Commit context** — a digest of recent commit messages, handed to every reviewer; a reviewer without them misclassifies intentional guards as defects.
 4. **Pre-register** — yours, never a leaf's: jot your own predicted top findings before any results return, then diff against the fanout output to catch anchoring and recall gaps.
@@ -77,6 +77,6 @@ A green mechanical sweep can lie (a tool that silently no-ops still prints nothi
 
 ## Phase 5 — Report & close the loop
 
-Write the dated report at `.notes/YYYY-MM-DD-<scope>-audit.md` per `${CLAUDE_SKILL_DIR}/references/report-template.md` (legend, master checklist, findings by severity with dispositions and reasoning, methodology, commit table). Maintain it as the live tracker throughout the audit; as the very last step run a conciseness pass and put a BLUF at the top for the user's morning read.
+Write the dated report at `.claude/adversarial-audit/YYYY-MM-DD-<scope>-audit.md` (create the dir if missing; if that Write is denied — sandboxed sessions block `.claude/` writes — write `./<scope>-audit.md` at the repo root instead and say so) per `${CLAUDE_SKILL_DIR}/references/report-template.md` (legend, master checklist, findings by severity with dispositions and reasoning, methodology, commit table). Maintain it as the live tracker throughout the audit; as the very last step run a conciseness pass and put a BLUF at the top for the user's morning read.
 
 Close the loop so the audit doesn't rot: flip items this audit resolved in prior audit docs and IDEAS.md with `**Resolved:**` notes, record vetoes where future runs will re-read them, and route any durable-doc change the audit motivated (a CLAUDE.md rule, a memory) through `durable-docs`. Commit the report and stubs by path at the end.

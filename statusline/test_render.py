@@ -37,6 +37,7 @@ def fg(rgb):
 
 
 GRAY = (135, 135, 135)
+WHITE = (235, 235, 235)
 RED = (255, 95, 95)
 STEP_500K = (202, 113, 113)
 STEP_200K = (162, 126, 126)
@@ -100,7 +101,7 @@ class RenderTestCase(unittest.TestCase):
     # -----------------------------------------------------------------------------------
 
     def test_idle_baseline_no_state_file(self):
-        """No chip state at all -> just the dim-gray dir + ctx% baseline, single line."""
+        """No chip state at all -> just the dir + ctx% baseline, single line."""
         proc = self.run_render(self.payload(pct=42))
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout.count("\n"), 1)
@@ -112,11 +113,13 @@ class RenderTestCase(unittest.TestCase):
         self.assertNotIn("▸", line)  # no chips -> no ' ▸ ' separator at all
 
     def test_missing_context_window_dir_only(self):
+        """Dir-only payload -> the name in explicit WHITE (promoted above the gray peers;
+        unstyled text gets re-muted by the TUI, so the color must be explicit)."""
         payload = json.dumps({"session_id": "sess-x", "workspace": {"project_dir": "/a/b/ballast"}})
         proc = self.run_render(payload)
         self.assertEqual(proc.returncode, 0)
         line = proc.stdout.rstrip("\n")
-        self.assertEqual(line, fg(GRAY) + "ballast" + RESET)
+        self.assertEqual(line, fg(WHITE) + "ballast" + RESET)
 
     def test_cwd_fallback_when_no_project_dir(self):
         payload = json.dumps({"session_id": "sess-y", "cwd": "/some/path/myproj"})

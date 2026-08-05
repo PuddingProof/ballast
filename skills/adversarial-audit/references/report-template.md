@@ -1,4 +1,4 @@
-# Audit report template — `.notes/YYYY-MM-DD-<scope>-audit.md`
+# Audit report template — `.claude/adversarial-audit/YYYY-MM-DD-<scope>-audit.md`
 
 The report is a live tracker during the audit and the frozen record after it. Fill sections top-down; the BLUF is written LAST (conciseness pass over the whole doc first). Adapt sections to the audit — drop what didn't occur, don't pad.
 
@@ -44,4 +44,4 @@ Disposition: 🚢 shipped · ◐ partial · 🚫 rejected (reason given) · 📥
 ```
 
 IDEAS.md stub shape for 📥 items:
-`- [ ] <emoji> **Title** — rationale. Seed: [report](.notes/YYYY-MM-DD-<scope>-audit.md) (finding F##, surfaced YYYY-MM-DD)`
+`- [ ] <emoji> **Title** — rationale. Seed: [report](.claude/adversarial-audit/YYYY-MM-DD-<scope>-audit.md) (finding F##, surfaced YYYY-MM-DD)`

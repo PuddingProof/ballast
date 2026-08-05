@@ -634,6 +634,170 @@ def _stale_file(path):
     return age_days >= LEDGER_STALE_DAYS
 
 
+# ---------------------------------------------------------------------------
+# Dispatch pin -- the session's frozen visual-dispatch context
+# ---------------------------------------------------------------------------
+#
+# WHY A PIN: a dispatched leaf that has to discover its own origin, out-dir, state manifest and cell
+# matrix spends its first turns rediscovering what the orchestrator already knows. Pinning that
+# context ONCE per session and templating every brief from it deletes the discovery phase by
+# construction. The pin is context, never a kill decision -- nothing here can signal a process.
+#
+# DEMURRAGE: the pin also stamps the newest frontend-source mtime at pin time. Evidence captured
+# before a later edit is stale, and stale evidence certifies nothing; `pin --check` compares that
+# stamp against the live tree so the caller can name the gap instead of shipping on it.
+
+PIN_FILENAME = "vp-context.json"
+
+# Frozen extension set for the demurrage stamp. Deliberately narrow: a miss makes the stamp too OLD,
+# which under-reports staleness (a nudge that doesn't fire), while walking everything would make the
+# walk itself the cost. Extend when a real frontend dialect escapes it.
+FRONTEND_EXTS = (".css", ".scss", ".sass", ".less", ".html", ".htm", ".svelte", ".vue", ".astro",
+                 ".js", ".jsx", ".ts", ".tsx", ".svg")
+
+# Bounds the demurrage walk. A repo large enough to exceed this gets a partial (older) stamp, which
+# fails in the under-reporting direction like a missed extension does.
+MAX_WALK_FILES = 20000
+
+_WALK_SKIP = {"node_modules", "dist", "build", "target", "out", "coverage", "__pycache__",
+              ".git", ".venv", "venv"}
+
+
+def newest_frontend_mtime(root):
+    """(path, mtime) of the newest frontend source under `root`, or (None, None).
+
+    Dot-directories and build outputs are skipped -- a generated bundle's mtime tracks the build,
+    not the edit, so including it would make every post-build pin look fresh."""
+    newest_path, newest_mt, seen = None, None, 0
+    try:
+        walker = os.walk(root)
+    except OSError:
+        return (None, None)
+    for dirpath, dirnames, filenames in walker:
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in _WALK_SKIP]
+        for name in filenames:
+            if not name.lower().endswith(FRONTEND_EXTS):
+                continue
+            seen += 1
+            full = os.path.join(dirpath, name)
+            try:
+                mt = os.path.getmtime(full)
+            except OSError:
+                continue
+            if newest_mt is None or mt > newest_mt:
+                newest_path, newest_mt = full, mt
+        if seen >= MAX_WALK_FILES:
+            break
+    return (newest_path, newest_mt)
+
+
+def _iso(ts):
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def pin_path(out_dir):
+    return os.path.join(out_dir, PIN_FILENAME)
+
+
+def write_pin(key, url, out_dir, states=None, matrix=None, settle=None, frontend_root=None,
+              native=None, suppressions=None):
+    """Freeze this session's dispatch context to <out-dir>/vp-context.json. Idempotent: a re-pin
+    overwrites wholesale, so the file is always one coherent snapshot rather than a merge of two.
+
+    `native` is the surface's NATIVE cell (WxH@1) -- the first cell of every dispatched matrix, so a
+    leaf never judges the design at a size nobody uses. `suppressions` lets a project with no state
+    manifest still declare its intended rung-0 findings."""
+    root = frontend_root or os.getcwd()
+    fe_path, fe_mt = newest_frontend_mtime(root)
+    pin = {
+        "session_key": sanitize_key(key),
+        "origin": url,
+        "out_dir": out_dir,
+        "states_manifest": states,
+        "matrix": matrix,
+        "native": native,
+        "suppressions": suppressions,
+        "settle": settle,
+        "frontend_root": root,
+        "demurrage": {"newest_frontend_path": fe_path, "newest_frontend_mtime": _iso(fe_mt)},
+        "pinned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    os.makedirs(out_dir, exist_ok=True)
+    path = pin_path(out_dir)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(pin, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+    return pin
+
+
+def read_pin(out_dir):
+    try:
+        with open(pin_path(out_dir), "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def shadow_log_path():
+    return os.path.join(cache_dir(), "dispatch-preflight-shadow.log")
+
+
+def check_pin(out_dir, index=None):
+    """Re-stat a pin's claims against live state. Returns [{check, ok, detail}, ...].
+
+    SHADOW POSTURE (the stack's soft-before-hard doctrine): this reports, it never blocks. A row
+    with ok=False is a WOULD-BLOCK the caller names in its dispatch, not a denial."""
+    rows = []
+    pin = read_pin(out_dir)
+    if not pin:
+        return [{"check": "pin", "ok": False, "detail": "no %s in %s" % (PIN_FILENAME, out_dir)}]
+    rows.append({"check": "pin", "ok": True, "detail": "pinned %s" % pin.get("pinned_at")})
+
+    rows.append({"check": "out-dir", "ok": os.path.isdir(out_dir), "detail": out_dir})
+
+    # Origin: verified against the ledger, not by probing the URL -- a request would be network IO
+    # from a preflight, and the ledger already answers "is the process I recorded still that process".
+    #
+    # SESSION-SCOPED, deliberately: a URL match across ALL ledgers means another session serving the
+    # same port validates this session's pin -- the pin would read "origin verified" while the
+    # process this session recorded is long dead, which is exactly the check's own failure mode.
+    origin_row = {"check": "origin", "ok": False, "detail": "no verified ledger entry for %s"
+                  % pin.get("origin")}
+    try:
+        if index is None:
+            index = index_by_pid(enumerate_processes())
+        entries, _ = read_entries(ledger_path(pin.get("session_key") or ""))
+        for e in entries:
+            if e.get("url") == pin.get("origin") and origin_verified(e, index):
+                origin_row = {"check": "origin", "ok": True,
+                              "detail": "pid %s verified" % e.get("pid")}
+                break
+    except ProcessProbeError as exc:
+        origin_row = {"check": "origin", "ok": True,
+                      "detail": "process table unavailable (%s) -- not asserting staleness" % exc}
+    rows.append(origin_row)
+
+    # Demurrage: capture evidence older than the newest frontend edit certifies the previous build.
+    manifest = os.path.join(out_dir, "manifest.json")
+    try:
+        man_mt = os.path.getmtime(manifest)
+    except OSError:
+        man_mt = None
+    _, fe_mt = newest_frontend_mtime(pin.get("frontend_root") or os.getcwd())
+    if man_mt is None:
+        rows.append({"check": "evidence", "ok": True, "detail": "no manifest yet (nothing stale)"})
+    elif fe_mt is not None and fe_mt > man_mt:
+        rows.append({"check": "evidence", "ok": False,
+                     "detail": "manifest %s predates a frontend edit at %s" % (_iso(man_mt), _iso(fe_mt))})
+    else:
+        rows.append({"check": "evidence", "ok": True, "detail": "manifest %s" % _iso(man_mt)})
+    return rows
+
+
 def sweep(index=None, fresh_index_fn=None):
     """Apply the reap rule across every ledger in the cache dir. Returns a result dict:
         {"ledgers": n, "reaped": [entry,...], "pruned": n, "failed": [entry,...], "skipped": n}
@@ -815,6 +979,19 @@ def main(argv=None):
     p_down = sub.add_parser("teardown", help="kill this session's verified origins, remove ledger")
     add_key(p_down)
 
+    p_pin = sub.add_parser("pin", help="freeze this session's dispatch context to <out-dir>/" + PIN_FILENAME)
+    add_key(p_pin)
+    p_pin.add_argument("--out-dir", required=True)
+    p_pin.add_argument("--url", help="origin URL (required unless --check)")
+    p_pin.add_argument("--states", help="path to the project's visual-states.json")
+    p_pin.add_argument("--matrix", help="cell matrix, e.g. 1440x900@1,768x1024@1,390x844@1")
+    p_pin.add_argument("--settle", type=int, help="post-ready dwell in ms")
+    p_pin.add_argument("--native", help="the surface's native cell, e.g. 1440x900@1 (first matrix cell)")
+    p_pin.add_argument("--suppressions", help="path to a rung-0 suppressions file (JSON)")
+    p_pin.add_argument("--frontend-root", help="root for the demurrage walk (default: cwd)")
+    p_pin.add_argument("--check", action="store_true",
+                       help="re-stat an existing pin instead of writing one (shadow: always exits 0)")
+
     args = parser.parse_args(argv)
 
     if args.cmd == "record":
@@ -845,6 +1022,42 @@ def main(argv=None):
             owner = {True: "owner alive", False: "owner dead", None: "owner unknown"}[r["owner_alive"]]
             state = "live" if r["origin_verified"] else "stale"
             print("[%s] %s  (%s, %s)" % (r["session"], _describe(r["entry"]), state, owner))
+        return 0
+
+    if args.cmd == "pin":
+        if args.check:
+            rows = check_pin(args.out_dir)
+            for r in rows:
+                print("%s %-9s %s" % ("ok  " if r["ok"] else "WARN", r["check"], r["detail"]))
+            stale = [r for r in rows if not r["ok"]]
+            if stale:
+                # SHADOW, not enforcement: recorded for the fire data that would justify a hard
+                # block later, and surfaced to the caller -- but the exit code stays 0, so a
+                # dispatcher script can never be wedged by this check's own false positive.
+                try:
+                    os.makedirs(cache_dir(), exist_ok=True)
+                    with open(shadow_log_path(), "a", encoding="utf-8") as f:
+                        f.write("%s WOULD-BLOCK %s %s\n"
+                                % (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                   args.out_dir, "; ".join("%s: %s" % (r["check"], r["detail"])
+                                                           for r in stale)))
+                except OSError:
+                    pass
+                print("WOULD-BLOCK: %d stale claim(s) -- name them in the dispatch or refresh the pin"
+                      % len(stale))
+            return 0
+        if not args.url:
+            print("pin: --url is required when writing a pin", file=sys.stderr)
+            return 2
+        key = _resolve_key(args)
+        pin = write_pin(key, args.url, args.out_dir, states=args.states, matrix=args.matrix,
+                        settle=args.settle, frontend_root=args.frontend_root,
+                        native=args.native, suppressions=args.suppressions)
+        print("pinned %s" % pin_path(args.out_dir))
+        print("  origin=%s  matrix=%s  native=%s  states=%s  suppressions=%s  settle=%s"
+              % (pin["origin"], pin["matrix"] or "-", pin["native"] or "-",
+                 pin["states_manifest"] or "-", pin["suppressions"] or "-",
+                 pin["settle"] if pin["settle"] is not None else "-"))
         return 0
 
     if args.cmd == "teardown":

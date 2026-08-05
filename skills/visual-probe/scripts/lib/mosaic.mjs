@@ -36,7 +36,21 @@ export function pngSize(buf) {
 // Slice ONE capture into segment tiles. See the header for the two calibration fixes.
 // src: {name, href, pngW, pngH, vw, vh, dsf, crop?: {x, width}} — vw/vh are the cell's CSS viewport,
 // crop is a horizontal content window in PNG pixels.
+//
+// A PLACEHOLDER source ({placeholder: true, name, reason}) has no frame behind it: it is a coverage
+// hole, rendered INTO the sheet as one visually-distinct labeled tile so the gap is physically
+// present in the image a reader looks at, instead of living only in a manifest field they may not
+// reach. It yields exactly one tile and is never a captured cell — see tallyTiles().
 export function planTiles(src, { tileH = 400, minSegment = 24 } = {}) {
+  if (src.placeholder) {
+    const vw = src.vw > 0 ? src.vw : 4;
+    const vh = src.vh > 0 ? src.vh : 3;
+    return [{
+      name: src.name, placeholder: true, reason: src.reason || '',
+      w: Math.max(1, Math.round(tileH * (vw / vh))), h: tileH,
+      caption: `${src.name} · NOT CAPTURED`,
+    }];
+  }
   const dsf = src.dsf > 0 ? src.dsf : 1;
   const srcX = src.crop ? src.crop.x : 0;
   const srcW = src.crop ? src.crop.width : src.pngW;
@@ -116,16 +130,37 @@ function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 
+// Sheet tile census. The ONE rule this function exists to enforce: a placeholder is not a captured
+// cell. Every tally in the manifest counts through here, so no consumer can ever add a hole into a
+// coverage number by reading `tiles.length`.
+export function tallyTiles(sheets) {
+  let tiles = 0, placeholders = 0;
+  for (const s of sheets) {
+    for (const t of s.tiles) {
+      if (t.placeholder) placeholders++;
+      else tiles++;
+    }
+  }
+  return { sheets: sheets.length, tiles, placeholders };
+}
+
 // Render one planned sheet. Hidden <img> preloads exist so the harness can wait on a deterministic
 // signal — CSS background images alone give no per-image load handle to await.
 export function sheetHtml(sheet, { title = 'mosaic', captionH = 14, background = '#7a7a7a' } = {}) {
-  const srcs = [...new Set(sheet.tiles.map((t) => t.href))];
-  const tiles = sheet.tiles.map((t) => (
-    `<div class="t" style="left:${t.x}px;top:${t.y}px;width:${t.w}px;height:${t.h}px;` +
-    `background-image:url('${esc(t.href)}');background-size:${t.bgW}px auto;` +
-    `background-position:${t.bgX}px ${t.bgY}px"></div>` +
-    `<div class="c" style="left:${t.x}px;top:${t.y + t.h}px;width:${t.w}px">${esc(t.caption)}</div>`
-  )).join('\n');
+  const srcs = [...new Set(sheet.tiles.filter((t) => !t.placeholder).map((t) => t.href))];
+  const tiles = sheet.tiles.map((t) => {
+    const cap = `<div class="c" style="left:${t.x}px;top:${t.y + t.h}px;width:${t.w}px">${esc(t.caption)}</div>`;
+    // A placeholder must not be mistakable for a captured tile at a glance — hatched, hard-bordered,
+    // and carrying its own reason as ink. Nothing is drawn from a frame, because there is no frame.
+    if (t.placeholder) {
+      return `<div class="t ph" style="left:${t.x}px;top:${t.y}px;width:${t.w}px;height:${t.h}px">` +
+        `<div class="phi"><div class="pht">NOT CAPTURED</div>` +
+        `<div class="phn">${esc(t.name)}</div><div class="phr">${esc(t.reason || 'coverage hole')}</div></div></div>` + cap;
+    }
+    return `<div class="t" style="left:${t.x}px;top:${t.y}px;width:${t.w}px;height:${t.h}px;` +
+      `background-image:url('${esc(t.href)}');background-size:${t.bgW}px auto;` +
+      `background-position:${t.bgX}px ${t.bgY}px"></div>` + cap;
+  }).join('\n');
   return `<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>${esc(title)}</title><style>
   html,body { margin:0; padding:0; background:${background}; }
@@ -133,6 +168,12 @@ export function sheetHtml(sheet, { title = 'mosaic', captionH = 14, background =
          font:11px/1.2 Consolas,'DejaVu Sans Mono',monospace; }
   .t { position:absolute; background-repeat:no-repeat; background-color:#fff; outline:1px solid #2a2a2a; }
   .c { position:absolute; height:${captionH}px; color:#fff; overflow:hidden; white-space:nowrap; }
+  .ph { background:repeating-linear-gradient(45deg,#3a1420 0 12px,#5e1d2e 12px 24px);
+        outline:3px solid #ff3b6b; display:flex; align-items:center; justify-content:center; }
+  .phi { text-align:center; color:#ffd9e2; padding:4px; overflow:hidden; }
+  .pht { font-size:15px; font-weight:700; letter-spacing:1px; color:#ff8fa8; }
+  .phn { font-size:11px; margin-top:4px; word-break:break-all; }
+  .phr { font-size:10px; margin-top:2px; opacity:.85; word-break:break-all; }
   #preload { position:absolute; left:-9999px; top:0; }
 </style></head><body>
 ${tiles}

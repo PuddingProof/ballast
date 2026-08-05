@@ -27,6 +27,10 @@ The engine version is pinned exactly in `package.json` + `package-lock.json`. Bu
 
 | Command | Use |
 |---|---|
+| `glance --url <base> [--urls u1,u2] [--matrix M] [--states F --skip-drive-hooks] [--deadline MS] [--epoch ISO] --out DIR` | FUSED cheap rung: preflight + viewport-clamped capture + rung-0 + contact sheets, one process, one browser launch. `glance --wait <dir> [--since ISO]` polls for a capture fired ahead of a dispatch instead (exit 3 = run it yourself). |
+| `review-capture --url <base> [--urls …] [--states F] [--matrix M] [--group RE] [--no-dsf-triad] --out DIR` | FUSED deep rung: full-page frames, the state sweep, console/pageerror/requestfailed listeners per cell, the DSF triad at the native cell, sheets grouped per route×theme |
+| `measure --url <u> [--selector S \| --selectors S1,S2] [--checks contrast,rects,fonts,targets,overflow] --out DIR` | deterministic instruments — composited-pixel contrast, painted-box overlap, font sizes, hit targets, overflow: compact summary to stdout, full record in `measure-<n>-<pid>.json` |
+| `crop --url <u> --selector S [--matrix M] [--magnify N] --out DIR` | post-hoc magnified evidence for one region; MERGES into the out-dir's manifest under `crops` (a failure lands in `cropHoles`, never coverage) |
 | `doctor` | environment self-check |
 | `selftest` | regression guard `doctor` doesn't cover: the `read.mjs` role→selector mapping round-trips + capture. Run after an Edge/Playwright/Claude-Code update. |
 | `shot <url\|path> [--matrix M] [--crop sel] [--magnify N] [--out DIR]` | navigate + capture the fidelity matrix. "Just show me how it renders." |

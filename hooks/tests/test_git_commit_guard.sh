@@ -108,6 +108,46 @@ check "add&&commit -m still blk" "$(P 'git add x && git commit -m \"y\"')"      
 check "msg quotes ; no block"  "$(P 'git commit -m \"a; git push b\"')"                        0 -                   BLOCKED
 check "real chain after -m blk" "$(P 'git commit -m \"x\" && git push')"                       2 "BLOCKED (compound" -
 
+# --- COMMIT-CYCLE NUDGE DEDUP: the review nudge's job is once per commit cycle, so a marker
+# (<home>/.cache/ballast-commitguard/nudge-<sid>) records "nudged, commit still pending" and a
+# `git commit` passing through the guard clears it. HERMETIC: BALLAST_CLAUDE_HOME points the
+# marker dir at a throwaway temp home, never the developer's real ~/.claude. The sid is grepped
+# out of the RAW payload, so these payloads must carry a session_id field -- the P() helper's
+# don't, which is exactly why every case above nudges unconditionally (fail-open, no sid). ---
+HERMETIC_HOME="$(mktemp -d 2>/dev/null || echo "${TMPDIR:-/tmp}/gcg-home.$$")"
+mkdir -p "$HERMETIC_HOME"
+export BALLAST_CLAUDE_HOME="$HERMETIC_HOME"
+MARKERS="$HERMETIC_HOME/.cache/ballast-commitguard"
+
+# PS <session_id> <command> -- payload carrying a session_id, the key the dedup marker is named for.
+PS() { printf '{"tool_name":"Bash","session_id":"%s","tool_input":{"command":"%s"}}' "$1" "$2"; }
+
+# check_marker <name> <sid> <exists|absent>
+check_marker() {
+  local name="$1" sid="$2" want="$3" got=absent
+  [ -f "$MARKERS/nudge-$sid" ] && got=exists
+  if [ "$got" = "$want" ]; then printf 'PASS  %-38s marker=%s\n' "$name" "$got"
+  else printf 'FAIL  %-38s marker=%s (want %s)\n' "$name" "$got" "$want"; fails=$((fails+1)); fi
+}
+
+check_marker "cycle: no marker before first diff" cd1 absent
+check "cycle: first diff nudges"     "$(PS cd1 'git diff')"        0 "review pass" -
+check_marker "cycle: marker set by nudge" cd1 exists
+check "cycle: second diff silent"    "$(PS cd1 'git diff')"        0 -             REMINDER
+check "cycle: git log also silent"   "$(PS cd1 'git log --oneline')" 0 -           REMINDER
+# Dedup is SCOPED to the review nudge: every other reminder still fires inside the same cycle.
+check "cycle: bulk-add caution still fires" "$(PS cd1 'git add -A')" 0 "bulk staging" -
+check "cycle: push reminder still fires"    "$(PS cd1 'git push origin main')" 0 "off-site" -
+# A commit ends the cycle -- marker cleared, next inspection re-arms.
+check "cycle: commit is silent"      "$(PS cd1 'git commit -m x')" 0 -             REMINDER
+check_marker "cycle: commit cleared marker" cd1 absent
+check "cycle: diff after commit nudges" "$(PS cd1 'git diff')"     0 "review pass" -
+# Per-session marker: a second session is unaffected by the first's cycle.
+check "cycle: other session nudges"  "$(PS cd2 'git diff')"        0 "review pass" -
+# FAIL OPEN: no extractable sid -> no dedup at all, every inspection nudges (pre-dedup behavior).
+check "cycle: no sid nudges once"    "$(P 'git diff')"             0 "review pass" -
+check "cycle: no sid nudges again"   "$(P 'git diff')"             0 "review pass" -
+
 # --- C1b regression: BALLAST_SIDECAR_REVIEW=1 (inherited from bin/ballast-review by the sidecar
 # session) silently suppresses the review nudge -- the reviewer must not be told to review itself.
 # Suppression is SCOPED to the nudges: the exit-2 compound hard block must stay live in sidecars
@@ -118,6 +158,7 @@ BALLAST_SIDECAR_REVIEW=1 check "sidecar suppresses nudge" "$(P 'git diff')" 0 - 
 BALLAST_SIDECAR_REVIEW=1 check "sidecar keeps hard block" "$(P 'git add -A && git commit -m x')" 2 "BLOCKED (compound" -
 
 rm -f "$tmperr" 2>/dev/null
+rm -rf "$HERMETIC_HOME" 2>/dev/null
 echo
 [ "$fails" = 0 ] && echo "ALL git-commit-guard TESTS PASS" || echo "$fails FAILURES"
 exit "$fails"

@@ -134,14 +134,49 @@ inspecting=0
 # ...but NOT when the SAME command also commits: `git commit && git log` would deliver the nudge
 # together with the commit's result, i.e. after the commit already ran. The review nudge is only
 # useful on a STANDALONE pre-commit inspection, so a command that commits suppresses it.
-printf '%s' "$cmd" | grep -qE "${L}git commit${R}" && inspecting=0
+has_commit=0
+printf '%s' "$cmd" | grep -qE "${L}git commit${R}" && has_commit=1
+[ "$has_commit" -eq 1 ] && inspecting=0
+
+# COMMIT-CYCLE NUDGE DEDUP: the review nudge's job is once per commit cycle, but sessions run
+# many exploratory diffs (audit data: this nudge was the plugin's single largest injection
+# volume) -- so a marker records "nudged, commit still pending" and a commit CLEARS it, re-arming
+# the next cycle. LAZY + MEMOIZED sid resolution: the grep+sed forks run only on the rare
+# commit/nudge branches, never on the every-git-call path (this file's header records the
+# fork-count history that makes that load-bearing). FAIL OPEN: no sid / no home dir -> ckdir
+# stays empty -> no dedup, nudge every time (the pre-dedup behavior). A compound-blocked commit
+# exits above before the clear -- correct: only a commit that actually runs ends a cycle.
+sid=""
+ckdir=""
+ckdir_resolved=0
+resolve_ckdir() {
+  [ "$ckdir_resolved" -eq 1 ] && return 0
+  ckdir_resolved=1
+  local home_dir="${BALLAST_CLAUDE_HOME:-${HOME:+$HOME/.claude}}"
+  [ -n "$home_dir" ] || return 0
+  sid="$(printf '%s' "$payload" | grep -oE '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
+  [ -n "$sid" ] && ckdir="$home_dir/.cache/ballast-commitguard"
+  return 0
+}
+if [ "$has_commit" -eq 1 ]; then
+  resolve_ckdir
+  [ -n "$ckdir" ] && rm -f "$ckdir/nudge-$sid" 2>/dev/null
+fi
 # Sidecar suppression, for the now-DORMANT bin/ballast-review shim: run manually it exports
 # BALLAST_SIDECAR_REVIEW=1 into its headless session's hook processes, and that session must not be
 # nudged to review itself. Scoped to the pre-commit nudges ONLY -- the exit-2 hard block and the
 # amend/reset/push cautions above stay live there, enforcing the shim's read-only intent if it ever
 # drifts toward a write. The primary path, the inline ballast:code-review skill, runs in the main
 # session and needs no suppression.
-if [ "$inspecting" -eq 1 ] && [ "${BALLAST_SIDECAR_REVIEW:-}" != "1" ]; then
+[ "$inspecting" -eq 1 ] && resolve_ckdir
+if [ "$inspecting" -eq 1 ] && [ -n "$ckdir" ] && [ -f "$ckdir/nudge-$sid" ]; then
+  # Already nudged this commit cycle (marker cleared by the next git commit). Record the
+  # suppressed fire so trigger-frequency audits can still see it -- a cooldown-suppressed match
+  # leaves no fire-ledger row (no output), and "suppressed" must stay distinguishable from
+  # "never matched".
+  printf '%s suppressed sid=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sid" >> "$ckdir/suppressed.log" 2>/dev/null
+elif [ "$inspecting" -eq 1 ] && [ "${BALLAST_SIDECAR_REVIEW:-}" != "1" ]; then
+  # (the cycle marker is touched at the end of this branch and cleared above when a commit runs)
   # `ballast:code-review` below keeps its namespace prefix ON PURPOSE: it disambiguates from NATIVE
   # /code-review (a real name collision), and this fork always ships as the namespaced plugin skill,
   # so skills/CLAUDE.md's prose-ify convention (for skills whose install form varies) doesn't apply.
@@ -153,6 +188,10 @@ if [ "$inspecting" -eq 1 ] && [ "${BALLAST_SIDECAR_REVIEW:-}" != "1" ]; then
   # fire it at the reliable pre-commit moment for multi-part work. Named as prose (not literal
   # invocation syntax) so it resolves for a personal or a namespaced plugin install alike.
   msgs+=("Multi-part change (built across multiple files / waves / subagents)? Invoke the integration-gate skill to sweep the whole combined diff for cross-cutting bugs before committing -- skip for a single-file edit.")
+  if [ -n "$ckdir" ]; then
+    { mkdir -p "$ckdir" && touch "$ckdir/nudge-$sid"
+      find "$ckdir" -type f -mmin +2880 -exec rm -f {} + ; } 2>/dev/null
+  fi
 fi
 
 # 2) SHARED-REPO STAGING HAZARDS -- on the dangerous command itself.

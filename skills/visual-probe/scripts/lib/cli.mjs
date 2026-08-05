@@ -7,16 +7,20 @@ import fs from 'fs';
 import path from 'path';
 import { parseMatrix, cellObj } from './matrix.mjs';
 import { guardUrl } from './urlguard.mjs';
-import { magnify, aHash, hamming, DEFAULT_OUT } from './capture.mjs';
+import { buildEntries, DEFAULT_OUT } from './capture.mjs';
 import { makeHelper } from './helpers.mjs';
 import { aggregateRung0, readSuppressionsFile } from './assertions.mjs';
-import { pngSize, planSheets, sheetHtml, measureContentBox } from './mosaic.mjs';
+import { sourcesFromManifest, renderSheets } from './compose.mjs';
 import { startSession, lookSession, readSession, doSession, stopSession, firstRealPage } from './session.mjs';
-import { runServeChild, startServe, statusServe, stopServe } from './serve.mjs';
+import { startServe, statusServe, stopServe } from './serve.mjs';
 import { runSelfTest } from './selftest.mjs';
 import { EDGE_NO_SYNC } from './edge-privacy.mjs';
+import { runGlance, runReviewCapture, runMeasure, runCrop } from './fused.mjs';
 
-export async function main(argv) {
+// `timing` comes from the bootstrap (probe.mjs): the process's own t0 and the ms spent importing
+// this module. The fused verbs stamp both into the manifest's budget block, so a leaf's wall-clock
+// is attributable to stages instead of reconstructed from transcripts after the fact.
+export async function main(argv, timing = {}) {
   const cmd = argv[0];
   const positional = [];
   const opts = {};
@@ -171,9 +175,6 @@ export async function main(argv) {
     // A dedicated ephemeral Edge for image post-processing — keeps magnify/hash off any CDP-attached app.
     const imgBrowser = await chromium.launch(EDGE);
     try {
-      const byLabel = {};
-      for (const s of snapshots) (byLabel[s.label] ||= []).push(s);
-
       // A scenario declares states it could not force by exporting `coverageHoles` — surfaced here
       // as manifest data (never stderr-only), because a hole absorbed silently reads as a pass.
       const coverageHoles = Array.isArray(scenarioModule?.coverageHoles) ? scenarioModule.coverageHoles : [];
@@ -192,35 +193,10 @@ export async function main(argv) {
         note: 'READ manifest first, then read ONLY the .xN.png magnified crops of cells flagged `diverges:true` — never the inline full-frame thumbnails (the agent Read path downscales and hides sub-pixel defects). `coverageHoles` lists states this run could not force: they are not asserts and do not affect `pass`, but they block a clean verdict. `rung0` lists deterministic geometry findings (overlap / overflow / contrast / broken-image / offscreen / misalignment) per `<label>__<cell>`: SHADOW-LOGGED advisory data — it does not affect `pass` — pre-locating where to look; entries with `suppressed:true` were declared intended by the project. `rung0UnusedSuppressions` lists declared suppressions that matched nothing (stale, or malformed).',
       };
 
-      for (const [label, snaps] of Object.entries(byLabel)) {
-        const entries = [];
-        for (const s of snaps) {
-          const base = `${label}__${s.cell.label}`.replace(/[^\w.@-]/g, '_');
-          const nativeFile = path.join(OUT, `${base}.png`);
-          fs.writeFileSync(nativeFile, s.buf);
-
-          // Magnify ONLY cropped snapshots (a full-page 8× blow-up would be enormous and useless).
-          let magnified = null;
-          if (s.opts?.crop) {
-            try { magnified = await magnify(imgBrowser, s.buf, MAGNIFY, path.join(OUT, `${base}.x${MAGNIFY}.png`)); }
-            catch (e) { log('magnify failed for', base, '-', e.message); }
-          }
-
-          let hash = null;
-          try { hash = await aHash(imgBrowser, s.buf); } catch (e) { log('hash failed for', base, '-', e.message); }
-
-          entries.push({ cell: s.cell.label, dsf: s.cell.dsf, file: nativeFile, magnified, bytes: s.buf.length, aHash: hash });
-        }
-
-        // Cross-cell divergence vs the baseline cell (size-normalized aHash Hamming distance).
-        const baseEntry = entries.find((e) => e.cell === baselineLabel) || entries[0];
-        for (const e of entries) {
-          const d = hamming(e.aHash, baseEntry.aHash);
-          e.divergenceVsBaseline = Number.isFinite(d) ? d : null;
-          e.diverges = e.cell !== baseEntry.cell && Number.isFinite(d) && d > THRESHOLD;
-        }
-        manifest.snapshots.push({ label, baseline: baseEntry.cell, entries });
-      }
+      manifest.snapshots = await buildEntries({
+        browser: imgBrowser, snapshots, outDir: OUT,
+        magnifyFactor: MAGNIFY, threshold: THRESHOLD, baselineLabel, log,
+      });
 
       manifest.pass = asserts.every((a) => a.pass);
       const manifestFile = path.join(OUT, 'manifest.json');
@@ -260,72 +236,18 @@ export async function main(argv) {
     const manifestFile = path.join(dir, 'manifest.json');
     if (!fs.existsSync(manifestFile)) throw new Error(`no manifest.json in ${dir} — compose reads a finished capture out-dir`);
     const m = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
-    const tileH = +(opts['tile-height'] || 400);
-    const maxSide = +(opts['max-side'] || 1568);
     const groupRe = opts.group && opts.group !== true ? new RegExp(opts.group) : null;
-    const geo = new Map((m.cellGeometry || []).map((c) => [c.label, c]));
-
-    const sources = [];
-    const skipped = [];
-    for (const snap of m.snapshots || []) {
-      for (const e of snap.entries || []) {
-        const name = `${snap.label} · ${e.cell}`;
-        const file = path.isAbsolute(e.file) ? e.file : path.join(dir, e.file);
-        if (!fs.existsSync(file)) { skipped.push({ name, reason: `frame not on disk: ${file}` }); continue; }
-        // Cell geometry: the manifest's own record first, then a WxH@DSF label (inline matrices),
-        // then give up loudly — a guessed aspect would silently mis-slice every segment.
-        let g = geo.get(e.cell);
-        if (!g) { const mm = /(\d+)x(\d+)@([\d.]+)/.exec(e.cell); if (mm) g = { width: +mm[1], height: +mm[2], dsf: +mm[3] }; }
-        if (!g || !(g.width > 0) || !(g.height > 0)) {
-          skipped.push({ name, reason: `no viewport geometry for cell "${e.cell}" (no cellGeometry in the manifest and the label is not WxH@DSF)` });
-          continue;
-        }
-        const dims = pngSize(fs.readFileSync(file));
-        const hit = groupRe ? groupRe.exec(name) : null;
-        sources.push({
-          group: groupRe ? (hit ? (hit[1] ?? hit[0]) : 'ungrouped') : '',
-          name, file, href: encodeURI(path.relative(dir, file).split(path.sep).join('/')),
-          pngW: dims.width, pngH: dims.height, vw: g.width, vh: g.height, dsf: g.dsf || 1,
-        });
-      }
-    }
+    const { sources, skipped } = sourcesFromManifest(m, dir, { groupRe });
     if (!sources.length) throw new Error(`no composable frames in ${dir}${skipped.length ? ` — ${skipped.length} skipped: ${skipped[0].reason}` : ''}`);
 
     const browser = await chromium.launch(EDGE);
-    const out = [];
+    let out = [];
     try {
-      if (opts['crop-content']) {
-        for (const s of sources) {
-          try {
-            const box = await measureContentBox(browser, fs.readFileSync(s.file));
-            if (box) s.crop = box;
-          } catch (e) { log('content-crop measure failed for', s.name, '-', e.message); }
-        }
-      }
-      for (const grp of [...new Set(sources.map((s) => s.group))]) {
-        const sheets = planSheets(sources.filter((s) => s.group === grp), { tileH, maxSide, group: grp });
-        for (const sheet of sheets) {
-          const stem = ['mosaic', grp, sheets.length > 1 ? String(sheet.index + 1) : '']
-            .filter(Boolean).join('-').replace(/[^\w.@-]/g, '_');
-          const htmlFile = path.join(dir, `${stem}.html`);
-          fs.writeFileSync(htmlFile, sheetHtml(sheet, { title: stem }));
-          const ctx = await browser.newContext({ viewport: { width: sheet.width, height: sheet.height }, deviceScaleFactor: 1 });
-          try {
-            const page = await ctx.newPage();
-            page.setDefaultTimeout(TIMEOUT);
-            await page.goto(pathToFileURL(htmlFile).href, { waitUntil: 'load' });
-            // The tiles paint from CSS backgrounds, which give no per-image handle; the sheet
-            // carries hidden <img> preloads of the same sources purely so this wait is real.
-            await page.evaluate(async () => {
-              await Promise.all(Array.from(document.images).map((i) => (i.complete ? null : new Promise((r) => { i.onload = i.onerror = r; }))));
-            });
-            const pngFile = path.join(dir, `${stem}.png`);
-            fs.writeFileSync(pngFile, await page.screenshot({ clip: { x: 0, y: 0, width: sheet.width, height: sheet.height } }));
-            out.push({ group: grp || null, sheet: sheet.index + 1, of: sheets.length, file: pngFile, html: htmlFile,
-              width: sheet.width, height: sheet.height, tiles: sheet.tiles.length });
-          } finally { await ctx.close(); }
-        }
-      }
+      ({ sheets: out } = await renderSheets({
+        browser, dir, sources,
+        tileH: +(opts['tile-height'] || 400), maxSide: +(opts['max-side'] || 1568),
+        cropContent: !!opts['crop-content'], timeout: TIMEOUT, log,
+      }));
     } finally { await browser.close(); }
 
     for (const s of out) log(`sheet ${s.file} — ${s.width}×${s.height}, ${s.tiles} tile(s)${s.group ? ` [${s.group}]` : ''}`);
@@ -334,9 +256,25 @@ export async function main(argv) {
     console.log(JSON.stringify({ sheets: out, skipped }, null, 2));
   }
 
+  // Everything the fused verbs need from this parser, handed over as one context object — they own
+  // their own pipeline (lib/fused.mjs) but must not re-derive the flag semantics that every other
+  // verb already agreed on (settle validation, out-dir resolution, the Edge launch options).
+  const ctx = {
+    opts, positional, OUT, EDGE, MAGNIFY, TIMEOUT, THRESHOLD, SETTLE, RUNG0_ON,
+    flagSuppressions, log, timing, resolveTarget,
+  };
+
   try {
     if (cmd === 'doctor') {
       await doctor();
+    } else if (cmd === 'glance') {
+      await runGlance(ctx);
+    } else if (cmd === 'review-capture') {
+      await runReviewCapture(ctx);
+    } else if (cmd === 'measure') {
+      await runMeasure(ctx);
+    } else if (cmd === 'crop') {
+      await runCrop(ctx);
     } else if (cmd === 'selftest') {
       const r = await runSelfTest({ channel: EDGE.channel });
       for (const c of r.results) log(`${c.ok ? 'PASS' : 'FAIL'}  ${c.name} — ${c.detail}`);
@@ -356,9 +294,6 @@ export async function main(argv) {
       await runCells({ scenario: mod.default, scenarioModule: mod, target, matrix: parseMatrix(opts.matrix), crop: opts.crop });
     } else if (cmd === 'compose') {
       await compose();
-    } else if (cmd === '__serve-child') {
-      // hidden: the detached server process spawned by `serve start` (see lib/serve.mjs)
-      runServeChild({ root: positional[0], port: +positional[1] });
     } else if (cmd === 'serve') {
       const sub = positional[0];
       if (sub === 'start') {
@@ -407,7 +342,7 @@ export async function main(argv) {
         process.exit(2);
       }
     } else {
-      log('usage: probe.mjs <doctor | shot <url> | run <scenario.mjs> | compose <out-dir> | serve … | session …> [flags] — see file header or --help');
+      log('usage: probe.mjs <glance | review-capture | measure | crop | doctor | shot <url> | run <scenario.mjs> | compose <out-dir> | serve … | session …> [flags] — see file header or --help');
       process.exit(2);
     }
   } catch (e) {

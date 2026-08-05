@@ -2,13 +2,14 @@
 // so the tool stays dependency-free beyond Playwright itself — no sharp, no pixelmatch, no jimp.
 
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 // Default capture directory: a namespaced OS-temp dir, NEVER the repo working tree — so frames
 // (look/shot/run PNGs + manifest) can't be accidentally git-added or committed. `session start`/`stop`
 // wipe it so it doesn't accumulate; pass `--out <dir>` to keep frames somewhere durable on purpose.
-export const DEFAULT_OUT = path.join(os.tmpdir(), 'visual-probe-out');
+// DEFINED in lib/budget.mjs (stdlib-only, so probe.mjs's pre-import bootstrap can resolve the same
+// default) and re-exported here, where every existing caller already imports it.
+export { DEFAULT_OUT } from './budget.mjs';
 
 // Capture a screenshot at the current cell's NATIVE device resolution.
 // If `crop` (a CSS selector) is given, clip to that element's bounding box; else full page.
@@ -84,6 +85,48 @@ export async function aHash(browser, pngBuf) {
   } finally {
     await ctx.close();
   }
+}
+
+// Write every captured frame, magnify the cropped ones, hash them all, and score cross-cell
+// divergence — the manifest's `snapshots` array, built once for BOTH callers: the classic
+// shot/run `flush()` (which hands in its dedicated post-processing browser) and the fused verbs
+// (which hand in the capture browser they are already holding). One implementation, so the
+// divergence arithmetic cannot drift between the two paths.
+export async function buildEntries({ browser, snapshots, outDir, magnifyFactor = 8, threshold = 6, baselineLabel, log = () => {} }) {
+  const byLabel = {};
+  for (const s of snapshots) (byLabel[s.label] ||= []).push(s);
+
+  const out = [];
+  for (const [label, snaps] of Object.entries(byLabel)) {
+    const entries = [];
+    for (const s of snaps) {
+      const base = `${label}__${s.cell.label}`.replace(/[^\w.@-]/g, '_');
+      const nativeFile = path.join(outDir, `${base}.png`);
+      fs.writeFileSync(nativeFile, s.buf);
+
+      // Magnify ONLY cropped snapshots (a full-page 8× blow-up would be enormous and useless).
+      let magnified = null;
+      if (s.opts?.crop) {
+        try { magnified = await magnify(browser, s.buf, magnifyFactor, path.join(outDir, `${base}.x${magnifyFactor}.png`)); }
+        catch (e) { log('magnify failed for', base, '-', e.message); }
+      }
+
+      let hash = null;
+      try { hash = await aHash(browser, s.buf); } catch (e) { log('hash failed for', base, '-', e.message); }
+
+      entries.push({ cell: s.cell.label, dsf: s.cell.dsf, file: nativeFile, magnified, bytes: s.buf.length, aHash: hash });
+    }
+
+    // Cross-cell divergence vs the baseline cell (size-normalized aHash Hamming distance).
+    const baseEntry = entries.find((e) => e.cell === baselineLabel) || entries[0];
+    for (const e of entries) {
+      const d = hamming(e.aHash, baseEntry.aHash);
+      e.divergenceVsBaseline = Number.isFinite(d) ? d : null;
+      e.diverges = e.cell !== baseEntry.cell && Number.isFinite(d) && d > threshold;
+    }
+    out.push({ label, baseline: baseEntry.cell, entries });
+  }
+  return out;
 }
 
 // Hamming distance between two equal-length bit strings (with a length-mismatch penalty).

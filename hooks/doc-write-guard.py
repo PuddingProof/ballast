@@ -28,12 +28,23 @@
 # backslashes, and round-tripping that JSON through `printf | jq/python` in bash corrupts the
 # \-escapes. python parses and normalizes the path natively.
 #
-# NOISE CONTROL: PostToolUse de-dupes per (session, file) and prunes its marker cache so it can't
-# grow without bound. Every internal-error path FAILS OPEN -- a broken guard must NEVER brick all
-# file writes -- but not silently: each makes a best-effort systemMessage announcement, wrapped in
-# its own try/except so the announce can never change an exit code that must stay 0.
+# NOISE CONTROL: PostToolUse de-dupes per (session, file) AND rate-limits the session as a whole to
+# one nudge per BURST_WINDOW_SECONDS, then prunes its marker cache so it can't grow without bound.
+# Every internal-error path FAILS OPEN -- a broken guard must NEVER brick all file writes -- but not
+# silently: each makes a best-effort systemMessage announcement, wrapped in its own try/except so
+# the announce can never change an exit code that must stay 0.
 
 import sys, json, os, hashlib, time, glob, fnmatch
+
+# Soft-nudge burst window: at most one emitted nudge per session per this many seconds. The
+# per-(session, file) dedupe below is correct across a whole session but says nothing about a BATCH
+# -- an N-file write batch in one turn earned N identical reminders, and one reminder per window
+# carries the same steering at 1/N the context. A file suppressed by the window keeps its per-path
+# marker UNWRITTEN, so it can still earn its own nudge later in the session, and the suppression is
+# recorded to suppressed.log so an audit can tell it apart from "never matched". The window applies
+# to the GENERIC reminder only -- the skill-forge reminder is distinct and rare, so it bypasses
+# (see post_nudge).
+BURST_WINDOW_SECONDS = 180
 
 
 def _announce_error(site, skipped, permission_flow=True):
@@ -74,7 +85,7 @@ SESSION_OUTPUT_SEGMENTS = {".notes", "postmortem", "postmortems"}
 # as bare segments -- because a series dir is named after the skill that writes it, and that same name
 # is also the shipped skill dir (skills/harness-sweep/), which IS a durable authoring surface and must
 # keep nudging. Without this, the "/.claude/*.md" catch-all below re-catches every digest write.
-CLAUDE_OUTPUT_SEGMENTS = {"harness-sweep", "changelog-digests"}
+CLAUDE_OUTPUT_SEGMENTS = {"harness-sweep", "changelog-digests", "adversarial-audit"}
 
 
 def normalize(path):
@@ -171,7 +182,9 @@ def cache_dir():
 
 
 def prune(cache):
-    # Prune markers (gate + dedupe both live here) older than 2 days -- stale sessions won't accrue.
+    # Prune markers (gate + dedupe + burst-window `last-*` all live here) older than 2 days --
+    # stale sessions won't accrue. Deliberately a bare `*` glob, not a name pattern, so every
+    # marker family this dir grows is reaped without a second edit here.
     cutoff = time.time() - 2 * 86400
     for f in glob.glob(os.path.join(cache, "*")):
         try:
@@ -194,6 +207,42 @@ def already_nudged(session_id, norm_path):
     except Exception:
         pass
     return False
+
+
+def burst_marker(session_id):
+    return os.path.join(cache_dir(), "last-%s" % session_id)
+
+
+def in_burst_window(session_id):
+    # True only if this session EMITTED a nudge less than BURST_WINDOW_SECONDS ago. Any failure
+    # (no marker -- the normal first-nudge state -- unreadable dir, clock surprise) reads as False,
+    # i.e. fail open to the pre-window behavior: nudge.
+    try:
+        return (time.time() - os.path.getmtime(burst_marker(session_id))) < BURST_WINDOW_SECONDS
+    except Exception:
+        return False
+
+
+def log_suppressed(norm_path):
+    # A burst-suppressed fire leaves NO row anywhere: run.sh's fire ledger records the hook PROCESS,
+    # not its decision, and a suppressed nudge prints nothing. Without this line an audit cannot
+    # tell "suppressed by the window" from "never matched a durable doc" -- two very different
+    # answers to "why did the guard stay quiet". Best-effort: an unwritable log changes nothing.
+    try:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(os.path.join(cache_dir(), "suppressed.log"), "a", encoding="utf-8") as f:
+            f.write("%s suppressed %s\n" % (stamp, norm_path))
+    except Exception:
+        pass
+
+
+def touch_burst_marker(session_id):
+    # Called ONLY on an actually-emitted nudge -- the window measures emissions, not attempts, so a
+    # suppressed file neither refreshes the window nor burns its own per-path marker. Best-effort.
+    try:
+        open(burst_marker(session_id), "w").close()
+    except Exception:
+        pass
 
 
 def pre_gate(d):
@@ -242,9 +291,22 @@ def post_nudge(d):
     # Same ordering rationale as pre_gate: the file-backed user_excluded check runs last.
     if is_excluded(p, segs) or is_hard(segs, base) or not is_durable(p, segs, base) or user_excluded(p):
         return
-    if already_nudged(d.get("session_id") or "nosession", p):
+    session_id = d.get("session_id") or "nosession"
+    # SKILL_REMINDER-class paths BYPASS the window: the skill-forge steering is a DISTINCT and rare
+    # message, and a generic durable-docs reminder emitted seconds earlier must not eat it. Both
+    # classes stay subject to the per-path dedupe below, and both touch the marker when they emit.
+    is_skill = base == "skill.md"
+    # Burst window BEFORE the per-path dedupe on purpose: already_nudged() writes the per-path
+    # marker as a side effect, and a file suppressed here has not been nudged about yet.
+    # Residual, accepted: the check and touch_burst_marker() are not atomic, so two overlapping
+    # fires may both emit -- worst case equals the pre-window behavior of one nudge per file.
+    if not is_skill and in_burst_window(session_id):
+        log_suppressed(p)
         return
-    reminder = SKILL_REMINDER if base == "skill.md" else REMINDER
+    if already_nudged(session_id, p):
+        return
+    reminder = SKILL_REMINDER if is_skill else REMINDER
+    touch_burst_marker(session_id)
     print(json.dumps({
         "systemMessage": "📐 ballast: doc-write-guard — durable-doc altitude reminder injected",
         "hookSpecificOutput": {

@@ -550,6 +550,130 @@ class CliTests(LedgerTestCase):
         self.assertIn("stale", r.stdout)
 
 
+class PinTests(LedgerTestCase):
+    """The dispatch pin: frozen context in, re-stated liveness out. Nothing here can kill anything --
+    the pin is context, and `--check` is a SHADOW report that must never change an exit code."""
+
+    def out_dir(self):
+        d = os.path.join(self.tmp, "vp-out")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def test_pin_round_trip_carries_every_brief_field(self):
+        out = self.out_dir()
+        vol.write_pin("s1", "http://127.0.0.1:5233", out, states="/p/.claude/visual-states.json",
+                      matrix="1440x900@1,390x844@1", settle=250, frontend_root=self.tmp)
+        pin = vol.read_pin(out)
+        self.assertEqual(pin["origin"], "http://127.0.0.1:5233")
+        self.assertEqual(pin["out_dir"], out)
+        self.assertEqual(pin["states_manifest"], "/p/.claude/visual-states.json")
+        self.assertEqual(pin["matrix"], "1440x900@1,390x844@1")
+        self.assertEqual(pin["settle"], 250)
+        self.assertTrue(pin["pinned_at"])
+
+    def test_re_pin_overwrites_rather_than_merging(self):
+        out = self.out_dir()
+        vol.write_pin("s1", "http://a", out, matrix="1440x900@1", frontend_root=self.tmp)
+        vol.write_pin("s1", "http://b", out, frontend_root=self.tmp)
+        pin = vol.read_pin(out)
+        self.assertEqual(pin["origin"], "http://b")
+        self.assertIsNone(pin["matrix"])  # a stale field must not survive a re-pin
+
+    def test_demurrage_stamp_finds_the_newest_frontend_file(self):
+        root = os.path.join(self.tmp, "app")
+        os.makedirs(os.path.join(root, "node_modules"), exist_ok=True)
+        old = os.path.join(root, "old.css")
+        new = os.path.join(root, "new.tsx")
+        vendored = os.path.join(root, "node_modules", "vendor.js")
+        for p in (old, vendored):
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("x")
+        os.utime(old, (1, 1))
+        os.utime(vendored, (10 ** 9, 10 ** 9))  # far newer, but excluded by the walk
+        with open(new, "w", encoding="utf-8") as f:
+            f.write("y")
+        os.utime(new, (10 ** 8, 10 ** 8))
+        path, _ = vol.newest_frontend_mtime(root)
+        self.assertEqual(os.path.basename(path), "new.tsx")
+
+    def test_check_flags_evidence_older_than_the_newest_edit(self):
+        root = os.path.join(self.tmp, "app2")
+        os.makedirs(root, exist_ok=True)
+        out = self.out_dir()
+        vol.write_pin("s1", "http://127.0.0.1:5233", out, frontend_root=root)
+        manifest = os.path.join(out, "manifest.json")
+        with open(manifest, "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.utime(manifest, (10 ** 8, 10 ** 8))
+        edit = os.path.join(root, "late.css")
+        with open(edit, "w", encoding="utf-8") as f:
+            f.write("x")
+        os.utime(edit, (10 ** 8 + 500, 10 ** 8 + 500))
+        rows = {r["check"]: r for r in vol.check_pin(out)}
+        self.assertFalse(rows["evidence"]["ok"])
+        # Fresh evidence is the other direction of the same check.
+        os.utime(manifest, (10 ** 8 + 900, 10 ** 8 + 900))
+        rows = {r["check"]: r for r in vol.check_pin(out)}
+        self.assertTrue(rows["evidence"]["ok"])
+
+    def test_check_verifies_the_origin_against_the_ledger(self):
+        out = self.out_dir()
+        vol.write_pin("s1", "http://127.0.0.1:5173", out, frontend_root=self.tmp)
+        rows = {r["check"]: r for r in vol.check_pin(out)}
+        self.assertFalse(rows["origin"]["ok"])          # nothing recorded yet
+        self.write_ledger("s1", [self.entry()])
+        rows = {r["check"]: r for r in vol.check_pin(out)}
+        self.assertTrue(rows["origin"]["ok"])
+
+    def test_check_never_borrows_another_session_s_ledger_row(self):
+        # Same URL, another session's ledger: a cross-session match would report "origin verified"
+        # for a process THIS session never recorded (and may well have outlived).
+        out = self.out_dir()
+        vol.write_pin("s1", "http://127.0.0.1:5173", out, frontend_root=self.tmp)
+        self.write_ledger("s2", [self.entry()])
+        rows = {r["check"]: r for r in vol.check_pin(out)}
+        self.assertFalse(rows["origin"]["ok"])
+
+    def test_pin_carries_the_native_cell_and_suppressions_slots(self):
+        out = self.out_dir()
+        vol.write_pin("s1", "http://127.0.0.1:5233", out, matrix="1440x900@1,390x844@1",
+                      native="1440x900@1", suppressions="/p/.claude/vp-suppressions.json",
+                      frontend_root=self.tmp)
+        pin = vol.read_pin(out)
+        self.assertEqual(pin["native"], "1440x900@1")
+        self.assertEqual(pin["suppressions"], "/p/.claude/vp-suppressions.json")
+
+    def test_check_of_a_missing_pin_is_a_single_named_row(self):
+        rows = vol.check_pin(os.path.join(self.tmp, "nope"))
+        self.assertEqual([r["check"] for r in rows], ["pin"])
+        self.assertFalse(rows[0]["ok"])
+
+    def test_cli_pin_then_check_is_shadow_only(self):
+        out = self.out_dir()
+        env = dict(os.environ)
+
+        def cli(*args):
+            return subprocess.run([sys.executable, vol.__file__] + list(args),
+                                  capture_output=True, text=True, timeout=60, env=env)
+
+        r = cli("pin", "--session-key", "s1", "--url", "http://127.0.0.1:5233", "--out-dir", out,
+                "--matrix", "1440x900@1", "--frontend-root", self.tmp)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("pinned", r.stdout)
+
+        r = cli("pin", "--check", "--out-dir", out)
+        # The origin is unrecorded, so this run HAS a stale claim -- and still exits 0.
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("WOULD-BLOCK", r.stdout)
+        self.assertIn("WOULD-BLOCK", self.read_file(vol.shadow_log_path()))
+
+    def test_cli_pin_without_url_is_a_usage_error(self):
+        r = subprocess.run([sys.executable, vol.__file__, "pin", "--session-key", "s1",
+                            "--out-dir", self.out_dir()],
+                           capture_output=True, text=True, timeout=60, env=dict(os.environ))
+        self.assertEqual(r.returncode, 2)
+
+
 class ShimTests(LedgerTestCase):
     """The bin/ shim resolves an interpreter and forwards argv. Skipped where bash is absent."""
 

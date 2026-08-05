@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "doc-write-guard.py")
@@ -108,6 +109,19 @@ class HermeticTestCase(unittest.TestCase):
 
     def gate_marker_exists(self, session_id):
         return os.path.exists(os.path.join(self.tmp, ".cache", "docguard", "gate-%s" % session_id))
+
+    def burst_marker_path(self, session_id):
+        return os.path.join(self.tmp, ".cache", "docguard", "last-%s" % session_id)
+
+    def burst_marker_exists(self, session_id):
+        return os.path.exists(self.burst_marker_path(session_id))
+
+    def age_burst_marker(self, session_id, seconds):
+        """Backdate the session's last-emitted-nudge marker so the burst window has expired --
+        the deterministic stand-in for waiting BURST_WINDOW_SECONDS in real time."""
+        path = self.burst_marker_path(session_id)
+        when = time.time() - seconds
+        os.utime(path, (when, when))
 
 
 # =================================================================================================
@@ -297,6 +311,7 @@ class SoftNudgeFires(HermeticTestCase):
         # after the skill that writes it, and that same name is also the shipped skill dir. Bare-
         # segment matching would silence durable authoring surfaces that merely share the name.
         self._assert_nudges("C:/proj/harness-sweep/memory/notes.md")
+        self._assert_nudges("C:/proj/adversarial-audit/memory/notes.md", session_id="s1b")
 
     def test_readme_nudges(self):
         self._assert_nudges("C:/proj/README.md")
@@ -373,6 +388,7 @@ class R1SessionOutputRegression(HermeticTestCase):
         # Same catch-all proof as SWEEP-STATE above -- these would match "/.claude/*.md" otherwise.
         self._assert_silent("C:/proj/.claude/harness-sweep/2026-01-01-harness-sweep-deep.md")
         self._assert_silent("C:/proj/.claude/changelog-digests/2026-01-01-v1.0-v1.1.md")
+        self._assert_silent("C:/proj/.claude/adversarial-audit/2026-01-01-repo-audit.md")
 
 
 # =================================================================================================
@@ -396,14 +412,104 @@ class HardTierSilentOnPostAndDedupe(HermeticTestCase):
     def test_dedupe_different_file_same_session_still_fires(self):
         first = run_payload(post_payload("C:/proj/specs/plan.md", session_id="dupe-2"), self.env)
         self.assertNotEqual(first.stdout.strip(), "")
+        # Past the burst window (below), the per-(session, file) rule is what decides -- a
+        # DIFFERENT file in the same session still earns its own nudge.
+        self.age_burst_marker("dupe-2", 10_000)
         other = run_payload(post_payload("C:/proj/specs/other.md", session_id="dupe-2"), self.env)
         self.assertNotEqual(other.stdout.strip(), "")
 
     def test_dedupe_different_session_same_file_still_fires(self):
         first = run_payload(post_payload("C:/proj/specs/plan.md", session_id="dupe-3a"), self.env)
         self.assertNotEqual(first.stdout.strip(), "")
+        # The burst window is session-scoped, so a second session needs no aging here -- that it
+        # fires immediately is itself the proof the marker isn't global.
         other_session = run_payload(post_payload("C:/proj/specs/plan.md", session_id="dupe-3b"), self.env)
         self.assertNotEqual(other_session.stdout.strip(), "")
+
+
+# =================================================================================================
+# SOFT-NUDGE BURST WINDOW: at most one EMITTED nudge per session per BURST_WINDOW_SECONDS (180).
+# An N-file batch in one turn used to earn N identical reminders; one per window carries the same
+# steering. A suppressed file must not burn its per-path marker -- it can still nudge later.
+# =================================================================================================
+
+class SoftNudgeBurstWindow(HermeticTestCase):
+    def test_second_file_within_window_is_suppressed(self):
+        first = run_payload(post_payload("C:/proj/specs/plan.md", session_id="burst-1"), self.env)
+        self.assertNotEqual(first.stdout.strip(), "")
+        second = run_payload(post_payload("C:/proj/specs/other.md", session_id="burst-1"), self.env)
+        self.assertEqual(second.returncode, 0)
+        self.assertEqual(second.stdout.strip(), "", "a second file inside the window must stay silent")
+
+    def test_emitted_nudge_writes_the_session_marker(self):
+        self.assertFalse(self.burst_marker_exists("burst-2"))
+        run_payload(post_payload("C:/proj/specs/plan.md", session_id="burst-2"), self.env)
+        self.assertTrue(self.burst_marker_exists("burst-2"))
+
+    def test_emitted_nudge_refreshes_the_marker(self):
+        run_payload(post_payload("C:/proj/specs/plan.md", session_id="burst-3"), self.env)
+        self.age_burst_marker("burst-3", 10_000)
+        stale = os.path.getmtime(self.burst_marker_path("burst-3"))
+        second = run_payload(post_payload("C:/proj/specs/other.md", session_id="burst-3"), self.env)
+        self.assertNotEqual(second.stdout.strip(), "")
+        self.assertGreater(os.path.getmtime(self.burst_marker_path("burst-3")), stale,
+                            "an emitted nudge must restart the window")
+
+    def test_suppressed_file_still_nudges_after_the_window(self):
+        # The load-bearing half: suppression must NOT write the per-path marker, or the file would
+        # be silently consumed for the rest of the session.
+        run_payload(post_payload("C:/proj/specs/plan.md", session_id="burst-4"), self.env)
+        suppressed = run_payload(post_payload("C:/proj/specs/other.md", session_id="burst-4"), self.env)
+        self.assertEqual(suppressed.stdout.strip(), "")
+        self.age_burst_marker("burst-4", 181)
+        retried = run_payload(post_payload("C:/proj/specs/other.md", session_id="burst-4"), self.env)
+        self.assertNotEqual(retried.stdout.strip(), "",
+                            "a file suppressed by the window must still earn its nudge later")
+
+    def test_marker_just_inside_the_window_still_suppresses(self):
+        run_payload(post_payload("C:/proj/specs/plan.md", session_id="burst-5"), self.env)
+        self.age_burst_marker("burst-5", 179)
+        second = run_payload(post_payload("C:/proj/specs/other.md", session_id="burst-5"), self.env)
+        self.assertEqual(second.stdout.strip(), "")
+
+    def test_skill_reminder_bypasses_the_window(self):
+        # The skill-forge steering is a DISTINCT and rare message -- a generic durable-docs
+        # reminder emitted seconds earlier must not eat it.
+        first = run_payload(post_payload("C:/proj/specs/plan.md", session_id="burst-7"), self.env)
+        self.assertNotEqual(first.stdout.strip(), "")
+        skill = run_payload(post_payload("C:/proj/notes/SKILL.md", session_id="burst-7"), self.env)
+        self.assertNotEqual(skill.stdout.strip(), "",
+                            "a SKILL.md nudge must fire even inside the burst window")
+        ctx = json.loads(skill.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("skill-forge", ctx)
+
+    def test_skill_reminder_still_deduped_per_path(self):
+        # Bypassing the WINDOW is not bypassing the per-(session, file) dedupe.
+        first = run_payload(post_payload("C:/proj/notes/SKILL.md", session_id="burst-8"), self.env)
+        self.assertNotEqual(first.stdout.strip(), "")
+        second = run_payload(post_payload("C:/proj/notes/SKILL.md", session_id="burst-8"), self.env)
+        self.assertEqual(second.returncode, 0)
+        self.assertEqual(second.stdout.strip(), "")
+
+    def test_suppression_is_recorded_in_suppressed_log(self):
+        # A suppressed fire prints nothing and leaves no fire-ledger decision row, so the audit
+        # trail is this log -- without it "suppressed" is indistinguishable from "never matched".
+        run_payload(post_payload("C:/proj/specs/plan.md", session_id="burst-9"), self.env)
+        suppressed = run_payload(post_payload("C:/proj/specs/other.md", session_id="burst-9"), self.env)
+        self.assertEqual(suppressed.stdout.strip(), "")
+        log = os.path.join(self.tmp, ".cache", "docguard", "suppressed.log")
+        self.assertTrue(os.path.exists(log), "a burst suppression must leave a suppressed.log row")
+        with open(log, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("suppressed c:/proj/specs/other.md", text)
+        self.assertNotIn("plan.md", text, "the EMITTED nudge is not a suppression")
+
+    def test_window_does_not_gate_the_hard_tier(self):
+        # The PreToolUse attestation gate is untouched by the soft-tier window: a session that just
+        # nudged must still be BLOCKED on a permanent-tier write.
+        run_payload(post_payload("C:/proj/specs/plan.md", session_id="burst-6"), self.env)
+        p = run_payload(pre_payload("C:/proj/CLAUDE.md", session_id="burst-6"), self.env)
+        self.assertEqual(p.returncode, 2)
 
 
 # =================================================================================================

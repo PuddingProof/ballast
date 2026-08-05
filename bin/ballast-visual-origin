@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stable, cross-OS entry point for the visual-stack ORIGIN LEDGER CLI
-# (hooks/visual_origin_ledger.py). Subcommands: record | list | teardown.
+# (hooks/visual_origin_ledger.py). Subcommands: record | list | teardown | pin.
 #
 # This file lives in plugins/ballast/bin/, which Claude Code puts on PATH for
 # any Bash tool call while the ballast plugin is enabled — so the orchestrator
@@ -9,6 +9,9 @@
 #   ballast-visual-origin record   --transcript-path <p> --url <u> --out-dir <d> --pid <n>
 #   ballast-visual-origin list     --transcript-path <p> | --all
 #   ballast-visual-origin teardown --transcript-path <p>
+#   ballast-visual-origin pin      --transcript-path <p> --url <u> --out-dir <d> [--matrix M]
+#                                  [--states F] [--settle MS] [--frontend-root D]
+#   ballast-visual-origin pin --check --out-dir <d>
 #
 # ONE shim with subcommands rather than one per verb, deliberately: record and
 # teardown read and write the SAME on-disk format, and a second entry point is a

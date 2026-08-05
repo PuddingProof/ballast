@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -953,6 +954,182 @@ class OneWayDocsAcceptance(GateTestCase):
         rc, out, err = self.run_hook()
         self.assertEqual(rc, 0)
         self.assertIn("WOULD-BLOCK", self.last_log())
+
+
+# =================================================================================================
+# Session-output allow: a staged set lying ENTIRELY under .claude/ or .notes/ is a deterministic
+# session artifact committed by standing rule -- ALLOW session-output, no ghost. Deliberately
+# narrow: any non-session-output path in the set drops it back into the normal evaluation.
+# =================================================================================================
+
+_NOTES_BODY = "\n".join("line %d of a working note" % i for i in range(8)) + "\n"
+
+
+class SessionOutputAllow(GateTestCase):
+    def test_all_notes_paths_allow_session_output(self):
+        write_and_stage(self.repo, ".notes/2026-01-01-plan.md", _NOTES_BODY)
+        rc, out, err = self.run_hook(transcript_path="/does/not/exist.jsonl")
+        self.assertEqual(rc, 0)
+        self.assertIn("ALLOW session-output", self.last_log())
+        self.assertIn("session=%s" % self.session_id, self.last_log())
+        self.assertNotIn('"systemMessage"', out)
+
+    def test_all_claude_paths_allow_session_output(self):
+        write_and_stage(self.repo, ".claude/postmortem/2026-01-01-report.md", _NOTES_BODY)
+        write_and_stage(self.repo, ".notes/archive/old.md", _NOTES_BODY)
+        rc, out, err = self.run_hook(transcript_path="/does/not/exist.jsonl")
+        self.assertEqual(rc, 0)
+        self.assertIn("ALLOW session-output", self.last_log())
+
+    def test_nested_session_output_segment_allows(self):
+        # Segment-matched, not prefix-matched: a session-output dir nested under a subproject
+        # is the same class of artifact.
+        write_and_stage(self.repo, "sub/proj/.notes/note.md", _NOTES_BODY)
+        rc, out, err = self.run_hook(transcript_path="/does/not/exist.jsonl")
+        self.assertEqual(rc, 0)
+        self.assertIn("ALLOW session-output", self.last_log())
+
+    def test_mixed_set_still_would_block(self):
+        write_and_stage(self.repo, ".notes/2026-01-01-plan.md", _NOTES_BODY)
+        write_and_stage(self.repo, "app.py", _REAL_CODE)
+        write_transcript(self.transcript, [genesis()])  # no review anywhere
+        rc, out, err = self.run_hook()
+        self.assertEqual(rc, 0)
+        self.assertIn("WOULD-BLOCK", self.last_log())
+        self.assertNotIn("session-output", self.last_log())
+
+    def test_ordinary_docs_are_not_session_output(self):
+        # The docs discipline is what this gate observes -- README/CLAUDE.md/docs must stay gated.
+        write_and_stage(self.repo, "docs/guide.md", _NOTES_BODY)
+        write_transcript(self.transcript, [genesis()])
+        rc, out, err = self.run_hook()
+        self.assertEqual(rc, 0)
+        self.assertIn("WOULD-BLOCK", self.last_log())
+
+    def test_shipped_content_under_dot_claude_is_not_session_output(self):
+        # `.claude/skills/` and `.claude/commands/` hold shipped durable content, not session
+        # output -- a skills-only staged set must stay gated despite the `.claude` segment.
+        # Body must exceed the trivial-churn allowance (real statements, >6 lines of churn),
+        # or the downstream O2b ALLOW masks the session-output verdict this test pins.
+        body = "#!/bin/sh\n" + "".join('echo "step %d"\nls -l /tmp/%d\n' % (i, i) for i in range(4))
+        write_and_stage(self.repo, ".claude/skills/foo/scripts/publish.sh", body)
+        write_transcript(self.transcript, [genesis()])
+        rc, out, err = self.run_hook()
+        self.assertEqual(rc, 0)
+        self.assertIn("WOULD-BLOCK", self.last_log())
+
+    def test_coincidental_commands_dir_outside_dot_claude_is_session_output(self):
+        # The skills/commands disqualifier is ADJACENCY-scoped to a `.claude` parent segment: a
+        # `commands` dir living anywhere else (here under `.notes/`) is an ordinary working note,
+        # not shipped content, and must still ALLOW as session-output.
+        write_and_stage(self.repo, ".notes/sub/commands/note.md", _NOTES_BODY)
+        rc, out, err = self.run_hook(transcript_path="/does/not/exist.jsonl")
+        self.assertEqual(rc, 0)
+        self.assertIn("ALLOW session-output", self.last_log())
+        self.assertNotIn('"systemMessage"', out)
+
+
+# =================================================================================================
+# Retry dedup: a re-attempted commit (same session, same staged set, within 10 min of a prior
+# WOULD-BLOCK) still LOGS -- tagged `retry=1` at end of line -- but skips the ghost systemMessage.
+# Shadow posture is untouched: still exit 0, still one line per qualifying call. State lives in a
+# per-session marker file (`<home>/.cache/ballast-gate/retry-<session>` = "<staged-hash> <epoch>"),
+# NOT in a re-read of the shadow log -- see the hook's retry-dedup section comment.
+# =================================================================================================
+
+class RetryDedup(GateTestCase):
+    def _marker_path(self, session_id=None):
+        return (Path(self.home) / ".cache" / "ballast-gate"
+                / ("retry-%s" % (session_id or self.session_id)))
+
+    def _backdate_marker(self, minutes, session_id=None):
+        """Rewrite the marker's stored epoch to `minutes` ago -- the deterministic stand-in for
+        waiting out the retry window."""
+        p = self._marker_path(session_id)
+        key = p.read_text(encoding="utf-8").split()[0]
+        p.write_text("%s %d" % (key, int(time.time()) - minutes * 60), encoding="utf-8")
+
+    def _stage_unreviewed(self):
+        write_and_stage(self.repo, "app.py", _REAL_CODE)
+        write_transcript(self.transcript, [genesis()])
+
+    def test_first_would_block_ghosts_and_carries_no_retry_tag(self):
+        self._stage_unreviewed()
+        rc, out, err = self.run_hook()
+        self.assertEqual(rc, 0)
+        self.assertIn("WOULD-BLOCK", self.last_log())
+        self.assertNotIn("retry=1", self.last_log())
+        self.assertIn('"systemMessage"', out)
+
+    def test_retry_within_window_tags_line_and_skips_ghost(self):
+        self._stage_unreviewed()
+        first_rc, first_out, _ = self.run_hook()
+        self.assertIn('"systemMessage"', first_out)
+        rc, out, err = self.run_hook()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(log_lines(self.home)), 2, "a retry still logs -- it is tagged, not dropped")
+        self.assertIn("WOULD-BLOCK", self.last_log())
+        self.assertTrue(self.last_log().endswith("retry=1"), "retry=1 must ride at END of line")
+        self.assertNotIn('"systemMessage"', out)
+
+    def test_same_set_past_the_window_ghosts_again(self):
+        self._stage_unreviewed()
+        self.run_hook()
+        self._backdate_marker(11)
+        rc, out, err = self.run_hook()
+        self.assertEqual(rc, 0)
+        self.assertIn("WOULD-BLOCK", self.last_log())
+        self.assertNotIn("retry=1", self.last_log())
+        self.assertIn('"systemMessage"', out)
+
+    def test_sixth_path_differing_past_the_uncovered_cap_is_not_a_retry(self):
+        """The WOULD-BLOCK grammar's `uncovered=` field caps at 5 sorted paths, so two 6-file sets
+        differing ONLY in their 6th sorted path are indistinguishable in the log. The marker keys
+        on the FULL sorted list, so the second set must score as a genuine new observation."""
+        for i in range(5):
+            write_and_stage(self.repo, "a%d.py" % i, _REAL_CODE)
+        write_and_stage(self.repo, "z6.py", _REAL_CODE)
+        write_transcript(self.transcript, [genesis()])
+        _, first_out, _ = self.run_hook()
+        self.assertIn('"systemMessage"', first_out)
+        first_log = self.last_log()
+
+        run_git(["rm", "-q", "-f", "z6.py"], self.repo)
+        write_and_stage(self.repo, "z7.py", _REAL_CODE)
+        rc, out, err = self.run_hook()
+        self.assertEqual(rc, 0)
+        # Same capped uncovered= field on both lines -- the very collision the marker key avoids.
+        self.assertEqual(first_log.split("uncovered=")[1].split(" ")[0],
+                          self.last_log().split("uncovered=")[1].split(" ")[0])
+        self.assertNotIn("retry=1", self.last_log())
+        self.assertIn('"systemMessage"', out)
+
+    def test_different_staged_set_is_not_a_retry(self):
+        self._stage_unreviewed()
+        self.run_hook()
+        write_and_stage(self.repo, "other.py", _REAL_CODE)
+        rc, out, err = self.run_hook()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("retry=1", self.last_log())
+        self.assertIn('"systemMessage"', out)
+
+    def test_different_session_same_set_is_not_a_retry(self):
+        self._stage_unreviewed()
+        self.run_hook()
+        payload = self.payload()
+        payload["session_id"] = "other-session"
+        rc, out, err = run_hook(payload, self.home)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("retry=1", self.last_log())
+        self.assertIn('"systemMessage"', out)
+
+    def test_allow_lines_are_never_retry_tagged(self):
+        write_and_stage(self.repo, ".notes/note.md", _NOTES_BODY)
+        self.run_hook(transcript_path="/does/not/exist.jsonl")
+        rc, out, err = self.run_hook(transcript_path="/does/not/exist.jsonl")
+        self.assertEqual(rc, 0)
+        self.assertIn("ALLOW", self.last_log())
+        self.assertNotIn("retry=1", self.last_log())
 
 
 # =================================================================================================

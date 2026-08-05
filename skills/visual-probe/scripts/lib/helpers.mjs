@@ -14,7 +14,11 @@ import { RUNG0_PAGE_FN } from './assertions.mjs';
 // `rung0`: {enabled, suppressions()} — the suppression list is pulled through a FUNCTION, not a
 // snapshot of the array, because a scenario may only learn its project's suppressions once it has
 // loaded the state manifest (i.e. after the harness built this helper).
-export function makeHelper({ page, cell, url, allowRemote, collector, rung0, settle = 0 }) {
+// `viewportOnly`: clamp every uncropped capture to the viewport instead of the full scrollable page.
+// Enforced HERE rather than left to each caller because the scenario chooses the snapshot options —
+// the `glance` rung's one-screenful contract has to hold for a bundled state scenario too, not only
+// for the plain goto-and-shoot path.
+export function makeHelper({ page, cell, url, allowRemote, collector, rung0, settle = 0, viewportOnly = false }) {
   const h = {
     url,                 // the resolved --url (may be undefined; scenario can pass an explicit target)
     page,                // the live Playwright Page — full API available for arbitrary drive logic
@@ -45,8 +49,17 @@ export function makeHelper({ page, cell, url, allowRemote, collector, rung0, set
     // A cropped snapshot is the one that gets magnified later (full-page magnify would be huge).
     async snapshot(label, opts = {}) {
       try { await page.evaluate(async () => { await document.fonts?.ready; }); } catch { /* fonts API absent */ }
-      const buf = await captureFrame(page, opts);
-      collector.addSnapshot({ label, cell, buf, opts });
+      const shot = viewportOnly && !opts.crop ? { ...opts, fullPage: false } : opts;
+      const buf = await captureFrame(page, shot);
+      // How much page sat BELOW this frame, measured at the shutter (the only moment the state is
+      // still on screen). A viewport-clamped rung saw one screenful; the rest is unseen SCOPE the
+      // reader has to state, not a defect — and it can't be recovered from the PNG afterwards.
+      let belowFoldPx = 0;
+      try {
+        belowFoldPx = await page.evaluate(() =>
+          Math.max(0, Math.round((document.documentElement?.scrollHeight || 0) - window.innerHeight)));
+      } catch { /* page gone / evaluate blocked — below-fold is unknown, never a capture failure */ }
+      collector.addSnapshot({ label, cell, buf, opts: shot, belowFoldPx });
 
       // RUNG 0 at the shutter — same instant as the frame, so a finding is tied to the state that
       // was actually on screen. SHADOW-LOGGED: findings are data only; they never fail a run, so a

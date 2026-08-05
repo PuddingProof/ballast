@@ -14,6 +14,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Process t0 — the anchor for every wall-clock number the fused verbs stamp into a manifest. Taken
+// here, in the bootstrap, so it covers node's own boot and the playwright import, not just the part
+// of the run that happens after the CLI is loaded.
+const T0 = Date.now();
+
+// Budget accounting lives in lib/budget.mjs (stdlib-only) and is loaded DYNAMICALLY, tolerating
+// absence. Two reasons, both load-bearing: a static import would hoist ahead of everything and make
+// a partial/damaged plugin copy die with a raw ESM error instead of this file's friendly NOT-READY
+// line (the exact regression the bootstrap split exists to prevent — pinned by test_bootstrap.sh's
+// no-lib/ copy), and accounting must never be the reason a capture fails. A lost count is a lost
+// measurement; a raw stack trace is a lost session.
+async function budgetLib() {
+  try { return await import('./lib/budget.mjs'); } catch { return null; }
+}
+
 // This file lives in scripts/, one level below the skill root (package.json, node_modules/ stay at
 // the skill root as the npm resolution anchor) — resolve from import.meta.url, not process.cwd(),
 // so any caller cwd works.
@@ -69,6 +84,17 @@ function reportReadiness(r, emitJson = true) {
 const HELP = `visual-probe — on-demand visual-verification harness (pinned Playwright library; no MCP/daemon)
 
 Usage:
+  node probe.mjs glance --url <base> [--urls u1,u2,…] [--matrix M] [--states F] [--skip-drive-hooks]
+                      [--settle MS] [--deadline MS] [--suppressions F] [--epoch ISO] --out DIR
+                      (FUSED: preflight + viewport-clamped capture + rung-0 + contact sheets, ONE browser)
+  node probe.mjs glance --wait <out-dir> [--since ISO] [--timeout MS]   (stdlib-only poll for a capture-ahead manifest; exit 3 = not ready, run it yourself)
+  node probe.mjs review-capture --url <base> [--urls u1,u2,…] [--states F] [--matrix M] [--no-dsf-triad]
+                      [--group RE] [--settle MS] [--deadline MS] [--epoch ISO] [--skip-drive-hooks] --out DIR
+                      (FUSED, deep: full-page frames + state sweep + console listeners + grouped sheets)
+  node probe.mjs measure --url <u> [--selector S | --selectors S1,S2] [--checks contrast,rects,fonts,targets,overflow]
+                      [--matrix M] [--settle MS] --out DIR      (deterministic instruments -> compact summary on stdout + measure-<n>-<pid>.json)
+  node probe.mjs crop --url <u> --selector S [--matrix M] [--magnify N] --out DIR
+                      (magnified region PNGs; MERGES into the out-dir's manifest under "crops")
   node probe.mjs preflight
   node probe.mjs doctor
   node probe.mjs selftest
@@ -88,6 +114,28 @@ Usage:
   node probe.mjs session stop                                     (close it)
 
 Commands:
+  glance   the cheap rung, FUSED into one process and ONE browser launch: readiness check, a
+           viewport-clamped capture of every matrix cell (no full-page slicing), rung-0 geometry
+           assertions at each shutter, and the contact sheets — all reusing the same browser.
+           A failed cell is a NAMED HOLE carrying its error (never a retry), and every hole is
+           RENDERED into the sheet as a labeled placeholder tile; placeholder tiles are never counted
+           as captured cells. --deadline MS hard-stops the cell loop and flushes a partial manifest
+           whose unreached cells are holes. "blocked" is reserved for ZERO captures. The manifest
+           carries sheets[], generatedAt, budget{invocations,invocations_total,launches,stage_ms,wall_ms}
+           and deadline_hit. With --states, the state sweep runs against --url ONLY; any --urls extras
+           are captured as plain cells (a sweep per target would duplicate every state label).
+  review-capture  the deep rung: same fusion at matrix scale — full-page frames, the state sweep
+           (--states), console/pageerror/requestfailed listeners attached per cell, the DSF fidelity
+           triad added at the NATIVE breakpoint only (--no-dsf-triad opts out), sheets grouped per
+           route×theme (--group RE overrides).
+  measure  deterministic instruments on named selectors: contrast (measured from composited PIXELS,
+           with the computed-style arithmetic reported alongside), rects (overlap on the PAINTED box,
+           so an ellipsized text rect never invents a collision), fonts, targets (hit-target size),
+           overflow. A COMPACT per-check summary to stdout (the full record goes to
+           <out>/measure-<n>-<pid>.json — measurements accumulate; n is the order they were taken in,
+           the pid keeps two concurrent writers off one filename). One viewport per call: --matrix's
+           FIRST cell, default 1280x800@1.
+  crop     magnified recapture of one selector, post-hoc; merges into the out-dir manifest's "crops".
   preflight  stdlib-only readiness check: node_modules/playwright installed at the pinned version?
              Safe unattended (no network, no npm, no side effects). Run after a plugin update / before
              dispatch if unsure the tool is ready.
@@ -132,11 +180,122 @@ Flags:
   --suppressions F    JSON file of rung-0 suppressions (a bare array, or a state manifest carrying
                       a top-level "suppressions": [{assert, selector, reason}])
   --no-rung0          skip the in-page geometry assertions (on by default; findings are advisory)
+  --urls u1,u2        extra routes for a fused verb (each becomes its own labelled snapshot)
+  --states F          absolute path to a project's visual-states.json (fused verbs run the bundled
+                      state scenario over it; pair with --skip-drive-hooks in a dispatched leaf).
+                      The sweep runs against --url only; --urls extras stay plain cells
+  --deadline MS       fused verbs only: hard wall-clock stop. Unreached cells become named holes and
+                      the partial manifest is still written (exit 0)                  [default: none]
+  --epoch ISO         fused verbs: the dispatch epoch this run belongs to. budget.invocations counts
+                      only calls at-or-after it; invocations_total stays cumulative [default: process start]
+  --wait DIR          fused verbs only: poll DIR for a complete manifest instead of capturing.
+                      Exit 0 + manifest path, or a single WAIT_TIMEOUT line + exit 3   [--timeout: 90000]
+  --since ISO         --wait only: accept a manifest only if its capture started at or after this
+                      dispatch epoch; older evidence keeps polling  [default: wait start − 120s]
+  --selector S        measure/crop: the element to measure or magnify
+  --selectors S1,S2   measure: several selectors in one invocation
+  --checks LIST       measure: any of contrast,rects,fonts,targets,overflow           [default: all]
+  --no-dsf-triad      review-capture: skip the 1.5×/2.0× fidelity cells at the native breakpoint
+
+Budget: every invocation is counted in <out>/budget.json (keyed by --out) and merged into the
+manifest's "budget" block — "invocations" is this dispatch's own count (see --epoch),
+"invocations_total" the whole ledger. A dispatched leaf echoes the dispatch-scoped number, and the
+caller can reject an over-budget verdict mechanically.
 
 Output: read manifest.json FIRST, then read ONLY the .xN.png magnified crops of cells flagged diverges:true.
 manifest.rung0 carries deterministic geometry findings (overlap / overflow / contrast / broken-image /
 offscreen / misalignment) that pre-locate defects before any image read — SHADOW-LOGGED advisory data:
 it never affects \`pass\` or the exit code.`;
+
+// Verbs whose contract is "a manifest exists at the end, whatever happened": their failures must be
+// reported IN the manifest (a dispatched leaf reads the manifest, not this process's stderr), so a
+// not-ready environment writes a `blocked` manifest instead of dying with a bare exit 1.
+const FUSED_VERBS = new Set(['glance', 'review-capture']);
+
+// Fallback freshness window for a `--wait` with no `--since`: evidence whose capture started more
+// than this before the wait began belongs to an earlier cycle.
+const WAIT_GRACE_MS = 120000;
+
+// stdlib-only flag read for the bootstrap — same "--key value" shape as the CLI's parser.
+function flagValue(args, name) {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] !== name) continue;
+    const next = args[i + 1];
+    return next === undefined || next.startsWith('--') ? true : next;
+  }
+  return undefined;
+}
+
+// `glance --wait <out-dir>` — the capture-ahead handshake. The gate may fire the real capture in the
+// background at dispatch time; the leaf then overlaps its own spawn with that capture by waiting on
+// the manifest instead of launching a second one.
+//
+// STDLIB ONLY, AND BEFORE THE READINESS GATE, DELIBERATELY: this path must never pay the multi-MB
+// playwright import (the whole point is that it is nearly free), and it must resolve even in an
+// environment where the real capture could not run — a clean "not ready, run the fallback" beats a
+// wait that only ends in a timeout.
+//
+// COMPLETENESS is the presence of the `budget` block: the fused verbs write their manifest through a
+// rename, so a poller can never see a torn file, and `budget` is stamped last.
+//
+// FRESHNESS is the DISPATCH EPOCH: a prior cycle's manifest sitting in the out-dir is complete in
+// every way this poll can see, so a wait with no epoch resolved instantly against stale evidence and
+// the leaf reviewed the build it was dispatched to replace. `--since <ISO>` (the gate stamps the
+// dispatch's own epoch into the brief) accepts only a manifest whose capture STARTED at or after it;
+// anything older keeps polling to the timeout, which is the same exit-3 "run it yourself" path a
+// missing manifest takes. With no `--since`, a 120s grace before the wait began stands in — long
+// enough for a capture-ahead fired at dispatch, short enough to reject last cycle's leftovers. A
+// manifest with no `generatedAt` at all predates this contract and is treated as stale.
+async function waitForManifest(dir, timeoutMs, sinceMs) {
+  const file = path.join(dir, 'manifest.json');
+  const deadline = Date.now() + timeoutMs;
+  let sawStale = null;
+  for (;;) {
+    try {
+      const m = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const at = m && m.generatedAt ? Date.parse(m.generatedAt) : NaN;
+      const fresh = Number.isFinite(at) && at >= sinceMs;
+      if (m && m.budget && typeof m.budget === 'object' && !fresh) sawStale = m.generatedAt || '(no generatedAt)';
+      if (m && m.budget && typeof m.budget === 'object' && fresh) {
+        console.error(`[visual-probe] manifest ready after ${Date.now() - T0}ms of waiting — ${file}`);
+        console.log(file);
+        return 0;
+      }
+    } catch { /* absent, or mid-write */ }
+    if (Date.now() >= deadline) {
+      // ONE machine line, exit 3: distinct from every other exit code so the caller can branch on it
+      // mechanically and run the fused verb itself. Never a hang — that is the whole contract.
+      console.error(`[visual-probe] no complete manifest in ${dir} after ${timeoutMs}ms`
+        + (sawStale ? ` (one was there, generated ${sawStale} — older than the dispatch epoch ${new Date(sinceMs).toISOString()})` : '')
+        + ' — run the fused verb yourself');
+      console.log('WAIT_TIMEOUT');
+      return 3;
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+// A not-ready environment still owes a fused verb's caller a manifest — with the failing check
+// verbatim, so the leaf can report `blocked` with a real reason instead of "the command failed".
+function writeBlockedManifest(B, outDir, verb, r) {
+  if (!B) return; // no budget lib => damaged copy; stderr already carries the failing check
+  try {
+    fs.mkdirSync(outDir, { recursive: true });
+    B.writeManifestAtomic(path.join(outDir, 'manifest.json'), {
+      verb, generatedBy: 'visual-probe', generatedAt: new Date(T0).toISOString(), target: null,
+      cells: [], cellGeometry: [], snapshots: [], asserts: [],
+      coverageHoles: [{ label: '(every cell)', cell: '', kind: 'blocked', reason: r.fix }],
+      console: [], rung0: [], rung0UnusedSuppressions: [],
+      sheets: [], sheetTally: { sheets: 0, tiles: 0, placeholders: 0 },
+      deadline_hit: false,
+      blocked: { reason: r.reason, detail: r.fix, check: 'preflight', pinned: r.pinned, installed: r.installed },
+      pass: false,
+      budget: B.budgetBlock(outDir, { launches: 0, stageMs: {}, wallMs: Date.now() - T0, epochMs: T0 }),
+      note: 'BLOCKED before any capture: the harness environment failed its readiness check (see `blocked`). ' +
+        'Nothing was captured — this is not a verdict about the app. Report `blocked` with the detail verbatim.',
+    });
+  } catch { /* bookkeeping must never mask the real failure */ }
+}
 
 const argv = process.argv.slice(2);
 const cmd = argv[0];
@@ -144,20 +303,57 @@ const cmd = argv[0];
 if (cmd === 'help' || cmd === '--help' || cmd === '-h' || cmd === undefined) {
   console.log(HELP);
   process.exit(0);
-} else if (cmd === 'preflight') {
-  const r = checkReadiness();
-  reportReadiness(r);
-  process.exit(r.ready ? 0 : 1);
+} else if (cmd === '__serve-child') {
+  // hidden: the detached static server spawned by `serve start`. Dispatched HERE rather than in
+  // lib/cli.mjs so it never imports playwright — a file server has no use for a browser bundle, and
+  // the child paid the whole parse on every start.
+  const { runServeChild } = await import('./lib/serve.mjs');
+  runServeChild({ root: argv[1], port: +argv[2] });
 } else {
-  const r = checkReadiness();
-  if (!r.ready) { reportReadiness(r, false); process.exit(1); }
-  try {
-    const cli = await import('./lib/cli.mjs');
-    await cli.main(argv);
-  } catch (e) {
-    // Defense in depth: preflight vets playwright, not lib/cli.mjs's own integrity (syntax error,
-    // missing lib file) — those still get a friendly line, never a raw stack trace.
-    console.error('[visual-probe] ERROR:', e.message);
-    process.exit(1);
+  // Budget accounting: EVERY verb invocation is counted, keyed by the out-dir the caller named, in
+  // the one place no entry point can bypass (see lib/budget.mjs for why the count is harness-side).
+  const B = await budgetLib();
+  const waitTarget = flagValue(argv, '--wait');
+  const outDir = typeof waitTarget === 'string' ? path.resolve(waitTarget)
+    : B ? B.resolveOutDir(argv) : path.resolve(String(flagValue(argv, '--out') ?? '.'));
+  if (B) B.recordInvocation(outDir, cmd);
+
+  if (waitTarget !== undefined && FUSED_VERBS.has(cmd)) {
+    const t = flagValue(argv, '--timeout');
+    const timeoutMs = typeof t === 'string' && Number.isFinite(+t) && +t > 0 ? Math.round(+t) : 90000;
+    const since = flagValue(argv, '--since');
+    let sinceMs = T0 - WAIT_GRACE_MS;
+    if (since !== undefined) {
+      const parsed = typeof since === 'string' ? Date.parse(since) : NaN;
+      if (!Number.isFinite(parsed)) {
+        // Usage (exit 2), never a silent fallback: a mistyped epoch that quietly degraded to the
+        // grace window would accept exactly the stale evidence --since exists to reject.
+        console.error(`[visual-probe] --since expects an ISO timestamp (got ${since === true ? '(no value)' : since})`);
+        process.exit(2);
+      }
+      sinceMs = parsed;
+    }
+    process.exit(await waitForManifest(outDir, timeoutMs, sinceMs));
+  } else if (cmd === 'preflight') {
+    const r = checkReadiness();
+    reportReadiness(r);
+    process.exit(r.ready ? 0 : 1);
+  } else {
+    const r = checkReadiness();
+    if (!r.ready) {
+      reportReadiness(r, false);
+      if (FUSED_VERBS.has(cmd)) writeBlockedManifest(B, outDir, cmd, r);
+      process.exit(1);
+    }
+    try {
+      const tImport = Date.now();
+      const cli = await import('./lib/cli.mjs');
+      await cli.main(argv, { t0: T0, importMs: Date.now() - tImport });
+    } catch (e) {
+      // Defense in depth: preflight vets playwright, not lib/cli.mjs's own integrity (syntax error,
+      // missing lib file) — those still get a friendly line, never a raw stack trace.
+      console.error('[visual-probe] ERROR:', e.message);
+      process.exit(1);
+    }
   }
 }

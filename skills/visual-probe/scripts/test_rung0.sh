@@ -279,6 +279,41 @@ console.log(`REAL_NAMED=${real.some((f) => /#real/.test(f.selector)) ? 1 : 0}`);
 console.log(`SUPPRESSED_CAPPED=${r.some((f) => f.capped && f.suppressed) ? 1 : 0}`);
 EOF
 
+# The FUSED verbs slim the manifest's rung0 array (`shot` above keeps it whole). 20 DISTINCT
+# low-contrast paragraphs, each a shade lighter than the last: distinct selectors so they aggregate
+# to 20 rows rather than one, and distinct ratios so the ranking has something to rank.
+{
+  printf '%s' '<!DOCTYPE html><html><head><meta charset="utf-8"><title>slim</title><style>
+    body { margin: 16px; background: #fff; font: 14px/1.4 system-ui, sans-serif; width: 700px; }
+  </style></head><body>'
+  i=0; while [ "$i" -lt 20 ]; do
+    g=$((140 + i))
+    printf '<p id="c%s" style="color: rgb(%s, %s, %s)">faint line %s</p>' "$i" "$g" "$g" "$g" "$i"
+    i=$((i + 1))
+  done
+  printf '%s' '</body></html>'
+} > "$tmp/slim.html"
+
+cat > "$tmp/read-slim.mjs" <<'EOF'
+import fs from 'fs';
+import path from 'path';
+const m = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const perKind = m.rung0.reduce((a, f) => (a[f.check] = (a[f.check] || 0) + 1, a), {});
+console.log(`KIND_MAX=${Math.max(0, ...Object.values(perKind))}`);
+console.log(`OVERFLOW_NAMED=${(m.rung0Overflow || {}).contrast > 0 ? 1 : 0}`);
+// Ranked by magnitude: the WORST ratio on the page must be one the manifest inlines, and the best
+// of the 20 must be one it trimmed — a cap that kept an arbitrary slice would fail this pair.
+const ratios = m.rung0.filter((f) => f.check === 'contrast').map((f) => f.measured.ratio);
+console.log(`WORST_INLINED=${Math.min(...ratios) < 2.9 ? 1 : 0}`);
+console.log(`BEST_TRIMMED=${Math.max(...ratios) < 3.1 ? 1 : 0}`);
+const trimmed = Object.values(m.rung0Overflow || {}).reduce((a, b) => a + b, 0);
+const side = path.join(path.dirname(process.argv[2]), m.rung0File || 'rung0.json');
+const full = fs.existsSync(side) ? JSON.parse(fs.readFileSync(side, 'utf8')).findings : [];
+console.log(`SIDECAR_COMPLETE=${full.length === m.rung0.length + trimmed ? 1 : 0}`);
+console.log(`SIDECAR_TOTAL=${full.length === m.rung0Total ? 1 : 0}`);
+console.log(`SELECTOR_MAX=${Math.max(0, ...m.rung0.map((f) => f.selector.length))}`);
+EOF
+
   budget_out="$(node "$WINDIR/probe.mjs" shot "$WINTMP/budget.html" --matrix "800x600@1" \
       --out "$WINTMP/out-budget" --suppressions "$WINTMP/budget-supp.json" 2>&1)"; rcB=$?
   if [ "$rcB" != 0 ] || [ ! -f "$tmp/out-budget/manifest.json" ]; then
@@ -289,6 +324,82 @@ EOF
     check "c) the genuine overlap survives 30 suppressed ones"           "$(getB REAL_ENUMERATED)"   "1"
     check "c) it keeps its selector (not rolled into the cap bucket)"    "$(getB REAL_NAMED)"        "1"
     check "c) the suppressed overflow is reported, never dropped"        "$(getB SUPPRESSED_CAPPED)" "1"
+  fi
+
+  # ---- (c2) the FUSED manifest slims the finding set -------------------------------------------
+  # A 1600-line manifest costs a second offset-Read on every leaf run, so the fused verbs inline a
+  # ranked HEAD per check kind and write the complete list to rung0.json. The cap must never be what
+  # hides evidence: it keeps the WORST instances, names what it trimmed, and the trimmed rows stay
+  # readable on disk.
+  slim_out="$(node "$WINDIR/probe.mjs" glance --url "$WINTMP/slim.html" --matrix "800x600@1" \
+      --out "$WINTMP/out-slim" 2>&1)"; rcSl=$?
+  if [ "$rcSl" != 0 ] || [ ! -f "$tmp/out-slim/manifest.json" ]; then
+    skip "c2) the fused manifest inlines a bounded, named head" "glance did not run (rc=$rcSl) — out=[$(printf '%s' "$slim_out" | tail -2)]"
+  else
+    L="$(node "$WINTMP/read-slim.mjs" "$WINTMP/out-slim/manifest.json" 2>&1)"
+    getL() { printf '%s\n' "$L" | grep -E "^$1=" | head -1 | cut -d= -f2-; }
+    check "c2) the manifest inlines at most 12 rows per check kind"      \
+          "$([ "$(getL KIND_MAX)" -le 12 ] && printf bounded || printf "over:$(getL KIND_MAX)")" "bounded"
+    check "c2) …and names the kind it trimmed"                           "$(getL OVERFLOW_NAMED)"   "1"
+    check "c2) the worst instance on the page is one it kept"            "$(getL WORST_INLINED)"    "1"
+    check "c2) …and the mildest is one it trimmed (ranked, not sliced)"  "$(getL BEST_TRIMMED)"     "1"
+    check "c2) rung0.json carries every row the manifest left out"       "$(getL SIDECAR_COMPLETE)" "1"
+    check "c2) …and agrees with the manifest's stated total"             "$(getL SIDECAR_TOTAL)"    "1"
+    check "c2) inlined selectors are truncated to 120 chars"             \
+          "$([ "$(getL SELECTOR_MAX)" -le 120 ] && printf bounded || printf "over:$(getL SELECTOR_MAX)")" "bounded"
+  fi
+
+  # ---- (d) rung-0 noise classes: an unresolvable background, and layered SVG paint -----------
+  # Both were measured false-positive floods, and both are SKIPS rather than guesses:
+  #   • a page whose face is painted by a canvas has NO resolvable CSS background behind its text.
+  #     Assuming white there reported 90+ phantom AA failures per run on a dark UI. The same page
+  #     carries one genuine low-contrast element on a painted solid, so the fix is asserted as a
+  #     CONTRAST — the check must go quiet on the unresolvable stack and still fire on the solid one.
+  #   • boxes under one <svg> overlap BY CONSTRUCTION (axis, plot and label layers); scanning them
+  #     produced 25+ spurious pairs per run on chart internals alone.
+  cat > "$tmp/noise.html" <<'EOF'
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>noise</title><style>
+  html, body { margin: 0; color: #e6e9ef; font: 14px/1.4 system-ui, sans-serif; }  /* no background anywhere up the chain */
+  #face { position: fixed; left: 0; top: 0; width: 100%; height: 100%; z-index: -1; }
+  .layer { position: relative; padding: 24px; }
+  #solid { background: #ffffff; color: #9a9fa6; padding: 8px; }   /* ~2.6:1 on a PAINTED solid — must still fire */
+</style></head><body>
+  <canvas id="face" width="800" height="600"></canvas>
+  <div class="layer">
+    <p id="darktext">Light text over a canvas-painted face</p>
+    <svg id="chart" width="300" height="120"><g>
+      <rect x="10" y="10" width="200" height="60" fill="#4a6fa5"></rect>
+      <rect x="60" y="30" width="200" height="60" fill="#d08a3e"></rect>
+    </g></svg>
+  </div>
+  <div id="solid">Low contrast on a solid background</div>
+  <script>
+    var g = document.getElementById('face').getContext('2d');
+    g.fillStyle = '#12161d'; g.fillRect(0, 0, 800, 600);
+  </script>
+</body></html>
+EOF
+
+  cat > "$tmp/read-noise.mjs" <<'EOF'
+import fs from 'fs';
+const r = JSON.parse(fs.readFileSync(process.argv[2], 'utf8')).rung0.filter((f) => !f.suppressed);
+const of = (c) => r.filter((f) => f.check === c);
+console.log(`CONTRAST_SET=${of('contrast').map((f) => f.selector).join(',')}`);
+console.log(`OVERLAP_COUNT=${of('overlap').length}`);
+EOF
+
+  noise_out="$(node "$WINDIR/probe.mjs" shot "$WINTMP/noise.html" --matrix "800x600@1" \
+      --out "$WINTMP/out-noise" 2>&1)"; rcNo=$?
+  if [ "$rcNo" != 0 ] || [ ! -f "$tmp/out-noise/manifest.json" ]; then
+    skip "d) rung-0 stays quiet on unresolvable backgrounds and SVG layers" \
+         "capture did not run (rc=$rcNo) — out=[$(printf '%s' "$noise_out" | tail -2)]"
+  else
+    D="$(node "$WINTMP/read-noise.mjs" "$WINTMP/out-noise/manifest.json" 2>&1)"
+    getD() { printf '%s\n' "$D" | grep -E "^$1=" | head -1 | cut -d= -f2-; }
+    check "d) a canvas-faced page yields NO contrast findings…"          \
+          "$(printf '%s' "$(getD CONTRAST_SET)" | grep -c 'darktext')" "0"
+    check "d) …while the genuine solid-bg failure still fires"           "$(getD CONTRAST_SET)"  "#solid"
+    check "d) two rects under one <svg> are not an overlap"              "$(getD OVERLAP_COUNT)" "0"
   fi
 fi
 

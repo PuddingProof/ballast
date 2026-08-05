@@ -19,6 +19,22 @@
 payload="$(cat)"
 
 if printf '%s' "$payload" | grep -iqE '\.claude[\\/]{1,2}plans[\\/]{1,2}'; then
+  # SESSION COOLDOWN (pattern shared with subagent-fanout.sh): plan drafting is many successive
+  # edits to the same file, and the conventions text is static -- one injection per session
+  # covers the drafting run. TTL 2h re-arms a long or post-compact session. FAIL OPEN: no sid /
+  # no home dir -> fire every time.
+  sid="$(printf '%s' "$payload" | grep -oE '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
+  home_dir="${BALLAST_CLAUDE_HOME:-${HOME:+$HOME/.claude}}"
+  if [ -n "$sid" ] && [ -n "$home_dir" ]; then
+    marker="$home_dir/.cache/ballast-plan/$sid"
+    # Suppressed matches leave no fire-ledger row -- record them (see subagent-fanout.sh).
+    if [ -n "$(find "$marker" -mmin -120 2>/dev/null)" ]; then
+      printf '%s suppressed sid=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sid" >> "$home_dir/.cache/ballast-plan/suppressed.log" 2>/dev/null
+      exit 0
+    fi
+    { mkdir -p "$home_dir/.cache/ballast-plan" && touch "$marker"
+      find "$home_dir/.cache/ballast-plan" -type f -mmin +2880 -exec rm -f {} + ; } 2>/dev/null
+  fi
   cat <<'JSON'
 {
   "systemMessage": "📝 ballast: plan-authoring conventions injected",

@@ -50,7 +50,12 @@ def _fg(rgb):
     return "\x1b[38;2;%d;%d;%dm" % (r, g, b)
 
 
-GRAY = (135, 135, 135)     # baseline dim gray (dir, model+effort, low-context ctx token)
+GRAY = (135, 135, 135)     # baseline dim gray (model+effort, low-context ctx token)
+WHITE = (235, 235, 235)    # project tag -- promoted above the gray peers. EXPLICIT, not
+                           # "unstyled inherits terminal default": tried that first (2026-08-04)
+                           # and the row rendered exactly as gray as before -- the TUI applies its
+                           # own muted style to un-SGR'd statusline text, so like the chip palette
+                           # this is hardcoded for a dark background by necessity.
 RED = (255, 95, 95)        # ctx token color at the top threshold
 
 # The ctx token's color tracks ABSOLUTE TOKENS, not the percentage it displays. The quantity
@@ -332,7 +337,7 @@ def _render_baseline(payload):
     segments = []
     dirname = _basename(_extract_project_dir(payload))
     if dirname:
-        segments.append("%s%s%s" % (_fg(GRAY), dirname, RESET))
+        segments.append("%s%s%s" % (_fg(WHITE), dirname, RESET))
     model = _extract_model(payload)
     if model:
         segments.append("%s%s%s" % (_fg(GRAY), model, RESET))

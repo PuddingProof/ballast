@@ -105,6 +105,47 @@ check "spaced keyword form fires"      '{"prompt":"fan out the subagents to cove
 check "tier-neutral visual wording"    '{"prompt":"run a code-review on this diff"}' \
                                         yes "visual review dispatch"
 
+# --- SESSION COOLDOWN (2h TTL marker): the ~5KB table is static, so one injection per session
+# covers a run of keyword prompts; a stale marker (older than the TTL) re-arms, which is what
+# keeps a long or post-compact session covered. HERMETIC: BALLAST_CLAUDE_HOME redirects the marker
+# dir to a throwaway temp home. The sid is grepped from the RAW payload, so a payload WITHOUT a
+# session_id has no cooldown at all and fires every time (fail open) -- which is exactly why every
+# case above fires unconditionally. ---
+HERMETIC_HOME="$(mktemp -d 2>/dev/null || echo "${TMPDIR:-/tmp}/fanout-home.$$")"
+mkdir -p "$HERMETIC_HOME"
+export BALLAST_CLAUDE_HOME="$HERMETIC_HOME"
+FANOUT_MARKERS="$HERMETIC_HOME/.cache/ballast-fanout"
+
+check "cooldown: first keyword fires"  '{"session_id":"fo1","prompt":"run a code-review on this diff"}' \
+                                        yes "tier calibration"
+if [ -f "$FANOUT_MARKERS/fo1" ]; then printf 'PASS  %-42s marker=exists\n' "cooldown: marker written"
+else printf 'FAIL  %-42s marker=absent (want exists)\n' "cooldown: marker written"; fails=$((fails+1)); fi
+
+check "cooldown: second keyword silent" '{"session_id":"fo1","prompt":"another audit please"}' \
+                                        no -
+check "cooldown: other session fires"  '{"session_id":"fo2","prompt":"another audit please"}' \
+                                        yes "tier calibration"
+
+# Age the marker past the 2h TTL -- a stale marker must re-arm the injection. Backdated via
+# python's os.utime, NOT `touch -d`/`touch -r`: the relative-date forms are GNU-only, so on
+# BSD/macOS they would silently no-op and turn this into a false PASS.
+# shellcheck disable=SC2086 -- intentional word-split for a two-word "py -3".
+if [ -n "$PY" ]; then
+  $PY -c "import os,time,sys; t=time.time()-3*3600; os.utime(sys.argv[1],(t,t))" "$FANOUT_MARKERS/fo1"
+  check "cooldown: stale marker re-arms" '{"session_id":"fo1","prompt":"another audit please"}' \
+                                          yes "tier calibration"
+else
+  printf 'SKIP  %-42s (no python to backdate the marker)\n' "cooldown: stale marker re-arms"
+fi
+
+# FAIL OPEN: no extractable sid -> no cooldown, every keyword prompt fires.
+check "cooldown: no sid fires again"   '{"prompt":"run a code-review on this diff"}' \
+                                        yes "tier calibration"
+check "cooldown: no sid fires twice"   '{"prompt":"run a code-review on this diff"}' \
+                                        yes "tier calibration"
+
+rm -rf "$HERMETIC_HOME" 2>/dev/null
+
 echo
 [ "$fails" = 0 ] && echo "ALL subagent-fanout TESTS PASS" || echo "$fails FAILURES"
 exit "$fails"
