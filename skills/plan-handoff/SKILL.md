@@ -10,7 +10,7 @@ when_to_use: >-
   "go ahead / build it / proceed with the plan", handing a spec or plan file to an executor,
   a user bug report on just-shipped work, resuming fixes after /compact, deciding between
   editing in-line vs dispatching executor subagents, picking model/effort for execution
-  leaves. Not for planning itself or review fanouts (/code-review); a genuinely tiny diff has
+  leaves. Not for planning itself or review fanouts (/diff-review); a genuinely tiny diff has
   its own table row — check it rather than assuming.
 ---
 
@@ -28,7 +28,7 @@ when_to_use: >-
 | **Unplanned tail** — implementation work appearing after the planned waves: a post-ship bug wave from live verification, an executor stalled mid-batch, a post-compact correction pass | The same split as planned work, applied to the tail: root-causing/characterization stays top-tier (diagnosis is judgement); once the fix is specified, the mechanical fix + tests dispatch as an executor batch like any other wave — for a stall, audit what actually landed (don't trust the stalled leaf's narration) AND enumerate the leaf's live background children — an audited-clean leaf can still have a background task mid-write, and a fresh executor dispatched over it races that child (commit-by-path keeps the collision recoverable; it is not a substitute for the check) — then hand a FRESH executor the remaining spec. Docs likewise: the durable-docs gate call and what-the-doc-must-say are yours; file-holding/splicing/formatting is an executor leaf (exception: session-distillation docs — postmortems, design records — whose content IS your context) |
 | Tiny diff, or taste iteration that can't be spec'd (visual tuning, wording) | In-line is correct — don't add dispatch ceremony |
 
-The division of labor: cheaper models take execution, editing, and large-file reading; design and judgement — evaluation, verification, adjudication — stay top-tier in the main session. Review/audit fanouts (a `ballast:code-review` run, ultracode, `/integration-gate`) still launch from the orchestrator and tier their leaves per the `subagent-fanout` rules — that calibration runs orthogonal to this protocol, not superseded by it. The orchestrator synthesizes the findings and renders the verdicts; *applying* the accepted fixes is another executor dispatch (tiny-diff exception as above).
+The division of labor: cheaper models take execution, editing, and large-file reading; design and judgement — evaluation, verification, adjudication — stay top-tier in the main session. Review/audit fanouts (a `ballast:diff-review` run, ultracode, `/integration-gate`) still launch from the orchestrator and tier their leaves per the `subagent-fanout` rules — that calibration runs orthogonal to this protocol, not superseded by it. The orchestrator synthesizes the findings and renders the verdicts; *applying* the accepted fixes is another executor dispatch (tiny-diff exception as above).
 
 ## Dispatching an executor
 
@@ -49,11 +49,11 @@ The division of labor: cheaper models take execution, editing, and large-file re
 - Plan shoving edits into an awkward structural fit? That's a plan revision, not an executor improvisation — raise `/refactor-fit` (propose-then-build) before dispatching.
 - Multi-executor build about to be called done? That's exactly `/integration-gate`'s trigger — per-leaf checks passing says nothing about the seams.
 - Complex implementation → run either gate as its own Opus dispatch (the evaluation/read churn stays out of the main window); simple diff → in-line by the orchestrator is fine.
-- Independent gates run concurrently, not as a serial pipeline: once the diff is frozen, a visual review dispatch (via `visual-verification-gate`), a `/code-review` fanout, and an integration-gate dispatch read the same tree and don't feed each other — launch them in one wave and adjudicate the merged findings. Chain only where one gate's input IS another's output (a delta re-verify after fixes).
+- Independent gates run concurrently, not as a serial pipeline: once the diff is frozen, a visual review dispatch (via `visual-verification-gate`), a `/diff-review` fanout, and an integration-gate dispatch read the same tree and don't feed each other — launch them in one wave and adjudicate the merged findings. Chain only where one gate's input IS another's output (a delta re-verify after fixes).
 
 ## Tier & effort per leaf
 
-Effort inherits the session's level silently — set it explicitly per leaf: executors opus medium by default, sonnet medium for light batches, opus high for the hardest fully-specified ones; judge/review leaves opus high/xhigh. The Agent tool has no per-dispatch effort param, so for executor leaves the **agentType is the model+effort selector** (mirroring /code-review's ladder): `plan-executor` = opus medium, the default; `plan-executor-light` = sonnet medium, light mechanical batches; `plan-executor-hard` = opus high, the hardest fully-specified batches (a difficulty pick, not a volume one — long routine laundry lists stay on the default). Workflow leaves take `opts.effort` directly. Full tier calibration: the `subagent-fanout` hook injection.
+Effort inherits the session's level silently — set it explicitly per leaf: executors opus medium by default, sonnet medium for light batches, opus high for the hardest fully-specified ones; judge/review leaves opus high/xhigh. The Agent tool has no per-dispatch effort param, so for executor leaves the **agentType is the model+effort selector** (mirroring /diff-review's ladder): `plan-executor` = opus medium, the default; `plan-executor-light` = sonnet medium, light mechanical batches; `plan-executor-hard` = opus high, the hardest fully-specified batches (a difficulty pick, not a volume one — long routine laundry lists stay on the default). Workflow leaves take `opts.effort` directly. Full tier calibration: the `subagent-fanout` hook injection.
 
 ## Rationalizations
 

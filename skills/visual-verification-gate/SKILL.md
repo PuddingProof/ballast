@@ -47,9 +47,9 @@ At loop boundaries — not per keystroke, not once at the end — force the stat
 
 **Preflight the dispatch** (shadow — it reports, it never blocks): `ballast-visual-origin pin --check --out-dir <dir>` re-stats the pin's claims — origin still verified in the ledger, out-dir present, and evidence newer than the newest frontend edit. A `WOULD-BLOCK` line means a claim went stale: refresh the pin, or carry the gap into the dispatch by name.
 
-**Capture ahead (the warm path).** You MAY fire the brief's exact capture command as ONE background Bash at dispatch time — a main-session lifecycle carve-out, cap **one in flight per session**, available to both rungs. The leaf's brief then says `--wait <out-dir> --since <epoch>`, overlapping capture with agent spawn. If the wait times out (exit 3) the leaf runs the full command itself: worst case equals the cold path, minus the overlap.
+**Capture ahead (the warm path).** You MAY fire the brief's exact capture command as ONE background Bash at dispatch time — a main-session lifecycle carve-out, cap **one in flight per session**, available to both rungs. The finished capture prints a `DISPATCH —` wait line; the brief carries that line verbatim, overlapping capture with agent spawn. If the wait times out (exit 3) the leaf runs the full command itself: worst case equals the cold path, minus the overlap.
 
-**Stamp the epoch on every dispatch.** One ISO timestamp, taken when you dispatch, carried into the brief's `Epoch:` line and into both commands (`--epoch` on the capture, `--since` on the wait). A re-used out-dir always holds a previous cycle's complete manifest, and without the epoch a wait resolves on it instantly — the leaf then reviews the build the dispatch was meant to replace. An RMA resume re-states a **new** epoch, for the same reason.
+**Copy the epoch — never compose it.** The epoch is the capture's own start stamp: a finished capture prints a `DISPATCH` line whose `--since` is its manifest's `generatedAt`; paste that value into the brief's `Epoch:` line and wait command. A hand-composed timestamp is the measured failure mode — an epoch even seconds in the future rejects every existing manifest and burns the wait's full timeout (the harness now exits 2 on a far-future `--since`). Cold dispatch (no capture-ahead): the leaf's own capture is its own epoch — no timestamp anywhere. A re-used out-dir always holds a previous cycle's complete manifest; the epoch is what keeps a leaf from reviewing the build the dispatch was meant to replace. An RMA resume re-runs capture-ahead (seconds) and pastes the NEW printed line, for the same reason.
 
 ### Verdicts — canonical here
 
@@ -92,7 +92,8 @@ Origin (REQUIRED): <pin.origin> — already running and main-session-owned. Use 
   it as "the user's live server". Start, stop, and signal nothing. No usable origin → return
   `blocked` naming it, and stop.
 Out-dir: <pin.out_dir> — the command below already writes there; the frames must survive for me.
-Epoch: <ISO> — this dispatch's window. Evidence generated before it belongs to a previous cycle.
+Epoch: <pasted from the capture's DISPATCH line | SELF-EPOCH (cold: your own capture is the epoch)> —
+  never hand-composed. Evidence generated before it belongs to a previous cycle.
 Target + intent: <routes / surface> — <one line of what must be true in the render>.
 Declared holes (not shot): <axes — why | NONE> — mine, not yours: carry each into your scope line
   verbatim, exactly like a `coverageHoles[]` entry.
@@ -102,8 +103,9 @@ Run this first, exactly as written:
   node ${CLAUDE_PLUGIN_ROOT}/skills/visual-probe/scripts/probe.mjs <glance|review-capture> \
     --url <pin.origin> --matrix <pin.matrix> [--urls <u1,u2>] [--states <pin.states_manifest>
     --skip-drive-hooks] [--suppressions <pin.suppressions>] [--settle <pin.settle>]
-    --epoch <ISO> --out <pin.out_dir>
-  (capture-ahead fired instead → `… probe.mjs glance --wait <pin.out_dir> --since <ISO> --timeout <ms>`)
+    --out <pin.out_dir>
+  (capture-ahead fired instead → paste its printed DISPATCH line:
+    `… probe.mjs glance --wait <pin.out_dir> --since <printed> --timeout <ms>`)
 Expected budget: <N> invocations · 1 browser launch · ~<M>s. Echo the manifest's `budget` block in
   your verdict as it stands — `invocations` is THIS dispatch's count (a waited capture legitimately
   reports 2); `invocations_total` is the out-dir's history and is not your spend.

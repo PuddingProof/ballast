@@ -239,8 +239,15 @@ since_before="$(node -e "console.log(new Date(Date.now()-600000).toISOString())"
 since_after="$(node -e "console.log(new Date(Date.now()+600000).toISOString())")"
 h4_stdout="$(cd "$poison/scripts" && node probe.mjs glance --wait "$WINPOISON/waitdir" --since "$since_before" --timeout 700 2>/dev/null)"; rcH4=$?
 check "h4) --since accepts a manifest generated after the epoch"     "$([ "$rcH4" = 0 ] && basename "$h4_stdout")"  "manifest.json"
-h5_stdout="$(cd "$poison/scripts" && node probe.mjs glance --wait "$WINPOISON/waitdir" --since "$since_after" --timeout 600 2>/dev/null)"; rcH5=$?
+h5_since="$(node -e "console.log(new Date(Date.now()+10000).toISOString())")"
+h5_stdout="$(cd "$poison/scripts" && node probe.mjs glance --wait "$WINPOISON/waitdir" --since "$h5_since" --timeout 600 2>/dev/null)"; rcH5=$?
 check "h5) …and rejects one generated before it"                     "$h5_stdout:$rcH5"  "WAIT_TIMEOUT:3"
+# A far-future epoch can never be satisfied by existing evidence: fail fast as usage, never a doomed
+# full-timeout poll — the measured live failure mode was a hand-composed epoch minutes ahead of the
+# clock, burning 180s per cycle on captures that took 2s.
+h5b_stdout="$(cd "$poison/scripts" && node probe.mjs glance --wait "$WINPOISON/waitdir" --since "$since_after" --timeout 600 2>"$tmp/future.err")"; rcH5b=$?
+check "h5b) a far-future --since fails fast, never a doomed poll"    "$rcH5b"  "2"
+check "h5b) …and the error names the future epoch"                   "$(grep -c 'in the future' "$tmp/future.err")" "1"
 h6_stdout="$(cd "$poison/scripts" && node probe.mjs glance --wait "$WINPOISON/waitdir" --since "not-a-date" --timeout 600 2>"$tmp/since.err")"; rcH6=$?
 check "h6) a malformed --since is usage (2), never a silent grace"   "$rcH6"  "2"
 

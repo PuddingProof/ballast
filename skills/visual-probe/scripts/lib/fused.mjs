@@ -225,6 +225,7 @@ async function fusedRun(ctx, cfg) {
   const asserts = [];
   const rung0Records = [];
   const holes = [];            // {label, cell, kind, reason} — never absorbed, always rendered
+  const docResponses = [];     // main-document HTTP statuses — an all-error-page run must not read as green
   const consoleFindings = [];
   const collector = {
     addSnapshot: (s) => snapshots.push(s),
@@ -268,6 +269,17 @@ async function fusedRun(ctx, cfg) {
       try {
         const page = await pageCtx.newPage();
         page.setDefaultTimeout(Math.min(TIMEOUT, budgetLeft));
+        // Main-document status per navigation, scenario and plain paths alike: a misconfigured
+        // origin serves 403/500 pages that CAPTURE fine — without this, an all-error-page run
+        // summarizes green and the failure isn't discovered until a dispatched leaf reads the sheet.
+        page.on('response', (r) => {
+          try {
+            const req = r.request();
+            if (req.isNavigationRequest() && req.frame() === page.mainFrame()) {
+              docResponses.push({ target: target.label, cell: cell.label, status: r.status(), url: r.url() });
+            }
+          } catch { /* observability only — never breaks a capture */ }
+        });
         // Console/pageerror/requestfailed listeners live on the PER-CELL page, so a finding is tied
         // to the cell that produced it — and so a review no longer needs a hand-authored scenario
         // just to notice that the app is throwing.
@@ -294,6 +306,21 @@ async function fusedRun(ctx, cfg) {
     for (const c of (Array.isArray(scenarioModule?.coverageHoles) ? scenarioModule.coverageHoles : [])) {
       holes.push({ label: c.label, cell: c.cell || '', kind: c.kind || 'unforced', reason: c.reason || c.detail || '' });
     }
+
+    // HTTP ≥400 on a main document: the frame exists but shows the server's error page, not the app.
+    // One hole per failing target×cell; if EVERY navigation failed, the origin itself is dead and the
+    // run is blocked below — the loudest possible signal at capture time, when fixing it costs
+    // seconds instead of a leaf round trip.
+    const docFailures = docResponses.filter((r) => r.status >= 400);
+    const seenHttpHole = new Set();
+    for (const f of docFailures) {
+      const key = `${f.target}|${f.cell}`;
+      if (seenHttpHole.has(key)) continue;
+      seenHttpHole.add(key);
+      holes.push({ label: f.target, cell: f.cell, kind: 'http-error',
+        reason: `main document HTTP ${f.status} at ${f.url}` });
+    }
+    const originDead = docResponses.length > 0 && docFailures.length === docResponses.length;
 
     const tFlush = Date.now();
     const built = await buildEntries({
@@ -367,6 +394,16 @@ async function fusedRun(ctx, cfg) {
       return;
     }
 
+    if (originDead) {
+      const first = docFailures[0];
+      manifest.blocked = {
+        reason: 'origin-dead',
+        detail: `every main-document response was HTTP ≥400 (first: ${first.status} at ${first.url}) — `
+          + 'the captured frames are the server\'s error pages, not the app. Fix the origin; do not dispatch a leaf against this evidence.',
+      };
+      manifest.pass = false;
+    }
+
     // ---- compose on the SAME browser: no second spawn, no second launch --------------------
     // A prior cycle's sheets are deleted first. Sheet names are derived from the GROUP, so a run over
     // a narrower scope leaves the wider run's `mosaic-*.png` on disk — and the leaf reads whatever
@@ -411,8 +448,18 @@ async function fusedRun(ctx, cfg) {
 
     const file = writeManifestAtomic(path.join(OUT, 'manifest.json'), manifest);
     summarize(log, manifest, RUNG0_ON, rung0Findings);
+    if (manifest.blocked) {
+      log(`BLOCKED — ${manifest.blocked.reason}: ${manifest.blocked.detail}`);
+      log('DO NOT DISPATCH a leaf against this out-dir until the origin is fixed.');
+      process.exitCode = 1;
+    } else {
+      // The leaf's wait line with the epoch baked in from this manifest's own start stamp — the
+      // dispatcher copies it verbatim. Hand-composed epochs are the measured dead-sleep failure mode.
+      log('DISPATCH — copy this wait line into the leaf brief verbatim:');
+      log(`  node "${process.argv[1]}" ${cfg.verb} --wait "${OUT}" --since ${manifest.generatedAt} --timeout 90000`);
+      process.exitCode = 0;
+    }
     console.log(file);
-    process.exitCode = 0;
   } finally {
     await browser.close();
   }

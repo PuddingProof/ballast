@@ -8,7 +8,8 @@ missing slot produced a wrong answer that still looked right:
   Epoch / --since   a re-used out-dir always holds a previous cycle's complete manifest, so a wait
                     with no epoch resolves on it instantly and the leaf reviews the build the
                     dispatch was meant to replace.
-  --epoch           the same window on the capture side, so the budget echo counts THIS dispatch.
+  --epoch           REMOVED 2026-08-05 as a hand-filled slot — the epoch is baked into the capture's
+                    printed DISPATCH line (its manifest's `generatedAt`), copied, never composed.
   Declared holes    an axis the caller chose not to shoot is a hole; unstated, it is a silent pass.
   Native cell       the surface's real size, judged there and not at a nearby cell.
   --suppressions    declared-intended rung-0 findings, for a project with no state manifest.
@@ -43,7 +44,7 @@ SLOTS = [
 
 # Harness flags the template hands the leaf, each of which must exist in the harness.
 FLAGS = ["--url", "--matrix", "--states", "--skip-drive-hooks", "--suppressions", "--settle",
-         "--epoch", "--out", "--wait", "--since", "--timeout"]
+         "--out", "--wait", "--since", "--timeout"]
 
 # Pin fields the brief is filled from — the template's `<pin.x>` placeholders.
 PIN_FIELDS = ["origin", "out_dir", "matrix", "native", "suppressions", "states_manifest", "settle"]
@@ -77,14 +78,18 @@ class BriefTemplate(unittest.TestCase):
             self.assertIn(flag, self.brief, "the brief template no longer passes %s" % flag)
             self.assertIn(flag, probe, "%s is in the brief but not in the harness" % flag)
 
-    def test_the_epoch_threads_through_both_commands(self):
-        # One dispatch window, stamped on the capture and re-asserted by the wait: either half alone
-        # leaves the other free to resolve on last cycle's evidence.
-        self.assertIn("--epoch", self.brief)
+    def test_the_epoch_is_copied_never_composed(self):
+        # The epoch rides the capture's own start stamp: the capture prints a DISPATCH wait line
+        # and the brief pastes it. A hand-composed timestamp was the live 4/4 dead-sleep failure
+        # mode (2026-08-05): an epoch even seconds in the future rejects every existing manifest.
         self.assertRegex(self.brief, r"--wait <pin\.out_dir> --since")
         self.assertIn("Epoch:", self.brief)
-        self.assertIn("--since", self.gate.split("## The dispatch brief")[0],
-                      "the capture-ahead stage no longer states the --since half of the epoch")
+        self.assertIn("DISPATCH", self.brief)
+        self.assertNotIn("--epoch", self.brief, "the brief re-grew a hand-filled --epoch slot")
+        gate_head = self.gate.split("## The dispatch brief")[0]
+        self.assertIn("--since", gate_head)
+        self.assertIn("DISPATCH", gate_head)
+        self.assertIn("hand-composed", gate_head)
 
     def test_every_pin_placeholder_is_a_field_the_pin_writer_emits(self):
         used = set(re.findall(r"<pin\.([a-z_]+)>", self.brief))

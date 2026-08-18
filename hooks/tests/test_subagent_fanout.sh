@@ -79,6 +79,33 @@ check "genuine keyword fires"          '{"prompt":"run a code-review on this dif
 check "keyword in path, no fire"       '{"prompt":"open skills/code-review/SKILL.md"}' \
                                         no -
 
+# (2b) backtick-quoted keyword -> NO fire: inline code is the declared mention syntax
+#      (same convention as freehand-mode.sh's identical strip).
+check "backticked keyword, no fire"    '{"prompt":"lol at `ultracode` firing the dispatch hook"}' \
+                                        no -
+
+# (2c) keyword OUTSIDE a code span, span text present -> still fires (only the quoted
+#      spans are stripped, not the line).
+check "keyword outside span fires"     '{"prompt":"read `hooks/run.sh` then run a code-review"}' \
+                                        yes "tier calibration"
+
+# (2d) span ADJACENT to the keyword with zero whitespace -> still fires: the strip replaces
+#      spans with a SPACE, so deletion never fuses the neighbors into one token and silences
+#      the keyword (empty replacement did exactly that).
+check "zero-space adjacency fires"     '{"prompt":"check`file.py`code-review this diff"}' \
+                                        yes "tier calibration"
+
+# (2e) a LONE stray backtick strips nothing (no pair to close) -> a plain keyword beside it
+#      still fires.
+check "lone stray backtick fires"      '{"prompt":"there is a stray ` here, run a code-review"}' \
+                                        yes "tier calibration"
+
+# (2f) ACCEPTED RESIDUAL pinned: a stray backtick FOLLOWED by a closed span pairs across the
+#      gap and deletes the keyword between -> false silence, accepted (re-type plainly). If
+#      this ever starts firing, the residual got fixed — update the MENTION MARKER comment.
+check "stray+closed span silences"     '{"prompt":"I left a stray `dangling, run a code-review, then read `hooks/run.sh` too"}' \
+                                        no -
+
 # (3) realistic task-notification payload: prompt field STARTS WITH
 #     <task-notification> and the body text (agent's own report) contains
 #     both "audit" and "subagent" -- must NOT fire even though both keywords
@@ -98,6 +125,13 @@ check "keyword-free, no fire"          '{"prompt":"please fix the typo on line 1
 
 # (6) hyphenated/spaced keyword forms -> [ -]? in the regex still matches.
 check "spaced keyword form fires"      '{"prompt":"fan out the subagents to cover this"}' \
+                                        yes "tier calibration"
+
+# (6b) the diff-review keyword (ballast:diff-review fork, disambiguated from native /code-review)
+# must fire identically -- both hyphenated and spaced forms.
+check "diff-review keyword fires"      '{"prompt":"run a diff-review on this diff"}' \
+                                        yes "tier calibration"
+check "spaced diff review fires"       '{"prompt":"kick off a diff review before committing"}' \
                                         yes "tier calibration"
 
 # (7) tier-neutral wording (2026-07-28 visual-stack redesign): the injected text must not name

@@ -332,6 +332,16 @@ if (cmd === 'help' || cmd === '--help' || cmd === '-h' || cmd === undefined) {
         process.exit(2);
       }
       sinceMs = parsed;
+      // Fail fast on an impossible epoch: a --since meaningfully in the future can never be
+      // satisfied by existing evidence — the observed failure mode is a hand-composed timestamp
+      // minutes ahead of the clock, burning the full timeout on a doomed poll. 15s of skew
+      // tolerance covers a capture-ahead racing this wait; beyond that the epoch is wrong.
+      const aheadMs = sinceMs - Date.now();
+      if (aheadMs > 15000) {
+        console.error(`[visual-probe] --since is ${Math.round(aheadMs / 1000)}s in the future — no existing capture can satisfy it. `
+          + 'Copy the --since value from the capture\'s DISPATCH line instead of composing a timestamp.');
+        process.exit(2);
+      }
     }
     process.exit(await waitForManifest(outDir, timeoutMs, sinceMs));
   } else if (cmd === 'preflight') {

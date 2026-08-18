@@ -2,7 +2,13 @@
 
 Consumer-visible changes to the ballast plugin. Changes land under **[Unreleased]** in the same commit that makes them; a release rotates the section into a dated version heading (versions = `.claude-plugin/plugin.json`). Internal dev churn is not tracked here. **Bullets are terse one-liners — what changed, not why; rationale lives in the commit message** (style anchor: Claude Code's own CHANGELOG).
 
-## [Unreleased]
+## [0.9.3] — 2026-08-18
+
+- freehand-mode: the inline slash-command form (`/freehand on`, `/ballast:freehand`) arms again; backtick-quoted keywords are mentions and never arm
+- subagent-fanout: backtick-quoted keywords (`` `ultracode` `` etc.) no longer fire the tier-calibration injection
+- visual-probe: fused captures print a ready-to-paste leaf wait line (epoch baked in); far-future `--wait --since` fails fast; an all-error-page capture is blocked as `origin-dead`
+- visual-verification-gate: dispatch epochs are pasted from the capture's DISPATCH line, never hand-composed
+- git-commit-guard: review launched ≠ review finished — a silent or vanished review fork gets one TaskOutput probe pre-commit; unresolved means verdict unknown, never pass
 
 ## [0.9.2] — 2026-08-05
 

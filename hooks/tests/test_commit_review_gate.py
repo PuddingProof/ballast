@@ -459,12 +459,12 @@ _REAL_CODE = "\n".join("def f%d():\n    return %d" % (i, i) for i in range(8)) +
 
 
 class SkillAcceptanceMatching(GateTestCase):
-    def test_plugin_qualified_code_review_skill_allow(self):
-        """F6(a): a plugin-qualified skill name ('ballast:code-review') must satisfy the accepted
-        set the same as the bare name ('code-review') on the reviewed-code path."""
+    def test_plugin_qualified_diff_review_skill_allow(self):
+        """F6(a): a plugin-qualified skill name ('ballast:diff-review') must satisfy the accepted
+        set the same as the bare name ('diff-review') on the reviewed-code path."""
         edit_path = write_and_stage(self.repo, "app.py", _REAL_CODE)
         write_transcript(self.transcript, [
-            genesis(), edit_event(10, edit_path), skill_event(20, "ballast:code-review"),
+            genesis(), edit_event(10, edit_path), skill_event(20, "ballast:diff-review"),
         ])
         rc, out, err = self.run_hook()
         self.assertEqual(rc, 0)
@@ -490,14 +490,14 @@ class SkillAcceptanceMatching(GateTestCase):
 
 class O1TurnStructure(GateTestCase):
     def test_canonical_fix_guard_allow(self):
-        """THE canonical FP guard: edit -> /code-review --fix launch -> fix-edits land MINUTES
+        """THE canonical FP guard: edit -> diff-review --fix launch -> fix-edits land MINUTES
         later (same turn, no user message in between) -> commit. MUST ALLOW -- a naive
         last_edit_ts > last_review_ts timestamp rule would wrongly block this exact case."""
         edit_path = write_and_stage(self.repo, "app.py", _REAL_CODE)
         write_transcript(self.transcript, [
             genesis(),
             edit_event(10, edit_path),
-            skill_event(20, "code-review"),
+            skill_event(20, "diff-review"),
             edit_event(300, edit_path),   # --fix rewriting bytes minutes later, same turn
         ])
         rc, out, err = self.run_hook()
@@ -507,7 +507,7 @@ class O1TurnStructure(GateTestCase):
     def test_reviewed_then_allow(self):
         edit_path = write_and_stage(self.repo, "app.py", _REAL_CODE)
         write_transcript(self.transcript, [
-            genesis(), edit_event(10, edit_path), skill_event(20, "code-review"),
+            genesis(), edit_event(10, edit_path), skill_event(20, "diff-review"),
         ])
         rc, out, err = self.run_hook()
         self.assertEqual(rc, 0)
@@ -548,7 +548,7 @@ class O1TurnStructure(GateTestCase):
         backup_dir = Path(self.home) / "compact-backups"
         backup_path = backup_dir / ("20260708-120000_manual_%s.jsonl" % self.session_id)
         write_transcript(backup_path, [
-            genesis(), edit_event(10, edit_path), skill_event(20, "code-review"),
+            genesis(), edit_event(10, edit_path), skill_event(20, "diff-review"),
         ])
         write_transcript(self.transcript, [])  # live transcript: empty (post-compaction, no new events)
         rc, out, err = self.run_hook()
@@ -568,7 +568,7 @@ class O1TurnStructure(GateTestCase):
         write_transcript(self.transcript, [
             genesis(),
             edit_event(10, edit_path),
-            skill_event(20, "code-review"),
+            skill_event(20, "diff-review"),
             bash_event(30, 'git commit -m "first"', tool_id="toolu_commit1"),
             tool_result(31, "toolu_commit1", "[main abc1234] first"),
             user_message(40, "also add the extra() helper"),
@@ -587,7 +587,7 @@ class O1TurnStructure(GateTestCase):
         edit_path = write_and_stage(self.repo, "app.py", _REAL_CODE)
         write_transcript(self.transcript, [
             genesis(),
-            skill_event(10, "code-review"),  # review launches FIRST...
+            skill_event(10, "diff-review"),  # review launches FIRST...
             edit_event(20, edit_path),        # ...then the staged-path edit happens
         ])
         rc, out, err = self.run_hook()
@@ -865,7 +865,7 @@ class PathspecStagedSet(GateTestCase):
             genesis(),
             edit_event(10, foo),
             edit_event(11, bar),
-            skill_event(20, "code-review"),
+            skill_event(20, "diff-review"),
         ])
         rc, out, err = self.run_hook(command="git commit foo.py bar.py -F msg.txt")
         self.assertEqual(rc, 0)
@@ -881,7 +881,7 @@ class PathspecStagedSet(GateTestCase):
         nothing and the gate would score empty-staged-diff -- so ALLOW/staged=1 IS the discriminator."""
         edit_path = track_and_modify(self.repo, "my dir/app.py", _REAL_CODE, _MORE_CODE)
         write_transcript(self.transcript, [
-            genesis(), edit_event(10, edit_path), skill_event(20, "code-review"),
+            genesis(), edit_event(10, edit_path), skill_event(20, "diff-review"),
         ])
         rc, out, err = self.run_hook(command='git commit "my dir/app.py" -m "wip"')
         self.assertEqual(rc, 0)
@@ -929,16 +929,16 @@ class PathspecStagedSet(GateTestCase):
 # =================================================================================================
 
 class OneWayDocsAcceptance(GateTestCase):
-    def test_docs_routed_plugin_qualified_code_review_allow(self):
+    def test_docs_routed_plugin_qualified_diff_review_allow(self):
         """Spec test 6: a docs-only commit is satisfied by a code review (one-way widening -- a
         full code-review is a heavier review than the docs gate). A PLUGIN-QUALIFIED
-        `ballast:code-review` Skill launch credits it (the prefix-strip + the widening together)."""
+        `ballast:diff-review` Skill launch credits it (the prefix-strip + the widening together)."""
         edit_path = write_and_stage(
             self.repo, "notes/design.md",
             "# Design\n\nSome longer prose describing the change in enough detail that it is not "
             "whitespace-only and not a tiny comment-only diff by any measure at all.\n")
         write_transcript(self.transcript, [
-            genesis(), edit_event(10, edit_path), skill_event(20, "ballast:code-review"),
+            genesis(), edit_event(10, edit_path), skill_event(20, "ballast:diff-review"),
         ])
         rc, out, err = self.run_hook()
         self.assertEqual(rc, 0)
@@ -1210,7 +1210,7 @@ class ShadowContract(GateTestCase):
         # 5) reviewed commit (ALLOW)
         edit_path = str(Path(self.repo) / "app.py")
         write_transcript(self.transcript, [
-            genesis(), edit_event(10, edit_path), skill_event(20, "code-review"),
+            genesis(), edit_event(10, edit_path), skill_event(20, "diff-review"),
         ])
         rc, _, _ = self.run_hook()
         self.assertEqual(rc, 0)

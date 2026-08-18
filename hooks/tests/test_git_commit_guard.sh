@@ -67,7 +67,7 @@ PD() { printf '{"tool_name":"Bash","tool_input":{"command":"%s","description":"%
 check "benign ls"              "$(P 'ls -la')"                        0 -                       REMINDER
 check "git status only"        "$(P 'git status')"                    0 -                       REMINDER
 check "git diff -> nudge"      "$(P 'git diff')"                      0 "review pass"           -
-check "nudge names code-review skill" "$(P 'git diff')"               0 "ballast:code-review"    -
+check "nudge names diff-review skill" "$(P 'git diff')"               0 "ballast:diff-review"    -
 check "nudge carries systemMessage" "$(P 'git diff')"                 0 "systemMessage"          -
 check "git log -> nudge"       "$(P 'git log --oneline')"             0 "review pass"           -
 check "pager-flag diff (norm)" "$(P 'git -c core.pager=cat diff')"    0 "review pass"           -

@@ -644,7 +644,7 @@ _DOCS_BASENAMES = {"claude.md", "agents.md", "ideas.md"}
 # alter BEHAVIOR, so it needs the code-review path even if it happens to live under a docs-ish dir.
 _CODE_FORCE_EXTS = {".sh", ".py", ".ps1", ".json"}
 
-_DEFAULT_CODE_SKILLS = {"code-review", "simplify"}
+_DEFAULT_CODE_SKILLS = {"code-review", "diff-review", "simplify"}
 _DEFAULT_DOCS_SKILLS = {"durable-docs"}
 
 

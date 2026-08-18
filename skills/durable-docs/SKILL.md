@@ -113,7 +113,7 @@ This replaces the manual weekly doc audit. Hand over the findings; let him skim 
 
 ## Who holds the pen (delegation shape)
 
-The judgement — the gate decision, the homing, what-the-doc-must-say — never delegates. The mechanics do: holding a long file, splicing entries, formatting are executor work — in a plan→execution handoff, dispatch them as an executor leaf instead of carrying file bodies in the orchestrator's context, and fan doc *audits* out like /code-review. Exception: session-distillation docs (postmortems, design records) whose content *is* the writing session's context — those stay in-line.
+The judgement — the gate decision, the homing, what-the-doc-must-say — never delegates. The mechanics do: holding a long file, splicing entries, formatting are executor work — in a plan→execution handoff, dispatch them as an executor leaf instead of carrying file bodies in the orchestrator's context, and fan doc *audits* out like /diff-review. Exception: session-distillation docs (postmortems, design records) whose content *is* the writing session's context — those stay in-line.
 
 ---
 

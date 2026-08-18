@@ -53,7 +53,7 @@ def main():
     # Payload is fed on stdin exactly as Claude Code would. A plain string is
     # enough to trip keyword-grep hooks; the default packs several common
     # triggers so most hooks fire without the caller naming the right keyword.
-    trigger = " ".join(sys.argv[2:]) or "ultracode autopilot fanout code-review deep-research"
+    trigger = " ".join(sys.argv[2:]) or "ultracode autopilot fanout code-review diff-review deep-research"
     proc = subprocess.run([bash, hook], input=trigger,
                           capture_output=True, text=True, timeout=30)
     out = proc.stdout.strip()

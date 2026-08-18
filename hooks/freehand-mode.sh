@@ -31,6 +31,31 @@
 # rejected while real prose ("go freehand.", "(autopilot)") still matches. Orthogonal to
 # `ultracode`: both are plain keywords, honor whichever are present.
 #
+# SLASH-COMMAND FORM: a second alternation arms on `/freehand …` / `/ballast:freehand …` at a
+# line start or after whitespace — the path exclusion above otherwise swallows exactly this shape
+# (`/` is an excluded boundary char), and an inline-typed slash command is the mode's own
+# invocation syntax, the STRONGEST grant signal there is. Suppressing it inverts the design's
+# error direction: a false ARM is harmless by construction (the stub adjudicates), a false
+# SILENCE loses a real grant until the user notices. The right boundary rejects `-` and `/`, so
+# a slash-led filename (`/freehand-mode.sh`) or deeper path (`/freehand/x`) stays quiet; a path
+# with a non-space char before its slash (hooks/freehand-mode.sh, C:/freehand.sh) is rejected
+# by the left boundary. `.` is deliberately NOT rejected — `/freehand.` ending a sentence is a
+# real grant shape and silencing it is the costly direction, so `/freehand.sh` false-arms as an
+# accepted, stub-adjudicated leniency.
+#
+# MENTION MARKER: inline-code (backtick) spans are replaced with a single space in the scan
+# target before the keyword match — a backtick-quoted keyword is the user's EXPLICIT typed
+# mention syntax (subagent-fanout.sh ships the identical strip; one convention across the
+# keyword sensors). This is the one sanctioned recall-layer rejection of a typed shape: it
+# encodes declared syntax with fixed semantics, not a heuristic guess at intent (those stay in
+# the stub), and it ships with failing-shape tests. The replacement is a SPACE, never empty:
+# deleting a span outright fuses its neighbors into one token, silencing a keyword with a
+# zero-whitespace span beside it ("read`f.py`freehand on") — the costly direction. Line-scoped
+# (sed is line-based), balanced pairs only. A LONE stray backtick strips nothing (no pair to
+# close); the accepted residual is a stray backtick FOLLOWED by a closed span on the same line
+# — sed pairs across the gap and deletes the prose between, a real grant included — re-type
+# the grant plainly, exactly like the notification-marker residual above.
+#
 # VISIBILITY: every ARM emits a systemMessage so an arm is never silent and the user can override
 # a wrong adjudication immediately. The MIRROR is the deliberate exception — it fires on EVERY
 # prompt while the mode is on, so a per-prompt systemMessage would be terminal spam (hooks/
@@ -115,9 +140,17 @@ case "$match_target" in
   *"[SYSTEM NOTIFICATION - NOT USER INPUT]"*|*"<task-notification>"*) exit 0 ;;
 esac
 
-# (^|non-word) KEYWORD (non-word|$) — "non-word" excludes path/identifier chars
-# so embedded-in-filename matches (the IDE-opened-file footgun) don't fire.
-if printf '%s' "$match_target" | grep -iqE '(^|[^[:alnum:]_/\-])(freehand|autopilot)([^[:alnum:]_/\-]|$)'; then
+# Backtick-quoted spans are mentions by declared convention (see MENTION MARKER above) — replace
+# them with a space before the match so `freehand` / `/freehand on` inside inline code never
+# arms while adjacent prose keeps its word boundary. If sed itself fails, fall back to the
+# unstripped text: fail open toward arming.
+scan_target="$(printf '%s' "$match_target" | sed 's/`[^`]*`/ /g')" || scan_target="$match_target"
+
+# Two alternations: (^|non-word) KEYWORD (non-word|$) — "non-word" excludes path/identifier
+# chars so embedded-in-filename matches (the IDE-opened-file footgun) don't fire — OR the
+# slash-command form (see SLASH-COMMAND FORM above), which the first alternation's boundary
+# exclusion would otherwise silence.
+if printf '%s' "$scan_target" | grep -iqE '(^|[^[:alnum:]_/\-])(freehand|autopilot)([^[:alnum:]_/\-]|$)|(^|[[:space:]])/(ballast:)?(freehand|autopilot)([^[:alnum:]_/\-]|$)'; then
   # ARM OUTPUT IS STATIC: the same text on every arm, regardless of whether the payload parsed or
   # carried a sid -- no python step, no state write. Keep it that way.
   cat <<'JSON'

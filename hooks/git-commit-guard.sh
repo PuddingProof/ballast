@@ -166,7 +166,7 @@ fi
 # BALLAST_SIDECAR_REVIEW=1 into its headless session's hook processes, and that session must not be
 # nudged to review itself. Scoped to the pre-commit nudges ONLY -- the exit-2 hard block and the
 # amend/reset/push cautions above stay live there, enforcing the shim's read-only intent if it ever
-# drifts toward a write. The primary path, the inline ballast:code-review skill, runs in the main
+# drifts toward a write. The primary path, the inline ballast:diff-review skill, runs in the main
 # session and needs no suppression.
 [ "$inspecting" -eq 1 ] && resolve_ckdir
 if [ "$inspecting" -eq 1 ] && [ -n "$ckdir" ] && [ -f "$ckdir/nudge-$sid" ]; then
@@ -177,13 +177,14 @@ if [ "$inspecting" -eq 1 ] && [ -n "$ckdir" ] && [ -f "$ckdir/nudge-$sid" ]; the
   printf '%s suppressed sid=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$sid" >> "$ckdir/suppressed.log" 2>/dev/null
 elif [ "$inspecting" -eq 1 ] && [ "${BALLAST_SIDECAR_REVIEW:-}" != "1" ]; then
   # (the cycle marker is touched at the end of this branch and cleared above when a commit runs)
-  # `ballast:code-review` below keeps its namespace prefix ON PURPOSE: it disambiguates from NATIVE
-  # /code-review (a real name collision), and this fork always ships as the namespaced plugin skill,
-  # so skills/CLAUDE.md's prose-ify convention (for skills whose install form varies) doesn't apply.
+  # `ballast:diff-review` below keeps its namespace prefix ON PURPOSE: this fork always ships as
+  # the namespaced plugin skill (and the prefix keeps it visibly distinct from the native
+  # /code-review lineage it forked from), so skills/CLAUDE.md's prose-ify convention (for skills
+  # whose install form varies) doesn't apply.
   # The public-mirror build excludes the skill, hence the explicit without-it branch in the text;
   # that mention is adjudicated in publish.sh's REFERENCE_WARN_ALLOWLIST (release-bump skill) and
   # the graceful-degrade wording here and there must stay in sync.
-  msgs+=("If you're heading toward a commit: run a review pass FIRST -- invoke the ballast:code-review skill if this install ships it (native-style multi-angle fan-out, inline in this session): \`ballast:code-review <low|medium|high|xhigh|max> [commit-range]\`; native /code-review is user-invoke-only now, and installs without the skill run their own review flow at equivalent depth. Scale the level to the diff; at a multi-commit checkpoint pass the cumulative range (e.g. \`<base>..HEAD\`) at a heavier level. Add \`--fix\` for high-confidence fixes, or adjudicate and apply them yourself -- pre-existing or non-exploitable is no reason to skip a correct, cheap finding; else log it to IDEAS/backlog. Then /simplify on the pending changes (or this project's equivalent). Your own audit / visual / diff-reread passes can LOWER the level and narrow scope, never REPLACE the review pass. Docs/meta changes run the durable-docs skill instead. Confirm via git status that only intended files are staged (a concurrent Claude session may share this index). Skip only if the diff is trivial (comments/one-liners) or already reviewed this session.")
+  msgs+=("If you're heading toward a commit: run a review pass FIRST -- invoke the ballast:diff-review skill if this install ships it (native-style multi-angle fan-out): \`ballast:diff-review [--light|--medium|--hard] [commit-range]\`; native /code-review is user-invoke-only now, and installs without the skill run their own review flow at equivalent depth. Scale the level to the diff; at a multi-commit checkpoint pass the cumulative range (e.g. \`<base>..HEAD\`) at a heavier level. The review only reports -- adjudicate and apply its findings yourself -- pre-existing or non-exploitable is no reason to skip a correct, cheap finding; else log it to IDEAS/backlog. Then /simplify on the pending changes (or this project's equivalent). Your own audit / visual / diff-reread passes can LOWER the level and narrow scope, never REPLACE the review pass. A review LAUNCHED is not a review FINISHED: a silent or vanished review fork gets one TaskOutput probe before you commit -- unresolved means the verdict is UNKNOWN, never pass; re-dispatch a scoped pass or state the gap. Docs/meta changes run the durable-docs skill instead. Confirm via git status that only intended files are staged (a concurrent Claude session may share this index). Skip only if the diff is trivial (comments/one-liners) or already reviewed this session.")
   # integration-gate reinforcement: a self-discipline skill's description is a weak auto-trigger, so
   # fire it at the reliable pre-commit moment for multi-part work. Named as prose (not literal
   # invocation syntax) so it resolves for a personal or a namespaced plugin install alike.

@@ -135,6 +135,76 @@ check "(e) malformed JSON fallback"  '{prompt: this is not valid json, but the u
 check "(f) keyword in path, no arm"  '{"prompt":"see path/autopilot/x for details"}' \
                                   no -
 
+# (f2) SLASH-COMMAND form typed inline -> ARMS. `/freehand on` inside a larger prompt is the
+#      mode's own invocation syntax — the strongest grant signal there is — and the path
+#      exclusion used to swallow it ('/' is an excluded boundary char), losing a real grant
+#      until the user noticed (observed 2026-08-17). The dedicated alternation closes that.
+check "(f2) slash-command form arms"  '{"prompt":"/freehand on. \n\ncheckpoint commits per usual"}' \
+                                  yes "FREEHAND / AUTOPILOT"
+
+# (f3) plugin-qualified slash form -> arms too.
+check "(f3) plugin-qualified slash arms"  '{"prompt":"/ballast:freehand off"}' \
+                                  yes "FREEHAND / AUTOPILOT"
+
+# (f4) slash-led FILENAME lookalike -> still suppressed (the slash alternation's right boundary
+#      rejects '-' and '/', and a path with a non-space char before its slash never matches its
+#      left).
+check "(f4) slash filename, no arm"  '{"prompt":"see /freehand-mode.sh for details"}' \
+                                  no -
+
+# (f5) slash form mid-prompt after whitespace -> arms (the left boundary admits any whitespace,
+#      not only line start).
+check "(f5) slash form after space arms"  '{"prompt":"do the fixes then /autopilot on"}' \
+                                  yes "FREEHAND / AUTOPILOT"
+
+# (f6) backtick-quoted keyword -> NO arm: inline code is the user's declared mention syntax
+#      (same convention as subagent-fanout.sh's identical strip).
+check "(f6) backticked word, no arm"  '{"prompt":"the `freehand` hook is misfiring again"}' \
+                                  no -
+
+# (f7) backtick-quoted SLASH form -> no arm either (quoting a past prompt is a mention).
+check "(f7) backticked slash, no arm"  '{"prompt":"typing `/freehand on` did nothing yesterday"}' \
+                                  no -
+
+# (f8) keyword OUTSIDE a code span, other span text present -> still arms (the strip removes
+#      only the quoted spans, not the line).
+check "(f8) keyword outside span arms"  '{"prompt":"fix `hooks/run.sh` first, then freehand on"}' \
+                                  yes "FREEHAND / AUTOPILOT"
+
+# (f9) span ADJACENT to the keyword with zero whitespace -> still arms: the strip replaces the
+#      span with a SPACE, so deletion never fuses "read" and "freehand" into one token (empty
+#      replacement did exactly that and silenced a real grant — the costly direction).
+check "(f9) zero-space adjacency arms"  '{"prompt":"read`file.py`freehand mode now"}' \
+                                  yes "FREEHAND / AUTOPILOT"
+
+# (f10) span SPLITTING a keyword -> the space keeps the halves apart: "auto`x`pilot" scans as
+#       "auto pilot", not the keyword -> no arm (empty replacement fused it into a false arm).
+check "(f10) split keyword, no arm"  '{"prompt":"the auto`x`pilot thing keeps firing"}' \
+                                  no -
+
+# (f11) a LONE stray backtick strips nothing (no pair to close) -> a plain grant beside it
+#       still arms.
+check "(f11) lone stray backtick arms"  '{"prompt":"ignore the stray ` there, freehand on"}' \
+                                  yes "FREEHAND / AUTOPILOT"
+
+# (f12) ACCEPTED RESIDUAL pinned: a stray backtick FOLLOWED by a closed span makes sed pair
+#       across the gap and delete the grant between them -> false silence, accepted (re-type
+#       plainly). If this case ever starts arming, the residual got fixed — update the MENTION
+#       MARKER header too.
+check "(f12) stray+closed span silences"  '{"prompt":"I broke `run.sh earlier, freehand on, then check `hooks/run.sh` again"}' \
+                                  no -
+
+# (f13) slash form continued by '/' (a directory path) -> the trailing boundary rejects '/',
+#       so a slash-led DIRECTORY path stays quiet like the f4 filename.
+check "(f13) slash dir path, no arm"  '{"prompt":"see /freehand/notes.md for details"}' \
+                                  no -
+
+# (f14) '.' is deliberately NOT a rejected trailing char: '/freehand.' ending a sentence is a
+#       real grant shape, so '/freehand.sh' false-arms as an accepted, stub-adjudicated
+#       leniency (see SLASH-COMMAND FORM in the hook header).
+check "(f14) trailing dot arms (leniency)"  '{"prompt":"run /freehand. then commit"}' \
+                                  yes "FREEHAND / AUTOPILOT"
+
 # (g) mention-form prompt (talking ABOUT the hook/mode, not invoking it) -> the regex still arms
 #     mechanically (want_arm=yes) because it cannot distinguish use from mention; the injected stub
 #     must contain the ADJUDICATE FIRST gate that makes this mechanical arm safe (the model is
