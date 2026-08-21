@@ -9,7 +9,7 @@ when_to_use: >-
   adversarial or multi-lens review of the whole project, "fresh senior eyes on the code", a
   foundation-check on a young project, or types /adversarial-audit or /audit — even when they
   don't say "audit" explicitly (e.g. "time has come for a full review of everything, frontend
-  and backend"). NOT for reviewing one diff/PR (native /code-review or a project pr-review
+  and backend"). NOT for reviewing one diff/PR (diff-review or a project pr-review
   skill), the seams of a single multi-part change (integration-gate), a docs-only staleness
   pass (durable-docs audit), or cross-project postmortem triage (harness-sweep).
 argument-hint: "[quick | standard | deep] [--report-only] [focus:<area or lens> ...]"
@@ -71,7 +71,7 @@ Adjudicate every survivor into exactly one disposition — this judgement is you
 
 ## Phase 4 — Counter-review
 
-The audit's own fixes are unreviewed code. At standard+ depth a second, differently-framed lane over the cumulative diff is mandatory — it reliably catches half-done fixes and self-introduced regressions, including comments that falsely claim safety. Run a `ballast:diff-review high [range]` pass (the model-invocable fork of native /code-review, which is user-invoke-only) if this install ships it, else a fresh finder set framed differently from Phase 1, then `integration-gate` across the whole change set, then live verification when the diff has a runtime surface. At `deep`, finish with a narrow convergence re-audit of the fixed areas — "N new findings, none meaningful" is the exit condition.
+The audit's own fixes are unreviewed code. At standard+ depth a second, differently-framed lane over the cumulative diff is mandatory — it reliably catches half-done fixes and self-introduced regressions, including comments that falsely claim safety. Run the diff-review skill at `--hard` over the range, then `integration-gate` across the whole change set, then live verification when the diff has a runtime surface. At `deep`, finish with a narrow convergence re-audit of the fixed areas — "N new findings, none meaningful" is the exit condition.
 
 A green mechanical sweep can lie (a tool that silently no-ops still prints nothing) — prefer deterministic scripts for residual checks and spot-check any zero-result before trusting it.
 

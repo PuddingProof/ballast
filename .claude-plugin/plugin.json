@@ -1,6 +1,6 @@
 {
   "name": "ballast",
-  "version": "0.9.3",
+  "version": "1.0.0",
   "description": "Verification-first agentic harness: docs discipline, session postmortems, plan-execution handoff, adversarial audits, secure-by-default guards.",
   "author": {
     "name": "PuddingProof"
@@ -11,7 +11,9 @@
     "./agents/plan-executor-light.md",
     "./agents/plan-executor-hard.md",
     "./agents/visual-glance.md",
-    "./agents/visual-reviewer.md"
+    "./agents/visual-reviewer.md",
+    "./agents/diff-finder.md",
+    "./agents/diff-verifier.md"
   ],
   "keywords": [
     "agentic-workflow",

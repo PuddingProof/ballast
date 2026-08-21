@@ -2,6 +2,13 @@
 
 Consumer-visible changes to the ballast plugin. Changes land under **[Unreleased]** in the same commit that makes them; a release rotates the section into a dated version heading (versions = `.claude-plugin/plugin.json`). Internal dev churn is not tracked here. **Bullets are terse one-liners — what changed, not why; rationale lives in the commit message** (style anchor: Claude Code's own CHANGELOG).
 
+## [1.0.0] — 2026-08-20
+
+- Added `diff-review`: adversarial review of one diff — your uncommitted changes by default, or a commit range, branch, PR, or file — at `--light` / `--medium` / `--hard`. Runs in a backgrounded fork with a fresh context; `--medium` and `--hard` fan out one read-only finder per applicable angle, verify every candidate, and return ranked findings with concrete failure scenarios; `--hard` adds a gap sweep. Report-only — never edits or commits.
+- ballast-principles: dropped the Communication block from the injected text (personal output style lives user-side, not in the shipped harness)
+- adversarial-audit: the Phase 4 counter-review lane runs diff-review at `--hard` (was a stale `high` keyword behind an "if this install ships it" hedge)
+- git-commit-guard: the pre-commit nudge points at `diff-review`; a silent review fork is resumed by name (SendMessage), not probed with TaskOutput
+
 ## [0.9.3] — 2026-08-18
 
 - freehand-mode: the inline slash-command form (`/freehand on`, `/ballast:freehand`) arms again; backtick-quoted keywords are mentions and never arm

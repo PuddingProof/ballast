@@ -4,3 +4,4 @@ __pycache__/
 .DS_Store
 .debug/
 /docs/hook-context.html
+/output-styles/terse.md

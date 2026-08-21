@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Stable, cross-OS entry point for diff-review's await_leaves.py. Like ballast-extract,
+# "ballast-await" is a bare permission-matcher literal (Claude Code puts bin/ on PATH),
+# so diff-review's SKILL.md invokes it by this exact name — never via a wrapper or path.
+
+set -euo pipefail
+
+# Resolve our own directory even if invoked via a relative path or symlink.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+. "$DIR/_python-probe.sh"
+
+# exec so this wrapper doesn't linger and await_leaves.py's exit code propagates.
+exec "${PY[@]}" "$DIR/../skills/diff-review/scripts/await_leaves.py" "$@"

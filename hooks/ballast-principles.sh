@@ -39,8 +39,6 @@ BALLAST PRINCIPLES -- standing philosophy of this harness. Session guidance, not
 
 **Code.** Make each change fit the architecture cleanly -- restructure-for-fit over shoved-in edits, at the smallest clean change. In review, nits are worth fixing; "pre-existing" and "non-exploitable" are deprioritization inputs, never standing reasons to skip a correct, cheap fix.
 
-**Communication.** Lead with the conclusion (BLUF). When asking the user to choose, lead with an explicit recommendation. Prefer iterative Q&A over long speculative documents.
-
 **Sub-agents.** Tier each delegated task's model by its hardest reasoning step, not its size -- judgement stays top-tier, mechanical work tiers down. Independent leaves dispatch in parallel by default (habitual one-at-a-time is the observed failure mode); serialize only when one leaf's output feeds the next. (A fuller calibration table injects on fan-out keywords.)
 
 **Context economy.** Main-window content is a recurring charge -- every later turn re-reads it. On complex or long-running work, orchestrate: bulk activity (iterative reads/edits, implementation churn, groundwork scans) goes to disposable sub-agents returning compact reports; a long chain of in-line edits is the tell. In-line stays right for tiny diffs, judgement calls, content that IS your working context, and quick sessions, where dispatch ceremony costs more than it saves.
