@@ -27,6 +27,7 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
 from collections import Counter
 
@@ -54,9 +55,8 @@ def _text_from_content(content):
 
 
 # ---------------------------------------------------------------------------
-# User-turn gate — COMPAT SURFACE. `hooks/commit-review-gate.py` imports this module and calls
-# `load_lines`, `_user_prompt`, and `_CMD_NAME_RE` directly; these are ported verbatim from v4 and
-# must keep their names, signatures, and admit/drop decisions.
+# User-turn gate. `load_lines`, `_user_prompt`, and `_CMD_NAME_RE` descend from v4;
+# test_extract.py pins their admit/drop decisions.
 # ---------------------------------------------------------------------------
 
 def _ask_answer(d):
@@ -77,6 +77,40 @@ def _ask_answer(d):
         ans = tur.get('answers')
         if isinstance(ans, dict) and ans:
             return ans
+    return None
+
+
+# A rejected tool call with a typed reason: the rejection result opens with `_REJECT_LEAD`, and the
+# typed text sits between `_REJECT_SAID` and the "Note: The user's next message…" trailer.
+# AskUserQuestion's "chat about this" button fills the same slot with fixed harness text, not typed.
+_REJECT_LEAD = "The user doesn't want to proceed with this tool use."
+_REJECT_SAID = 'To tell you how to proceed, the user said:\n'
+_REJECT_TRAILER = "\n\nNote: The user's next message"
+_REJECT_TEMPLATE = 'The user wants to clarify these questions.'
+
+
+def _rejection_note(d):
+    """If `d` is a tool call the user rejected WITH a typed reason, return that reason; else None.
+
+    Shape: a `type=="user"` line whose `toolUseResult` is the rejection error string and whose
+    is_error `tool_result` block OPENS with `_REJECT_LEAD` and carries the typed text after
+    `_REJECT_SAID`. Anchoring on the lead-in keeps a failed command whose output merely quotes the
+    phrase out; a dict toolUseResult never matches; a bare rejection has no reason."""
+    if d.get('type') != 'user' or not isinstance(d.get('toolUseResult'), str):
+        return None
+    msg = d.get('message')
+    content = msg.get('content') if isinstance(msg, dict) else None
+    if not isinstance(content, list):
+        return None
+    for c in content:
+        if isinstance(c, dict) and c.get('type') == 'tool_result' and c.get('is_error'):
+            text = _text_from_content(c.get('content'))
+            if not text.startswith(_REJECT_LEAD):
+                continue
+            _, sep, said = text.partition(_REJECT_SAID)
+            said = said.split(_REJECT_TRAILER, 1)[0].strip()
+            if sep and said and not said.startswith(_REJECT_TEMPLATE):
+                return said
     return None
 
 
@@ -113,11 +147,29 @@ def _slash_echo(text):
     return f'/{name}' + (f' {cargs}' if cargs else '')
 
 
+def _is_human_origin(origin):
+    """True when a line's `origin` marks the person, not the machine — the ONE origin gate both user
+    shapes share (`_is_real_user_msg` on user lines, `_attachment_prompt` on queued steers). A fail-
+    CLOSED allow-list: only an absent/null origin or `kind == "human"` passes. Every other kind is
+    machine-delivered text riding a user shape — task notices, the goal auto-continuation echo, and
+    the peer/coordinator agent-messages (subagent hand-backs, cross-session sends, orchestrator
+    steers into a leaf) that arrive as `commandMode == "prompt"` steers. A novel kind is DROPPED
+    rather than miscounted as the user speaking; the drift canary's origin axis surfaces it."""
+    if origin is None:
+        return True
+    return isinstance(origin, dict) and origin.get('kind') in (None, 'human')
+
+
 def _is_real_user_msg(d):
     """Return True only for a genuine user turn (standalone prose OR an AskUserQuestion answer).
 
-    Mirrors the canonical rule in cc-dashboard's core/parse.rs + the cc-user-prompts engine.
-    A real turn is a `type=="user"` line that is NOT:
+    Mirrors the canonical rule in cc-dashboard's core/parse.rs + the cc-user-prompts engine, with
+    two known divergences the transcript-parser convergence port resolves: the origin gate here is
+    an allow-list (`_is_human_origin`) where the siblings deny only `task-notification`, so they
+    still count peer/coordinator agent-messages as turns; and there is no `entrypoint == "sdk-cli"`
+    gate, which drops every turn of a `claude remote-control` session (logged as `sdk-cli`, like a
+    headless `claude -p` run — whose prompt now counts as its one turn). A real turn is a
+    `type=="user"` line that is NOT:
       - a synthetic / injected line: `isMeta == true` (slash expansions, the SessionStart caveat,
         hook-injected context, skill base-dir injections);
       - a post-compaction recap: `isCompactSummary == true` (the "This session is being
@@ -125,12 +177,11 @@ def _is_real_user_msg(d):
         it slips every other gate);
       - a sidechain replay: `isSidechain == true` (a dispatched subagent prompt replayed as the
         subagent's first user turn — lives in the subagents/ sidecars);
-      - a headless eval probe: `entrypoint == "sdk-cli"` (`claude -p` RED/GREEN runs — `type=="user"`
-        but harness-authored, not the person);
       - a tool result: a top-level `toolUseResult` / `sourceToolUseID` field or a `tool_result`
-        content block — EXCEPT an AskUserQuestion answer (`_ask_answer`), which rides a
-        toolUseResult yet IS a real turn and is admitted before that gate;
-      - a background-task notice: `origin.kind == "task-notification"` (a NON-meta user line);
+        content block — EXCEPT an AskUserQuestion answer (`_ask_answer`) or a typed rejection reason
+        (`_rejection_note`), which ride a toolUseResult yet ARE real turns, admitted before that gate;
+      - machine-origin text: any `origin.kind` but "human" (`_is_human_origin` — e.g. a NON-meta
+        `task-notification` background-task notice);
       - a `!`-mode shell OUTPUT echo (a `<local-command…>` wrapper, `<bash-stdout>` / `<bash-stderr>`).
         The `<bash-input>` the user TYPED is deliberately NOT excluded — it is a real user action.
         (A `<command-name>` / `<command-message>` SLASH echo is NOT excluded either — ENG-5: a /slash
@@ -138,7 +189,7 @@ def _is_real_user_msg(d):
 
     GUARDRAIL: `promptSource` ("typed" / "sdk" / "system" / "queued") is a TRANSPORT channel, NOT a
     human-vs-machine signal — never gate on it. Treating `sdk` as non-human hid ~790 genuine VS Code
-    turns in the sibling parser; the human axis is `entrypoint` + structural origin, never promptSource.
+    turns in the sibling parser; the human axis is structural origin, never promptSource or entrypoint.
     """
     if d.get('isMeta') is True:
         return False
@@ -146,14 +197,11 @@ def _is_real_user_msg(d):
         return False
     if d.get('isSidechain') is True:
         return False
-    if d.get('entrypoint') == 'sdk-cli':
-        return False
-    if _ask_answer(d) is not None:
-        return True   # answer rides a toolUseResult but IS a real turn — admit before the gate below
+    if _ask_answer(d) is not None or _rejection_note(d) is not None:
+        return True   # rides a toolUseResult but IS a real turn — admit before the gate below
     if 'toolUseResult' in d or 'sourceToolUseID' in d:
         return False
-    origin = d.get('origin')
-    if isinstance(origin, dict) and origin.get('kind') == 'task-notification':
+    if not _is_human_origin(d.get('origin')):
         return False
     msg = d.get('message')
     if not isinstance(msg, dict):
@@ -177,9 +225,9 @@ def _attachment_prompt(d):
     many attachment subtypes and only these are the person speaking):
       - `attachment.type == "queued_command"` with `commandMode == "prompt"` → a mid-turn STEER
         typed while the agent worked. Body in `attachment.prompt`. EXCLUDED: `task-notification` /
-        any other commandMode, AND a synthetic `origin.kind == "auto-continuation"` echo — the
-        harness's "Goal set: …" reply to a goal-set, which is NOT user-typed and would otherwise be
-        emitted as a spurious steer, duplicating the goal already surfaced via `goal_status`.
+        any other commandMode, AND any non-human origin (`_is_human_origin`) — the harness's "Goal
+        set: …" auto-continuation echo (would duplicate the goal `goal_status` already surfaces)
+        and peer/coordinator agent-messages such as a subagent's hand-back report.
       - `attachment.type == "goal_status"` → an autonomous-mode GOAL/condition the user set in
         autopilot (text in `attachment.condition`). Logged as met=false / met=true bookends that
         repeat the same condition, so callers dedup by condition.
@@ -191,10 +239,8 @@ def _attachment_prompt(d):
     att = d.get('attachment')
     if not isinstance(att, dict):
         return None
-    # `(att.get('origin') or {})` — fail closed if `origin` is explicitly JSON-null, mirroring the
-    # `isinstance(origin, dict)` task-notification gate in `_is_real_user_msg`.
     if att.get('type') == 'queued_command' and att.get('commandMode') == 'prompt' \
-            and (att.get('origin') or {}).get('kind') != 'auto-continuation':
+            and _is_human_origin(att.get('origin')):
         body = _text_from_content(att.get('prompt', ''))
         return (body, 'mid-turn steer') if body.strip() else None
     if att.get('type') == 'goal_status':
@@ -208,9 +254,12 @@ def _user_prompt(d):
     """Return (text, marker) if `d` is a prompt the user sent, else None.
 
     The single source of truth for "did the user say something here", unifying the user shapes —
-    a standalone `type=="user"` turn, an AskUserQuestion answer, a `/slash`-command echo, a mid-turn
-    `type=="attachment"` queued steer, and an autopilot goal. `marker` is None for a standalone prose
-    turn / answer, else a label ('slash-command' | 'mid-turn steer' | 'autopilot goal').
+    a standalone `type=="user"` turn, an AskUserQuestion answer, a typed tool-rejection reason, a
+    `/slash`-command echo (on a user line, or a `system`/`local_command` line for some built-ins
+    such as `/context` and `/feedback`), a mid-turn `type=="attachment"` queued steer, and an
+    autopilot goal.
+    `marker` is None for a standalone prose turn / answer, else a label ('rejection note' |
+    'slash-command' | 'mid-turn steer' | 'autopilot goal').
     """
     t = d.get('type')
     if t == 'user':
@@ -219,6 +268,9 @@ def _user_prompt(d):
         ans = _ask_answer(d)
         if ans is not None:
             return _format_answers(ans), None
+        note = _rejection_note(d)
+        if note is not None:
+            return note, 'rejection note'
         msg = d.get('message', {})
         content = msg.get('content', '') if isinstance(msg, dict) else ''
         text = _text_from_content(content)
@@ -228,13 +280,17 @@ def _user_prompt(d):
         return text, None
     if t == 'attachment':
         return _attachment_prompt(d)
+    if t == 'system' and d.get('subtype') == 'local_command' and d.get('isMeta') is not True \
+            and d.get('isSidechain') is not True:
+        slash = _slash_echo(_text_from_content(d.get('content')))  # its output lines return None
+        return (slash, 'slash-command') if slash is not None else None
     return None
 
 
 # ---------------------------------------------------------------------------
 # User-turn KIND ladder (ported from the cc-user-prompts engine) layered ON TOP of the gate above:
 # the gate decides IS-a-turn, the ladder decides WHICH KIND and renders the displayed text. Kinds:
-# typed | bash_input | queued_steer | slash_command | ask_answer | goal.
+# typed | bash_input | queued_steer | slash_command | ask_answer | rejection_note | goal.
 # ---------------------------------------------------------------------------
 
 # `!`-mode shell command the user typed, wrapped <bash-input …>cmd</bash-input>.
@@ -316,8 +372,8 @@ def _render_ask(d, ans):
 def _user_turn(d):
     """Return (kind, displayed_text) for a genuine user turn, else None.
 
-    Gate = `_user_prompt` (the compat surface, unchanged); this only classifies + cleans what the
-    gate already admitted, so the turn SET here is identical to the one the hook consumes.
+    Gate = `_user_prompt`; this only classifies + cleans what the gate
+    already admitted, so the turn SET here is exactly the gate's.
     """
     p = _user_prompt(d)
     if p is None:
@@ -329,6 +385,8 @@ def _user_turn(d):
         return 'queued_steer', _clean_prose(text)
     if marker == 'slash-command':
         return 'slash_command', text          # already rendered to `/name args` by the gate
+    if marker == 'rejection note':
+        return 'rejection_note', _clean_prose(text)
     ans = _ask_answer(d)
     if ans is not None:
         return 'ask_answer', _render_ask(d, ans)
@@ -376,6 +434,11 @@ KNOWN_LINE_TYPES = frozenset({
     # are `d.get('timestamp','')`. Added per extend-never-delete.
     'pr-link',
     'file-history-delta',  # Added per extend-never-delete.
+    # Characterized live 2026-09-23 — session-metadata records, none turn/usage-bearing, no axis reads
+    # them: `atis-latch` {atis, sessionId}; `cost-state` {totalCostUSD, total*Duration,
+    # totalLines*, startTime, modelUsage, …} (the CLI's running cost ledger); `relocated`
+    # {sessionId, relocatedCwd}, 1:1 with `worktree-state` on worktree-isolated turns.
+    'atis-latch', 'cost-state', 'relocated',
 })
 KNOWN_SYSTEM_SUBTYPES = frozenset({
     'model_refusal_fallback', 'turn_duration', 'away_summary', 'local_command', 'api_error',
@@ -434,13 +497,33 @@ KNOWN_ATTACHMENT_TYPES = frozenset({
     # the shape now occurs structurally; the tripwire's assertNotIn pin flipped with it. Carrier is
     # `type="attachment"`, not turn/usage-bearing. Added per extend-never-delete.
     'mcp_instructions_delta',
+    # Characterized live 2026-09-23 (575-transcript census) — all injected context or telemetry,
+    # carrier `type="attachment"` so turn counting already skips them; no counting branch needed.
+    # Harness nudges: `batching_reminder_sent` {text, model}, `bash_output_audience_note`
+    # {toolUseID}, `silent_turn_reminder` {text}.
+    'batching_reminder_sent', 'bash_output_audience_note', 'silent_turn_reminder',
+    # Session-context snapshots, re-emitted at session start / compact / model switch:
+    # `prompt_snapshot` {systemPrompt}, `date` {date}, `model` {identity, text}, `environment`
+    # {snapshot}, `instructions` {files}, `session_context` {context}, `deferred_tools_record`
+    # {entries, nameOnlyAnnouncements}, `credential_org` {organizationUuid},
+    # `remote_session_change` {url, commit, pr, sendUserFileHint, managedCommit, managedPr}.
+    'prompt_snapshot', 'date', 'model', 'environment', 'instructions', 'session_context',
+    'deferred_tools_record', 'credential_org', 'remote_session_change',
+    # Per-request records: `thinking_drop` {requestId, model, newlyDropped, blockHashes, …} (thinking
+    # blocks elided from the resent context), `inlined_image_paths` {paths}, `structured_output`
+    # {data, toolUseID} (a workflow agent's schema'd result, sidechain-only).
+    'thinking_drop', 'inlined_image_paths', 'structured_output',
 })
 KNOWN_COMMAND_MODES = frozenset({'prompt', 'task-notification'})
 KNOWN_PROMPT_SOURCES = frozenset({'typed', 'sdk', 'system', 'queued'})
-# origin.kind axis — extract.py uniquely branches on it (`_is_real_user_msg` drops task-notification
-# user lines; `_attachment_prompt` drops the auto-continuation goal echo), an axis drift.rs has no
-# equivalent for. A novel origin.kind would silently slip those gates.
-KNOWN_ORIGIN_KINDS = frozenset({'task-notification', 'auto-continuation', 'human'})
+# origin.kind axis — extract.py uniquely branches on it (`_is_human_origin`, shared by both user
+# shapes), an axis drift.rs has no equivalent for. The gate is an allow-list, so a novel kind is
+# dropped rather than miscounted — the canary is what makes that drop visible. `peer` / `coordinator`
+# (characterized 2026-09-23): agent-messages — subagent hand-backs, cross-session sends, and
+# orchestrator steers into a leaf — carried as isMeta user lines or `commandMode == "prompt"` steers.
+KNOWN_ORIGIN_KINDS = frozenset({
+    'task-notification', 'auto-continuation', 'human', 'peer', 'coordinator',
+})
 # Leading content-tag NAMES the parser recognizes (without the angle brackets). Unlike drift.rs's
 # string-only raw scan, the parsed-dict approach below ALSO sees array-form content tags (`ide_*`),
 # so they are included here (closes drift.rs's documented array blind spot rather than inheriting it).
@@ -448,6 +531,7 @@ KNOWN_USER_CONTENT_TAGS = frozenset({
     'command-name', 'command-message', 'bash-input', 'bash-stdout', 'bash-stderr',
     'local-command-stdout', 'local-command-caveat', 'system-reminder', 'task-notification',
     'ide_opened_file', 'ide_selection', 'ide_diagnostics',
+    'pasted_content',  # the CLI's large-paste wrapper on a typed turn — still the user speaking
 })
 # Marker flags on USER lines the parser recognizes — the gates (isSidechain/isMeta/isCompactSummary)
 # plus a benign marker it ignores (isVisibleInTranscriptOnly). A truthy is*-flag on a user line
@@ -490,16 +574,21 @@ def _bump(acc, kind, value):
 
 
 def _observe_origin(acc, origin):
-    """Tally a novel origin.kind from EITHER origin site extract.py gates on — the top-level
-    `origin` on user lines (`_is_real_user_msg` drops kind=='task-notification') AND the
-    attachment-nested `attachment.origin` (`_attachment_prompt` drops kind=='auto-continuation').
-    Observing only one site would let a novel kind on the OTHER slip its gate AND the canary — the
-    silent miscount the canary exists to surface (and would leave 'auto-continuation', an
-    attachment-only kind, unreachable in the registry)."""
-    if isinstance(origin, dict):
-        ok = origin.get('kind')
-        if isinstance(ok, str) and ok not in KNOWN_ORIGIN_KINDS:
-            _bump(acc, 'origin_kind', ok)
+    """Tally a novel origin.kind from EITHER origin site `_is_human_origin` gates — the top-level
+    `origin` on user lines AND the attachment-nested `attachment.origin` on queued steers.
+    Observing only one site would let a novel kind on the OTHER drop out of the turn count with no
+    signal — the silent miscount the canary exists to surface (and would leave attachment-only
+    kinds such as 'auto-continuation' unreachable in the registry)."""
+    if origin is None:
+        return
+    if not isinstance(origin, dict):
+        _bump(acc, 'origin_kind', '<non-dict>')    # the gate drops it — so the canary must see it
+        return
+    ok = origin.get('kind')
+    if ok is not None and not isinstance(ok, str):
+        _bump(acc, 'origin_kind', '<non-str-kind>')
+    elif isinstance(ok, str) and ok not in KNOWN_ORIGIN_KINDS:
+        _bump(acc, 'origin_kind', ok)
 
 
 def _observe_drift(acc, d):
@@ -873,7 +962,7 @@ def _collect_subagents(sidedir):
 
 # ---------------------------------------------------------------------------
 # Pricing — a small offline table ported from cc-dashboard core/pricing.rs (which mirrors ccusage).
-# APPROXIMATE, ccusage-aligned snapshot 2026-07: prices drift, and this deliberately SKIPS the
+# APPROXIMATE, ccusage-aligned snapshot 2026-09: prices drift, and this deliberately SKIPS the
 # >200k tiering and the fast-speed multiplier (both no-ops on standard Claude Code data). USD per
 # MILLION tokens: (input, output, cache_write_5m, cache_read); 1-hour cache writes bill at 2x base
 # input. An UNKNOWN model still has its tokens counted — its cost is reported as null, never guessed.
@@ -891,6 +980,11 @@ def _price_for(model):
     if 'fable' in m or 'mythos' in m:
         return (10.0, 50.0, 12.5, 1.0)
     if 'opus' in m:
+        # Opus 5.5 is its own $4/$20 SKU (CC 2.1.280 changelog); cache write keeps the 1.25x-input
+        # ratio every other row uses. Cache read is $0.20 as published: 0.05x input, deliberately
+        # off the 0.1x ratio of the other rows.
+        if re.search(r'opus-5-5(?!\d)', m):
+            return (4.0, 20.0, 5.0, 0.2)
         # Legacy Opus (3, and the original 4.0/4.1 generation) is $15/$75; everything else Opus is
         # the modern $5/$25 SKU. Legacy is the CLOSED set so a future Opus minor prices as modern.
         legacy = '3-opus' in m or re.search(r'opus-4-[01](?!\d)', m) is not None
@@ -979,7 +1073,7 @@ def _bucket_paths(paths, cwd, ignored_buckets):
 
 
 def _suggested_slug(paths, project_dir):
-    """Derive a topic slug from the session's edit footprint, bucketed by the first
+    """Derive a topic slug from the session's git footprint, bucketed by the first
     content-bearing path segment relative to the project root (the last record's cwd — the digest may run from anywhere, so it
     does NOT read os.getcwd() like the v4 subcommand did). Throwaway scratch dirs never represent
     the topic. A heuristic: the skill body may override it."""
@@ -997,8 +1091,12 @@ def _suggested_slug(paths, project_dir):
 # separator at all ("⚓ ballast: principles loaded") — that's the genuine fallback case (tally by
 # the full line), not a regex bug to chase.
 _HOOK_FIRE_NAME_RE = re.compile(r'ballast:\s*(.+?)\s*(?:—|--)')
-# `git commit` output: "[branch 1a2b3c4] subject" — the sha + subject a Bash result exposes.
-_GIT_COMMIT_OUT_RE = re.compile(r'^\[\S+ ([0-9a-f]{7,40})\] (.+)$', re.MULTILINE)
+# A PreToolUse hard block (hook exit 2) surfaces as an is_error tool_result, NOT a
+# `hook_blocking_error` attachment: `<Event>:<Tool> hook error: [<hook command>]: <reason>`. A
+# structured deny carries no `[<command>]` segment, so the prefix is the only name available.
+_HOOK_BLOCK_RE = re.compile(r'^(\w+:\S+) hook error: (?:\[(.*?)\]: )?')
+# The hook's name inside its command: the `run.sh <name>` dispatcher arg, else a script's stem.
+_HOOK_CMD_NAME_RE = re.compile(r'run\.sh"?\s+([\w.-]+)|([\w-]+)\.(?:sh|py)(?![\w.])')
 # The harness's interrupt marker, on a tool_result or as its own user line.
 _INTERRUPT_MARK = 'Request interrupted by user'
 # A record whose largest single content payload exceeds this is "oversized" (an ANOMALIES signal:
@@ -1014,7 +1112,6 @@ _OVERSIZE_NODES = 2000
 # Per-side retention for a very long user prompt. >= 2x the 4096 per-prompt cap ceiling, so the
 # rendered head+tail elision is always computed from retained text, never from a lossy clip.
 _CLIP_KEEP = 8192
-_EDITING_TOOLS = ('Edit', 'Write', 'MultiEdit', 'NotebookEdit')
 # Timeline degradation ladder: (assistant snippet cap, tool-arg head cap, user per-prompt cap).
 # User cap degrades LAST and only when USER TURNS alone exceeds 40% of budget (see _build_digest);
 # 1024 is the floor — the section is the adjudication source and is never cut below it.
@@ -1141,20 +1238,87 @@ def _tool_arg(inp):
     keys), else a compact key list — enough to tell two calls of the same tool apart."""
     if not isinstance(inp, dict):
         return ''
-    for k in _TOOL_ARG_KEYS:
+    v = _first_str(inp, *_TOOL_ARG_KEYS)
+    return _cut(v, 400) if v else ', '.join(sorted(inp)[:6])
+
+
+def _first_str(inp, *keys):
+    """First non-blank string among `keys` in a tool-input dict, else None. Tool inputs in the wild
+    carry non-string values, and one used as a Counter key or rendered as text would crash the scan."""
+    for k in keys:
         v = inp.get(k)
         if isinstance(v, str) and v.strip():
-            return _cut(v, 400)
-    return ', '.join(sorted(inp)[:6])
+            return v
+    return None
 
 
-def _hook_fire_name(content):
-    """The `<name>` from a hook_system_message's `ballast: <name> — <clause>` segment, or None
-    (caller falls back to the full line)."""
+def _hook_fire_names(content):
+    """Every `<name>` from a hook_system_message's `ballast: <name> — <clause>` segments, in order;
+    empty when none (caller falls back to the full line). One message can carry several banners
+    joined by ` · ` (shell-guards merges its guards' messages), and each names a fire."""
     if not isinstance(content, str):
+        return []
+    return [m.group(1).strip() for m in _HOOK_FIRE_NAME_RE.finditer(content)]
+
+
+def _hook_block_name(command, fallback):
+    """Inventory key for one hook hard block: `<hook-name> (block)`, the name read from the hook's
+    command when it has one, else `fallback` (the `<Event>:<Tool>` label)."""
+    m = _HOOK_CMD_NAME_RE.search(command) if isinstance(command, str) else None
+    return f'{(m.group(1) or m.group(2)) if m else fallback} (block)'
+
+
+_GIT_TIMEOUT_SEC = 10
+
+
+def _git(repo, *args):
+    """stdout of one read-only git command run in `repo`, or None on ANY failure (no git binary,
+    not a repo, timeout, non-zero exit) — the footprint fails open. Optional locks and fsmonitor
+    are off so reading a repo never writes its index or spawns its configured helpers."""
+    try:
+        r = subprocess.run(['git', '--no-optional-locks', '-c', 'core.quotepath=off',
+                            '-c', 'core.fsmonitor=false', '-C', repo, *args],
+                           capture_output=True, timeout=_GIT_TIMEOUT_SEC)
+    except (OSError, subprocess.SubprocessError, ValueError):
         return None
-    m = _HOOK_FIRE_NAME_RE.search(content)
-    return m.group(1).strip() if m else None
+    return r.stdout.decode('utf-8', 'replace') if r.returncode == 0 else None
+
+
+def _git_footprint(cwd, first_ts, last_ts):
+    """The session's footprint read from git rather than scraped from tool calls (shell-driven
+    edits and `git commit -q` leave no parseable tool trace): commits in the session's window
+    (first → last transcript timestamp) in the cwd's repo, the files those commits name, plus the
+    uncommitted tree. Returns {root, commits: [(sha, subject)], files: Counter, dirty: set} with
+    repo-relative paths, or None when git or the repo is unavailable (the section is omitted)."""
+    a, b = _parse_ts(first_ts), _parse_ts(last_ts)
+    if not cwd or a is None or b is None or not os.path.isdir(cwd):
+        return None
+    root = (_git(cwd, 'rev-parse', '--show-toplevel') or '').strip()
+    if not root:
+        return None
+    log = _git(root, 'log', '--reverse', f'--since=@{int(a)}', f'--until=@{int(b) + 1}',
+               '--format=%x1e%h%x09%s', '--name-only')
+    status = _git(root, 'status', '--porcelain', '-z')
+    if log is None or status is None:
+        return None
+    commits, files = [], Counter()
+    for rec in log.split('\x1e')[1:]:
+        head, _, names = rec.partition('\n')
+        sha, _, subject = head.partition('\t')
+        commits.append((sha, _cut(subject, 100)))
+        for n in names.splitlines():
+            if n.strip():
+                files[n.strip()] += 1
+    dirty, entries, i = set(), status.split('\0'), 0
+    while i < len(entries):
+        e = entries[i]
+        i += 1
+        if len(e) < 4:
+            continue
+        if e[0] in 'RC':
+            i += 1  # a rename/copy's next -z entry is its origin path
+        dirty.add(e[3:])
+    return {'root': root, 'commits': commits, 'files': files, 'dirty': dirty}
 
 
 def _scan(path):
@@ -1168,10 +1332,10 @@ def _scan(path):
         'transcript': os.path.abspath(path), 'lines': 0, 'first_ts': '', 'last_ts': '',
         'users': [], 'events': [], 'kinds': Counter(), 'tools': Counter(), 'tool_errors': Counter(),
         'skills': Counter(), 'slash': Counter(), 'hooks': Counter(), 'agent_dispatch': Counter(),
-        'mcp': {}, 'edits': Counter(), 'commits': [], 'api_errors': [], 'interrupts': [],
+        'mcp': {}, 'api_errors': [], 'interrupts': [],
         'oversized': 0, 'compact_boundaries': 0, 'assistant_ids': set(), 'assistant_keyless': 0,
         'usage': {}, 'usage_keyless': {}, 'drift': {}, 'chain': [], 'session_id': '',
-        'project_dir': '', 'edit_paths': [],
+        'project_dir': '',
     }
     events, pending, seen_goals = s['events'], {}, set()
     per_id = s['usage']            # message.id -> {'model': str, field: max-seen}
@@ -1221,11 +1385,12 @@ def _scan(path):
                         if is_err:
                             ev['err'] = _cut(head, 120)
                             s['tool_errors'][ev.get('n2', '?')] += 1
-                        if ev.get('git'):
-                            for sha, subject in _GIT_COMMIT_OUT_RE.findall(head):
-                                s['commits'].append((sha, _cut(subject, 100)))
                     elif is_err:
                         s['tool_errors']['?'] += 1
+                    if is_err:
+                        hb = _HOOK_BLOCK_RE.match(head)
+                        if hb:
+                            s['hooks'][_hook_block_name(hb.group(2), hb.group(1))] += 1
                     if _INTERRUPT_MARK in head[:400]:
                         s['interrupts'].append(cur_user)
                         events.append({'k': 'interrupt', 'ep': _parse_ts(ts)})
@@ -1269,7 +1434,14 @@ def _scan(path):
             if isinstance(att, dict) and att.get('type') == 'hook_system_message':
                 content = att.get('content')
                 if isinstance(content, str) and content.strip():
-                    s['hooks'][_hook_fire_name(content) or content.strip()] += 1
+                    for name in _hook_fire_names(content) or [content.strip()]:
+                        s['hooks'][name] += 1
+            elif isinstance(att, dict) and att.get('type') == 'hook_blocking_error':
+                # The attachment-shaped block (seen from project-local hooks); its paired
+                # tool_result carries only the reason, so the tool_result tally above can't double it.
+                be = att.get('blockingError')
+                s['hooks'][_hook_block_name(be.get('command') if isinstance(be, dict) else None,
+                                            _first_str(att, 'hookName') or 'hook')] += 1
             continue
 
         msg = d.get('message')
@@ -1308,6 +1480,10 @@ def _scan(path):
                     slot = s['usage_keyless'].setdefault(model, {k: 0 for k in vals})
                     for k, v in vals.items():
                         slot[k] += v
+            if isinstance(content, str):
+                # Plain-string assistant content exists in the wild (CC 2.1.277/2.1.281 fixes); it
+                # is one text block.
+                content = [{'type': 'text', 'text': content}]
             if not isinstance(content, list):
                 continue
             for c in content:
@@ -1324,6 +1500,8 @@ def _scan(path):
                 elif ctype == 'tool_use':
                     name = c.get('name', '?')
                     inp = c.get('input')
+                    if not isinstance(inp, dict):
+                        inp = {}
                     s['tools'][name] += 1
                     server, tool = _split_mcp(name)
                     if server is not None:
@@ -1331,23 +1509,26 @@ def _scan(path):
                         m['tools'].add(tool)
                         m['calls'] += 1
                     arg = _tool_arg(inp)
-                    if name in _EDITING_TOOLS:
-                        fp = (inp or {}).get('file_path') or (inp or {}).get('notebook_path') or ''
-                        if isinstance(fp, str) and fp:
-                            s['edits'][fp] += 1
-                            s['edit_paths'].append(fp)
+                    if name == 'SubagentHandback':
+                        # An auto-mode leaf's report rides this call's `input.message`, not its
+                        # trailing end_turn text — render it as the leaf's text.
+                        report = _first_str(inp, 'message')
+                        if report:
+                            events.append({'k': 'text', 't': _hhmm(ts), 'ep': _parse_ts(ts),
+                                           's': _cut('[handback] ' + report, _LADDER[0][0])})
+                        continue
                     if name in ('Agent', 'Task'):
-                        atype = (inp or {}).get('subagent_type') or (inp or {}).get('name') or '?'
+                        atype = _first_str(inp, 'subagent_type', 'name') or '?'
                         s['agent_dispatch'][atype] += 1
-                        model = (inp or {}).get('model')
+                        model = inp.get('model')
                         ev = {'k': 'agent', 't': _hhmm(ts), 'ep': _parse_ts(ts),
                               'n2': f'{atype}|{model}' if isinstance(model, str) and model else atype,
                               'a': arg}
                     elif name in ('Skill', 'Workflow'):
-                        label = (inp or {}).get('skill') or (inp or {}).get('name') or name
+                        label = _first_str(inp, 'skill', 'name') or name
                         s['skills'][label] += 1
                         ev = {'k': 'skill', 't': _hhmm(ts), 'ep': _parse_ts(ts), 'n2': label,
-                              'a': (inp or {}).get('args') or arg}
+                              'a': _first_str(inp, 'args') or arg}
                     else:
                         ev = {'k': 'tool', 't': _hhmm(ts), 'ep': _parse_ts(ts), 'n2': name,
                               'a': arg, 'done': False, 'err': None}
@@ -1355,13 +1536,6 @@ def _scan(path):
                     bid = c.get('id')
                     if bid is not None:
                         pending[bid] = ev
-                        # Detect against the RAW command, never the 400-char rendered `arg`: a real
-                        # compound (`git add <many paths> && git commit -m …`) puts the commit verb
-                        # well past the cap, and the Commits table would silently miss it.
-                        if name == 'Bash':
-                            raw_cmd = (inp or {}).get('command')
-                            if isinstance(raw_cmd, str) and 'git commit' in raw_cmd:
-                                ev['git'] = True
             continue
 
     # Idle gaps — a post-pass over the ordered events, so a >15 min hole in the session reads as a
@@ -1378,7 +1552,10 @@ def _scan(path):
     s['session_id'] = _session_uuid_from_path(path)
     s['assistant_responses'] = len(s['assistant_ids']) + s['assistant_keyless']
     s['transcript_bytes'] = os.path.getsize(path) if os.path.exists(path) else 0
-    s['suggested_slug'] = _suggested_slug(s['edit_paths'], s['project_dir'])
+    g = s['git'] = _git_footprint(s['project_dir'], s['first_ts'], s['last_ts'])
+    s['suggested_slug'] = _suggested_slug(
+        [os.path.join(g['root'], p) for p in set(g['files']) | g['dirty']] if g else [],
+        s['project_dir'])
     s['unpaired_tools'] = len(pending)
 
     # Subagent sidecars (own files, own passes) — the v4 `subagents` roster, folded into INVENTORY.
@@ -1563,18 +1740,26 @@ def _sec_inventory(scan, caps):
 
 
 def _sec_files(scan, caps):
-    rows = [(p, c) for p, c in scan['edits'].most_common()]
-    parts = [_table(['File', 'Edits'], rows, cap=60), '']
-    if scan['commits']:
-        parts += ['**Commits**', '',
-                  _table(['SHA', 'Subject'], scan['commits'], cap=40)]
+    g = scan['git']
+    if g is None:
+        return '_Omitted: no git, or the session cwd is not a git repo._'
+    paths = sorted(set(g['files']) | g['dirty'], key=lambda p: (-g['files'].get(p, 0), p))
+    rows = [(p, g['files'].get(p, 0), 'yes' if p in g['dirty'] else '') for p in paths]
+    parts = [f"_From git in `{g['root']}`: commits in the session window, plus the uncommitted "
+             'tree (which may predate the session)._', '',
+             _table(['File', 'Commits', 'Uncommitted'], rows, cap=60), '']
+    if g['commits']:
+        parts += ['**Commits**', '', _table(['SHA', 'Subject'], g['commits'], cap=40)]
     else:
-        parts += ['**Commits:** _none observed in Bash results_']
+        parts += ['**Commits:** _none in the session window_']
     return '\n'.join(parts)
 
 
 def _sec_anomalies(scan, caps):
     parts = []
+    if not scan['users'] and scan['assistant_ids']:
+        parts += [f"**No user turns captured** across {len(scan['assistant_ids'])} responses — "
+                  f"almost certainly a user-turn parser gap, not a silent session; report it.", '']
     if scan['tool_errors']:
         parts += ['**Tool errors**', '',
                   _table(['Tool', 'Errors'], scan['tool_errors'].most_common()), '']

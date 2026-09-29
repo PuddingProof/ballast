@@ -64,10 +64,9 @@ MAX_LISTED = 8
 CMDLINE_TRUNC = 120
 
 GUIDANCE = (
-    "These processes predate this session and reference this project. A leftover dev server or "
-    "built exe can hold ports, lock build outputs, or split app state across two instances. "
-    "Before launching a dev instance or a build, account for each -- reuse it or stop it "
-    "deliberately. Expected (your editor, an intentionally persistent server)? Ignore this."
+    "Leftover from a prior session and referencing this project: reuse or stop each deliberately "
+    "before launching a dev instance or a build. Expected (your editor, an intentionally "
+    "persistent app)? Ignore this."
 )
 
 

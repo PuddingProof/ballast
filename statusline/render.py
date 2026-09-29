@@ -98,7 +98,6 @@ CONFIRMED_TTL_SECONDS = 24 * 60 * 60
 # Unclaimed and vetted against both constraints, for whatever chip comes next:
 # green rgb(95,215,135) and coral rgb(255,120,120).
 CYAN = (95, 215, 255)      # autonomy chip -- cool counterpart to the warm exec orange
-MAGENTA = (255, 135, 215)  # critical-analysis -- max hue separation from both chips above
 
 # The autonomy chip, defined ONCE and bound to both of its registry keys below. Escaped rather
 # than written as a literal glyph, matching the ANSI constants above -- nothing in this file then
@@ -121,7 +120,6 @@ MODE_STYLES = {
     # for the two spellings to drift visually apart.
     "freehand": _AUTONOMY_CHIP,
     "autopilot": _AUTONOMY_CHIP,
-    "critical-analysis": ("\U0001F9E0", "critical-analysis", MAGENTA),
     # Transient phases last: DECLARATION ORDER IS DISPLAY ORDER (see _chip_sort_key), so putting
     # the short-lived phase chips after the standing stances keeps churn at the row's right edge
     # and leaves the stance chips at fixed positions. Reordering the row = reordering these lines.
@@ -136,7 +134,7 @@ _MODE_ORDER = {mode: i for i, mode in enumerate(MODE_STYLES)}
 def _claude_home():
     """Base `~/.claude` dir. Override via BALLAST_CLAUDE_HOME (test-only -- render.sh's real
     invocation never sets this, so production always resolves the genuine ~/.claude; mirrors
-    the same convention used by commit-review-gate.py / run.sh / bin/ballast-extract)."""
+    the same convention used by run.sh / bin/ballast-extract)."""
     override = os.environ.get("BALLAST_CLAUDE_HOME")
     return Path(override) if override else (Path.home() / ".claude")
 

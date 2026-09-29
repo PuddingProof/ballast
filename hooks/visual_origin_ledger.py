@@ -11,7 +11,7 @@ entries turns that into a decidable question: a later session can ask "is the pr
 still the process I recorded, and is the session that recorded it gone?" -- and only then act.
 
 THIS MODULE IS SHARED CODE ON PURPOSE. ballast's guards deliberately do NOT import each other
-(see ballast-allow.py's home_root() note): two independently fail-open guards that merely share a
+(see hooks/ballast_allow.py's home_root() note): two independently fail-open guards that merely share a
 *convention* are safer duplicated than coupled. This is the opposite shape -- one subsystem's
 on-disk state format with two readers (the origin-sweep hook and the bin/ CLI). Duplicating a
 kill-decision format across two files is the actual hazard here: a drift between writer and reader
@@ -47,10 +47,9 @@ PROBE ORDER for the process table (documented because a wrong answer here decide
      dependency-free way to get full command lines on Windows (`tasklist` has no such column) and
      matches dev-process-nudge.py's existing enumerator. psutil is NOT assumed anywhere.
   2. Windows: `pwsh` (PowerShell 7) with the same command, for boxes where Windows PowerShell is
-     absent or disabled.
-  3. Windows: `wmic process get ...` CSV -- legacy fallback only. Verified ABSENT on Windows 11
-     26200 (wmic is deprecated/removed in 24H2+), so it exists for older boxes and nothing else.
-  4. POSIX: `ps -eo pid=,ppid=,lstart=,args=`. `lstart` is the only widely portable ABSOLUTE start
+     absent or disabled. No `wmic` fallback: it is removed in Windows 11 24H2+, and the two CIM
+     probes above already cover the older boxes that still ship it.
+  3. POSIX: `ps -eo pid=,ppid=,lstart=,args=`. `lstart` is the only widely portable ABSOLUTE start
      time (BSD + GNU); `etime` is elapsed-since-boot-style and changes between calls, so it cannot
      serve as an equality-comparable fingerprint. If lstart is unavailable the probe FAILS rather
      than degrading -- see the fail direction below.
@@ -130,7 +129,7 @@ class ProcessProbeError(Exception):
 
 def claude_home():
     """BALLAST_CLAUDE_HOME (hermetic-test override; production never sets it) else ~/.claude.
-    Mirrors the resolver in run.sh / commit-review-gate.py -- deliberately never the plugin dir."""
+    Mirrors the resolver in run.sh -- deliberately never the plugin dir."""
     return os.environ.get("BALLAST_CLAUDE_HOME") or os.path.join(os.path.expanduser("~"), ".claude")
 
 
@@ -204,7 +203,7 @@ def _run(argv):
                           timeout=PROBE_TIMEOUT_S)
 
 
-# Parsing is split from execution in both Windows enumerators so the parse half is testable
+# Parsing is split from execution in the Windows enumerator so the parse half is testable
 # without a live process table: every existing test drives the BALLAST_VISUAL_PROC_FAKE seam,
 # which bypasses these branches entirely -- leaving the code production actually runs on this
 # platform unexercised. A parse bug here fails toward missed-reap (a mismatched fingerprint never
@@ -228,35 +227,6 @@ def _parse_cim(stdout, source="CIM"):
 def _windows_cim(exe):
     proc = _run([exe, "-NoProfile", "-NonInteractive", "-Command", _PS_CIM_COMMAND])
     return _parse_cim(proc.stdout, source="CIM result from %s" % exe)
-
-
-def _parse_wmic(stdout):
-    """Header is Node,CommandLine,CreationDate,ParentProcessId,ProcessId (wmic sorts the columns
-    alphabetically and prepends Node); a command line containing commas would shred a naive split,
-    so the row is parsed from BOTH ends -- the four fixed fields are taken from the known positions
-    and everything between is rejoined as the command line."""
-    out = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line or line.startswith("Node,"):
-            continue
-        parts = line.split(",")
-        if len(parts) < 5:
-            continue
-        cmdline = ",".join(parts[1:-3])
-        p = _normalize_proc(parts[-1], parts[-2], parts[-3], cmdline)
-        if p:
-            out.append(p)
-    if not out:
-        raise ProcessProbeError("empty wmic result")
-    return out
-
-
-def _windows_wmic():
-    """Legacy CSV fallback for boxes predating wmic's removal."""
-    proc = _run(["wmic", "process", "get",
-                 "CommandLine,CreationDate,ParentProcessId,ProcessId", "/format:csv"])
-    return _parse_wmic(proc.stdout)
 
 
 def _posix_ps():
@@ -305,8 +275,7 @@ def enumerate_processes():
     errors = []
     if os.name == "nt":
         probes = [("powershell.exe", lambda: _windows_cim("powershell.exe")),
-                  ("pwsh", lambda: _windows_cim("pwsh")),
-                  ("wmic", _windows_wmic)]
+                  ("pwsh", lambda: _windows_cim("pwsh"))]
     else:
         probes = [("ps", _posix_ps)]
     for label, fn in probes:
@@ -635,93 +604,53 @@ def _stale_file(path):
 
 
 # ---------------------------------------------------------------------------
-# Dispatch pin -- the session's frozen visual-dispatch context
+# Dispatch pin + brief -- the session's frozen visual-dispatch context
 # ---------------------------------------------------------------------------
 #
 # WHY A PIN: a dispatched leaf that has to discover its own origin, out-dir, state manifest and cell
 # matrix spends its first turns rediscovering what the orchestrator already knows. Pinning that
-# context ONCE per session and templating every brief from it deletes the discovery phase by
+# context ONCE per session and printing every brief from it deletes the discovery phase by
 # construction. The pin is context, never a kill decision -- nothing here can signal a process.
 #
-# DEMURRAGE: the pin also stamps the newest frontend-source mtime at pin time. Evidence captured
-# before a later edit is stale, and stale evidence certifies nothing; `pin --check` compares that
-# stamp against the live tree so the caller can name the gap instead of shipping on it.
+# WHY A PRINTER (`brief`): the observed blocked-leaf round trips all came from hand-filled briefs
+# (no runnable command, a relative URL resolved as a file path, a shorthand run literally). The same
+# class died for epochs once the harness printed the wait line, so the brief is printed too: the
+# command is assembled from the pin, never typed.
 
 PIN_FILENAME = "vp-context.json"
 
-# Frozen extension set for the demurrage stamp. Deliberately narrow: a miss makes the stamp too OLD,
-# which under-reports staleness (a nudge that doesn't fire), while walking everything would make the
-# walk itself the cost. Extend when a real frontend dialect escapes it.
-FRONTEND_EXTS = (".css", ".scss", ".sass", ".less", ".html", ".htm", ".svelte", ".vue", ".astro",
-                 ".js", ".jsx", ".ts", ".tsx", ".svg")
+# The harness entry point the brief's command runs, printed absolute so the leaf's cwd is irrelevant.
+PROBE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "skills", "visual-probe", "scripts", "probe.mjs")
 
-# Bounds the demurrage walk. A repo large enough to exceed this gets a partial (older) stamp, which
-# fails in the under-reporting direction like a missed extension does.
-MAX_WALK_FILES = 20000
-
-_WALK_SKIP = {"node_modules", "dist", "build", "target", "out", "coverage", "__pycache__",
-              ".git", ".venv", "venv"}
-
-
-def newest_frontend_mtime(root):
-    """(path, mtime) of the newest frontend source under `root`, or (None, None).
-
-    Dot-directories and build outputs are skipped -- a generated bundle's mtime tracks the build,
-    not the edit, so including it would make every post-build pin look fresh."""
-    newest_path, newest_mt, seen = None, None, 0
-    try:
-        walker = os.walk(root)
-    except OSError:
-        return (None, None)
-    for dirpath, dirnames, filenames in walker:
-        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in _WALK_SKIP]
-        for name in filenames:
-            if not name.lower().endswith(FRONTEND_EXTS):
-                continue
-            seen += 1
-            full = os.path.join(dirpath, name)
-            try:
-                mt = os.path.getmtime(full)
-            except OSError:
-                continue
-            if newest_mt is None or mt > newest_mt:
-                newest_path, newest_mt = full, mt
-        if seen >= MAX_WALK_FILES:
-            break
-    return (newest_path, newest_mt)
-
-
-def _iso(ts):
-    if ts is None:
-        return None
-    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+# Review-rung wall-clock expectation per mode, echoed into the brief's budget line.
+REVIEW_SECONDS = {"targeted": 150, "full": 150, "delta": 120}
 
 
 def pin_path(out_dir):
     return os.path.join(out_dir, PIN_FILENAME)
 
 
-def write_pin(key, url, out_dir, states=None, matrix=None, settle=None, frontend_root=None,
-              native=None, suppressions=None):
+def write_pin(key, url, out_dir, states=None, matrix=None, settle=None, native=None,
+              suppressions=None, ready=None):
     """Freeze this session's dispatch context to <out-dir>/vp-context.json. Idempotent: a re-pin
     overwrites wholesale, so the file is always one coherent snapshot rather than a merge of two.
 
     `native` is the surface's NATIVE cell (WxH@1) -- the first cell of every dispatched matrix, so a
     leaf never judges the design at a size nobody uses. `suppressions` lets a project with no state
-    manifest still declare its intended rung-0 findings."""
-    root = frontend_root or os.getcwd()
-    fe_path, fe_mt = newest_frontend_mtime(root)
+    manifest still declare its intended rung-0 findings. `ready` is the selector every capture waits
+    to see before its shutter, so no cell fires before the app is ready."""
     pin = {
         "session_key": sanitize_key(key),
         "origin": url,
         "out_dir": out_dir,
-        "states_manifest": states,
+        # Absolute at pin time (the pinning session's cwd), so the leaf's cwd is irrelevant.
+        "states_manifest": os.path.abspath(states) if states else states,
         "matrix": matrix,
         "native": native,
-        "suppressions": suppressions,
+        "suppressions": os.path.abspath(suppressions) if suppressions else suppressions,
         "settle": settle,
-        "frontend_root": root,
-        "demurrage": {"newest_frontend_path": fe_path, "newest_frontend_mtime": _iso(fe_mt)},
+        "ready": ready,
         "pinned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     os.makedirs(out_dir, exist_ok=True)
@@ -742,60 +671,92 @@ def read_pin(out_dir):
     return obj if isinstance(obj, dict) else None
 
 
-def shadow_log_path():
-    return os.path.join(cache_dir(), "dispatch-preflight-shadow.log")
+def _q(value):
+    r"""Quote one value so the printed command runs as written in bash (the leaf's Bash tool): double
+    quotes, or single quotes when the value carries a character double quotes would end or expand
+    -- a selector like [data-state="ready"] is the realistic case -- or a backslash double quotes
+    would consume (`\\`, a trailing `\`). Single quotes escape an embedded `'` POSIX-style as
+    '\'', so any value is one correct bash word."""
+    s = str(value)
+    if not (any(c in s for c in '"$`') or "\\\\" in s or "\\\n" in s or s.endswith("\\")):
+        return '"%s"' % s
+    return "'%s'" % s.replace("'", "'\\''")
 
 
-def check_pin(out_dir, index=None):
-    """Re-stat a pin's claims against live state. Returns [{check, ok, detail}, ...].
+def brief(out_dir, rung, intent, holes="NONE", mode=None, urls=None, facet=None, prior=None):
+    """The leaf's whole dispatch prompt, filled from the pin in `out_dir`; None when there is no pin.
 
-    SHADOW POSTURE (the stack's soft-before-hard doctrine): this reports, it never blocks. A row
-    with ok=False is a WOULD-BLOCK the caller names in its dispatch, not a denial."""
-    rows = []
+    The leaf loads no skill, so this text is its entire contract. The slot literals are pinned by
+    skills/visual-probe/scripts/test_brief_template.py, and the agent bodies refer to them by name
+    (`Run this first`, declared holes)."""
     pin = read_pin(out_dir)
     if not pin:
-        return [{"check": "pin", "ok": False, "detail": "no %s in %s" % (PIN_FILENAME, out_dir)}]
-    rows.append({"check": "pin", "ok": True, "detail": "pinned %s" % pin.get("pinned_at")})
+        return None
+    review = rung == "review"
+    mode = mode or "targeted"
+    origin = pin.get("origin")
+    out = os.path.abspath(out_dir)
+    matrix = pin.get("matrix")
+    urls = [u for u in (urls or []) if u]
+    native = (pin.get("native") or (matrix.split(",")[0].strip() if matrix else "")
+              or "the harness default matrix's first cell")
 
-    rows.append({"check": "out-dir", "ok": os.path.isdir(out_dir), "detail": out_dir})
+    cmd = ["node", _q(PROBE_PATH), "review-capture" if review else "glance", "--url", _q(origin)]
+    if urls:
+        cmd += ["--urls", _q(",".join(urls))]
+    if matrix:
+        cmd += ["--matrix", matrix]
+    if pin.get("states_manifest"):
+        # A leaf never imports project drive hooks; states needing one surface as named holes.
+        cmd += ["--states", _q(pin["states_manifest"]), "--skip-drive-hooks"]
+    if pin.get("ready"):
+        cmd += ["--ready", _q(pin["ready"])]
+    if pin.get("suppressions"):
+        cmd += ["--suppressions", _q(pin["suppressions"])]
+    if pin.get("settle") is not None:
+        cmd += ["--settle", str(pin["settle"])]
+    cmd += ["--out", _q(out)]
 
-    # Origin: verified against the ledger, not by probing the URL -- a request would be network IO
-    # from a preflight, and the ledger already answers "is the process I recorded still that process".
-    #
-    # SESSION-SCOPED, deliberately: a URL match across ALL ledgers means another session serving the
-    # same port validates this session's pin -- the pin would read "origin verified" while the
-    # process this session recorded is long dead, which is exactly the check's own failure mode.
-    origin_row = {"check": "origin", "ok": False, "detail": "no verified ledger entry for %s"
-                  % pin.get("origin")}
-    try:
-        if index is None:
-            index = index_by_pid(enumerate_processes())
-        entries, _ = read_entries(ledger_path(pin.get("session_key") or ""))
-        for e in entries:
-            if e.get("url") == pin.get("origin") and origin_verified(e, index):
-                origin_row = {"check": "origin", "ok": True,
-                              "detail": "pid %s verified" % e.get("pid")}
-                break
-    except ProcessProbeError as exc:
-        origin_row = {"check": "origin", "ok": True,
-                      "detail": "process table unavailable (%s) -- not asserting staleness" % exc}
-    rows.append(origin_row)
-
-    # Demurrage: capture evidence older than the newest frontend edit certifies the previous build.
-    manifest = os.path.join(out_dir, "manifest.json")
-    try:
-        man_mt = os.path.getmtime(manifest)
-    except OSError:
-        man_mt = None
-    _, fe_mt = newest_frontend_mtime(pin.get("frontend_root") or os.getcwd())
-    if man_mt is None:
-        rows.append({"check": "evidence", "ok": True, "detail": "no manifest yet (nothing stale)"})
-    elif fe_mt is not None and fe_mt > man_mt:
-        rows.append({"check": "evidence", "ok": False,
-                     "detail": "manifest %s predates a frontend edit at %s" % (_iso(man_mt), _iso(fe_mt))})
+    if review:
+        budget = ("1 invocation + ≤3 crops + ≤2 measures · 1 browser launch each · ~%ds"
+                  % REVIEW_SECONDS.get(mode, 150))
     else:
-        rows.append({"check": "evidence", "ok": True, "detail": "manifest %s" % _iso(man_mt)})
-    return rows
+        budget = "1 invocation · 1 browser launch · ~40s"
+
+    lines = [
+        "Origin (REQUIRED): %s — running and main-session-owned; authoritative, never \"the user's "
+        "live server\". Start, stop, and signal nothing. No usable origin → `blocked`, naming it." % origin,
+        "Out-dir: %s — the command below writes there; the frames must survive." % out,
+        "Epoch: SELF-EPOCH — your own capture is the epoch. (A pasted `DISPATCH … --since` wait line "
+        "replaces the command below; evidence generated before it belongs to a previous cycle.)",
+        "Target + intent: %s — %s" % (", ".join([origin] + urls), intent),
+    ]
+    if review:
+        lines.append("Mode: %s" % mode)
+    if facet:
+        lines.append("Facet: %s" % facet)
+    if prior:
+        lines.append("Prior findings: %s" % prior)
+    lines += [
+        "Declared holes (not shot): %s — carry each into your scope line verbatim, like a "
+        "`coverageHoles[]` entry." % holes,
+        "Native cell: %s — the matrix's FIRST cell; judge there, never at a nearby cell." % native,
+        "Run this first, exactly as written, alone:",
+        "  " + " ".join(cmd),
+        "Expected budget: %s. Echo the manifest's `budget` block: `invocations` is THIS dispatch "
+        "(a waited capture reports 2); `invocations_total` is the out-dir's history, not your spend."
+        % budget,
+        "Exit codes: 0 normal, including a `--deadline` partial flush (holes are data) · 1 blocked — "
+        "return the output verbatim · 2 malformed command — `blocked` · 3 the capture-ahead is not "
+        "coming — run the command above yourself, once.",
+        "Read manifest.json before any image: every `coverageHoles[]` entry rides your scope and "
+        "blocks a clean pass; a placeholder tile is a rendered hole. `cropHoles[]` only makes THAT "
+        "question indeterminate. States skipped by `--skip-drive-hooks` appear as "
+        "`drive-hook-skipped` holes.",
+        "You install nothing and never start, background, or kill a process; missing tooling or "
+        "origin = `blocked` or a named gap. Load no skill: this brief is your contract.",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def sweep(index=None, fresh_index_fn=None):
@@ -957,7 +918,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="ballast-visual-origin",
         description="Origin ledger for the visual stack: record, list, and tear down the "
-                    "orchestrator-owned origin processes of a session.")
+                    "orchestrator-owned origin processes of a session; pin its dispatch context "
+                    "and print each leaf's brief from it.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     def add_key(p):
@@ -982,15 +944,25 @@ def main(argv=None):
     p_pin = sub.add_parser("pin", help="freeze this session's dispatch context to <out-dir>/" + PIN_FILENAME)
     add_key(p_pin)
     p_pin.add_argument("--out-dir", required=True)
-    p_pin.add_argument("--url", help="origin URL (required unless --check)")
+    p_pin.add_argument("--url", help="origin URL (required)")
     p_pin.add_argument("--states", help="path to the project's visual-states.json")
     p_pin.add_argument("--matrix", help="cell matrix, e.g. 1440x900@1,768x1024@1,390x844@1")
     p_pin.add_argument("--settle", type=int, help="post-ready dwell in ms")
     p_pin.add_argument("--native", help="the surface's native cell, e.g. 1440x900@1 (first matrix cell)")
     p_pin.add_argument("--suppressions", help="path to a rung-0 suppressions file (JSON)")
-    p_pin.add_argument("--frontend-root", help="root for the demurrage walk (default: cwd)")
-    p_pin.add_argument("--check", action="store_true",
-                       help="re-stat an existing pin instead of writing one (shadow: always exits 0)")
+    p_pin.add_argument("--ready", help="CSS selector every capture waits to see before its shutter")
+
+    p_brief = sub.add_parser("brief", help="print a leaf's dispatch brief, filled from the pin in <out-dir>")
+    add_key(p_brief)
+    p_brief.add_argument("--out-dir", required=True)
+    p_brief.add_argument("--rung", required=True, choices=("glance", "review"))
+    p_brief.add_argument("--intent", required=True, help="one line: what must be true in the render")
+    p_brief.add_argument("--holes", default="NONE", help="axes not shot, each with why [default: NONE]")
+    p_brief.add_argument("--mode", choices=("targeted", "full", "delta"),
+                         help="review rung only [default: targeted]")
+    p_brief.add_argument("--urls", help="extra routes beside the origin, comma-separated")
+    p_brief.add_argument("--facet", help="the review facet this leaf owns")
+    p_brief.add_argument("--prior", help="prior findings this dispatch re-checks")
 
     args = parser.parse_args(argv)
 
@@ -1025,39 +997,33 @@ def main(argv=None):
         return 0
 
     if args.cmd == "pin":
-        if args.check:
-            rows = check_pin(args.out_dir)
-            for r in rows:
-                print("%s %-9s %s" % ("ok  " if r["ok"] else "WARN", r["check"], r["detail"]))
-            stale = [r for r in rows if not r["ok"]]
-            if stale:
-                # SHADOW, not enforcement: recorded for the fire data that would justify a hard
-                # block later, and surfaced to the caller -- but the exit code stays 0, so a
-                # dispatcher script can never be wedged by this check's own false positive.
-                try:
-                    os.makedirs(cache_dir(), exist_ok=True)
-                    with open(shadow_log_path(), "a", encoding="utf-8") as f:
-                        f.write("%s WOULD-BLOCK %s %s\n"
-                                % (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                                   args.out_dir, "; ".join("%s: %s" % (r["check"], r["detail"])
-                                                           for r in stale)))
-                except OSError:
-                    pass
-                print("WOULD-BLOCK: %d stale claim(s) -- name them in the dispatch or refresh the pin"
-                      % len(stale))
-            return 0
         if not args.url:
             print("pin: --url is required when writing a pin", file=sys.stderr)
             return 2
         key = _resolve_key(args)
         pin = write_pin(key, args.url, args.out_dir, states=args.states, matrix=args.matrix,
-                        settle=args.settle, frontend_root=args.frontend_root,
-                        native=args.native, suppressions=args.suppressions)
+                        settle=args.settle, native=args.native, suppressions=args.suppressions,
+                        ready=args.ready)
         print("pinned %s" % pin_path(args.out_dir))
-        print("  origin=%s  matrix=%s  native=%s  states=%s  suppressions=%s  settle=%s"
+        print("  origin=%s  matrix=%s  native=%s  states=%s  suppressions=%s  settle=%s  ready=%s"
               % (pin["origin"], pin["matrix"] or "-", pin["native"] or "-",
                  pin["states_manifest"] or "-", pin["suppressions"] or "-",
-                 pin["settle"] if pin["settle"] is not None else "-"))
+                 pin["settle"] if pin["settle"] is not None else "-", pin["ready"] or "-"))
+        return 0
+
+    if args.cmd == "brief":
+        urls = [u.strip() for u in (args.urls or "").split(",") if u.strip()]
+        text = brief(args.out_dir, args.rung, args.intent, holes=args.holes, mode=args.mode,
+                     urls=urls, facet=args.facet, prior=args.prior)
+        if text is None:
+            print("brief: pin first (ballast-visual-origin pin ...) -- no %s in %s"
+                  % (PIN_FILENAME, args.out_dir), file=sys.stderr)
+            return 2
+        # Bytes, not print(): the brief carries non-ASCII punctuation, and a Windows pipe's default
+        # stdout codec (cp1252) cannot encode all of it.
+        sys.stdout.flush()
+        sys.stdout.buffer.write(text.encode("utf-8"))
+        sys.stdout.buffer.flush()
         return 0
 
     if args.cmd == "teardown":

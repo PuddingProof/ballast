@@ -10,7 +10,7 @@ Two properties this suite exists to pin:
      producer-side schema change fails here, in dev/check.sh, instead of silently degrading a
      live sweep.
 
-  2. THE SWEEP-STATE BYTE CONTRACT. hooks/harness-sweep-nudge.sh parses the registry with bash
+  2. THE SWEEP-STATE BYTE CONTRACT. .claude/hooks/harness-sweep-nudge.sh parses the registry with bash
      parameter expansion on the literal " · " separator. `Advance` re-parses the rewritten file
      with a Python replication of that exact expansion logic, so a formatting "improvement" in
      `advance` can't silently blind the nudge hook.
@@ -54,7 +54,7 @@ def write_bytes(path, data):
 
 
 def hook_registry_parse(line):
-    """Byte-for-byte replication of hooks/harness-sweep-nudge.sh step 3, in full:
+    """Byte-for-byte replication of .claude/hooks/harness-sweep-nudge.sh step 3, in full:
         line="${line%$'\\r'}"; case "$line" in *" · "*) ;; *) continue ;; esac
         rest="${line#* · }"; pdir="${rest%% · *}"; wm="${rest##* · }"; wm="${wm#last=}"
         [ -d "$pdir" ] || continue
@@ -917,7 +917,9 @@ class BundleAssembly(Base):
             recs=LEDGER,
             drift=('# DRIFT-SIGHTINGS\n\n'
                    '2026-01-05' + SEP + 'projx' + SEP + 'kind=shape-one ×1\n'
-                   '2026-01-06' + SEP + 'projx' + SEP + 'kind=shape-two ×2 [registered]\n'))
+                   '2026-01-06' + SEP + 'projx' + SEP + 'kind=shape-two ×2 [registered]\n'
+                   '2026-01-07 (first 01-02)' + SEP + 'projx' + SEP + 'kind=shape-three ×9\n'
+                   '2026-01-07' + SEP + 'projx' + SEP + 'kind=shape-four ×1 — unregistered\n'))
 
     def test_ledgers_inlined_verbatim(self):
         _rc, _o, _e, out_dir = self.digest_to()
@@ -930,6 +932,8 @@ class BundleAssembly(Base):
         inbox = self.bundle_of(out_dir).split('## Drift inbox')[1].split('## Gist table')[0]
         self.assertIn('shape-one', inbox)
         self.assertNotIn('shape-two', inbox)
+        self.assertIn('shape-three', inbox, 'a (first MM-DD) date form is still a live line')
+        self.assertIn('shape-four', inbox, 'prose "unregistered" is not the [registered] tag')
 
     def test_gist_table_rows(self):
         _rc, _o, _e, out_dir = self.digest_to()

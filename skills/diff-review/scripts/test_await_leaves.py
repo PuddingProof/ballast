@@ -30,6 +30,18 @@ def tool_use():
         {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}}
 
 
+def handback(message):
+    # Auto-mode report shape: the leaf delivers its report as a tool call.
+    return {"type": "assistant", "message": {"stop_reason": "tool_use", "content": [
+        {"type": "tool_use", "id": "hb1", "name": "SubagentHandback",
+         "input": {"message": message}}]}}
+
+
+def handback_result():
+    return {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "hb1", "content": "delivered"}]}}
+
+
 class AwaitLeavesTest(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
@@ -169,6 +181,43 @@ class AwaitLeavesTest(unittest.TestCase):
         out = self.run_await("p3")
         self.assertIn("PENDING: p3", out)
         self.assertNotIn("leaked", out)
+
+    def test_handback_then_trailing_text(self):
+        # Hand-back followed by a recap + LEAF-DONE -> the hand-back message is the report.
+        self.leaf("r5", [tool_use(), handback('[{"file":"a.py","line":3}]'),
+                         handback_result(),
+                         assistant("Report delivered.\n\nLEAF-DONE", stop_reason="end_turn")])
+        out = self.run_await("r5")
+        self.assertIn("## r5 (r5)", out)
+        self.assertIn('[{"file":"a.py","line":3}]', out)
+        self.assertNotIn("Report delivered.", out)
+        self.assertIn("PENDING: none", out)
+
+    def test_handback_as_last_record_done(self):
+        # The hand-back record itself, with no trailing text yet -> done with its message.
+        self.leaf("s6", [tool_use(), handback("VERDICT: CONFIRMED")])
+        out = self.run_await("s6")
+        self.assertIn("## s6 (s6)", out)
+        self.assertIn("VERDICT: CONFIRMED", out)
+        self.assertIn("PENDING: none", out)
+
+    def test_handback_outside_tail_window(self):
+        # A hand-back pushed out of the 64KiB tail by later records is still found.
+        big = tool_use()
+        big["message"]["content"][0]["input"] = {"pad": "z" * 70000}
+        self.leaf("t7", [handback("early report"), handback_result(), big,
+                         assistant("recap only", stop_reason="end_turn")])
+        out = self.run_await("t7")
+        self.assertIn("early report", out)
+        self.assertNotIn("recap only", out)
+
+    def test_empty_handback_falls_back_to_text(self):
+        # A hand-back with no usable message fails open to the trailing text.
+        self.leaf("u8", [handback(""), handback_result(),
+                         assistant("text verdict", stop_reason="end_turn")])
+        out = self.run_await("u8")
+        self.assertIn("text verdict", out)
+        self.assertIn("PENDING: none", out)
 
     def test_large_file_tail_read(self):
         # >64KiB sidecar whose final record is done -> done via the tail read.

@@ -5,7 +5,7 @@
 # for any Bash tool call while the ballast plugin is enabled — same pattern
 # as bin/ballast-extract (see that file's header for the rationale).
 #
-# Deliberately NOT auto-allowed by hooks/ballast-allow.py: install.py edits
+# Deliberately NOT auto-allowed by hooks/ballast_allow.py: install.py edits
 # this machine's ~/.claude/settings.json (a user-settings mutation, not a
 # bounded write under ballast's own state dir), so it goes through the
 # normal Bash permission prompt like any other settings-touching command.

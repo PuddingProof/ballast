@@ -11,12 +11,6 @@
           },
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" harness-sweep-nudge",
-            "timeout": 10,
-            "statusMessage": "Checking for unswept postmortem reports..."
-          },
-          {
-            "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" dev-process-nudge",
             "timeout": 15,
             "statusMessage": "Checking for leftover project processes..."
@@ -36,11 +30,6 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" freehand-mode",
-            "timeout": 5
-          },
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" subagent-fanout",
             "timeout": 5
           }
         ]
@@ -63,44 +52,20 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" process-lifecycle-guard",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" shell-guards",
             "timeout": 5,
-            "statusMessage": "Checking sub-agent process lifecycle..."
-          },
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" package-install-guard",
-            "timeout": 5,
-            "statusMessage": "Checking for package installs / npx..."
-          },
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" git-commit-guard",
-            "timeout": 5,
-            "statusMessage": "Checking git commit / staging hygiene..."
-          },
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" commit-review-gate",
-            "timeout": 10,
-            "statusMessage": "Checking review-gated commit (shadow)..."
-          },
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" ballast-allow",
-            "timeout": 5,
-            "statusMessage": "Checking permission allowlist..."
+            "statusMessage": "Checking shell command guards..."
           }
         ]
       },
       {
-        "matcher": "Write|Edit|MultiEdit",
+        "matcher": "Task|Agent",
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" doc-write-guard",
-            "timeout": 10,
-            "statusMessage": "Checking durable-doc authoring gate (permanent-tier)..."
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" diff-review-cap",
+            "timeout": 5,
+            "statusMessage": "Checking diff-review leaf caps..."
           }
         ]
       }
@@ -109,18 +74,6 @@
       {
         "matcher": "Write|Edit|MultiEdit",
         "hooks": [
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" doc-write-guard",
-            "timeout": 10,
-            "statusMessage": "Checking durable-doc altitude (overfit guard)..."
-          },
-          {
-            "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" plan-authoring",
-            "timeout": 5,
-            "statusMessage": "Checking for plan-file authoring..."
-          },
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" visual-arm",
@@ -136,7 +89,7 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" plan-handoff",
             "timeout": 5,
-            "statusMessage": "Injecting plan→execution handoff protocol..."
+            "statusMessage": "Injecting plan-handoff pointer..."
           }
         ]
       },
@@ -147,7 +100,7 @@
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/run.sh\" inline-churn-nudge",
             "timeout": 5,
-            "statusMessage": "Logging inline-edit run length (shadow)..."
+            "statusMessage": "Counting in-line edit run..."
           }
         ]
       }

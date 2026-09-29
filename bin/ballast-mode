@@ -5,7 +5,7 @@
 # This file lives in plugins/ballast/bin/, which Claude Code puts on PATH
 # for any Bash tool call while the ballast plugin is enabled. That makes
 # "ballast-mode" a bare, machine-independent literal -- both the freehand
-# and plan-handoff hooks' injected instructions and the ballast-allow.py
+# and plan-handoff hooks' injected instructions and the hooks/ballast_allow.py
 # self-allow hook key off this exact name, so it must never be invoked
 # through a wrapper, alias, or path prefix (mirrors bin/ballast-extract's
 # same rule -- see its header and session-postmortem's SKILL.md).

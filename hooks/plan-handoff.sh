@@ -1,113 +1,41 @@
 #!/bin/bash
 # PostToolUse hook, matcher "ExitPlanMode" (wired in hooks/hooks.json) — plan→execution handoff.
 #
-# THE MOMENT: a plan was just approved and execution is about to begin. This is the decision point
-# the keyword-triggered subagent-fanout.sh structurally misses (it fires on USER prompts; plan
-# approval is a permission response, not a prompt). PostToolUse fires only on SUCCESSFUL tool
-# completion, so a rejected plan never triggers this — exactly the scoping we want, for free.
+# CONTRACT: a successful ExitPlanMode means the user just approved a plan (PostToolUse fires only on
+# success, so a rejected plan never reaches here). Inject a one-line pointer to the plan-handoff
+# skill, raise the statusline "exec" chip CONFIRMED (approval IS the confirm), and tell the model how
+# to lower the chip at hand-back. The renderer's 24h TTL is only the staleness backstop.
 #
-# SOFT BY DESIGN (additionalContext nudge, never a block): in-line execution is sometimes correct
-# (tiny diffs; taste iteration that can't be spec'd — postmortem-verified), so a hard gate would be
-# wrong. The injected text is a pointer-stub: the full protocol lives in the plan-handoff skill,
-# keeping this injection lean (durable-docs: one canonical home, reminders fire point-of-use).
+# POSTURE: soft pointer (additionalContext, never a block) — in-line execution is sometimes right
+# (tiny diffs, taste iteration), and the full protocol lives in the skill, not here.
 #
-# CHIP LIFECYCLE (statusline mode-indicator): a successful ExitPlanMode in PostToolUse literally IS
-# the user approving the plan — nothing to adjudicate — so the "exec" chip is raised CONFIRMED
-# directly, with no pending stage. The model lowers it at hand-back via the `ballast-mode clear exec
-# --session <sid>` instruction appended to the injected text below; the renderer's 24h confirmed-chip
-# TTL is only the staleness backstop, never the primary mechanism.
+# JSON SAFETY: the sid is accepted only if it matches ^[A-Za-z0-9_-]+$, and the text contains no `"`
+# or `\`, so printf interpolation always yields valid JSON. Accepted residual: a sid with unexpected
+# characters loses the chip, never the pointer.
 #
-# MECHANICS: sibling to subagent-fanout.sh (emit JSON on stdout, always exit 0), plus a payload read
-# for the `session_id` the chip write and clear-instruction need. Extraction mirrors
-# freehand-mode.sh's (python -c, rc=1 on ANY parse failure incl. "python not found" -> bash rc 127)
-# so a clean-but-absent field is distinguishable from a genuine parse failure. JSON emission goes
-# through python json.dumps with the handoff text passed via an ENV VAR and the sid via ARGV, never
-# interpolated into the python -c source: the text contains literal backticks and the sid is
-# payload-controlled, so keeping both out of the source string sidesteps any backtick/quote-escaping
-# hazard entirely (same discipline as doc-write-guard.py's env-var-for-content convention).
-#
-# DEGRADATION LADDER (python unavailable, JSON parse fails, OR sid comes back empty): fall back to
-# TODAY'S STATIC HEREDOC VERBATIM — no chip write, no clear-instruction, exactly the pre-chip
-# behavior. This means the handoff paragraph is duplicated (bash variable for the dynamic path;
-# hardcoded inside the static JSON heredoc for the fallback) — accepted, forced by the
-# python-less fallback. The pairing is pinned by hooks/tests/test_plan_handoff.sh asserting both
-# paths share the SAME distinctive sentence — keep them textually identical if you edit the wording.
-#
-# Fail-open contract: the mode-state.py write is fail-quiet (`|| true`) and never gates the JSON
-# emission that follows it — a state-write failure (e.g. unwritable state dir) must never cost the
-# handoff nudge itself. Always exit 0.
+# Fail-open: the mode-state.py write is fail-quiet and never gates the emission. Always exit 0.
 
 set -u
 
-# Self-located via BASH_SOURCE (mirrors run.sh's own DIR resolution) so statusline/mode-state.py
-# resolves correctly regardless of the caller's cwd.
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="${BALLAST_PYTHON:-python}"
 
 payload="$(cat)"
 
-PY="${BALLAST_PYTHON:-python}"
+text='PLAN APPROVED → run the plan-handoff skill before the first edit. You orchestrate, verify, and review; leaf-light / leaf / leaf-hard agents write the code. Frontend or visual work: load visual-probe now. Before hand-back, read the combined diff once as a whole.'
+msg='📋 ballast: plan-handoff — protocol pointer injected'
 
-# --- HANDOFF TEXT (canonical copy #1 — the dynamic-path source) ------------------------------
-# Single-quoted heredoc: backticks and $ are literal, no expansion hazard.
-handoff_text="$(cat <<'BALLAST_HANDOFF'
-PLAN APPROVED → EXECUTION HANDOFF. The main thread stays top-tier for orchestration, verification, and review — it does not type the implementation. Dispatch the mechanical build steps to `plan-executor` subagents (`-light` / default / `-hard` by batch difficulty); for one coherent fully-specifiable task, a git-tracked plan file → fresh cheap session also works. In-line editing is right only for tiny diffs or taste iteration that can't be spec'd. Executors get plan steps, deterministic checks, and a brief big-picture why (comment quality is bounded by it) — open-ended verification (live-driving, visual) and review adjudication stay top-tier. Plan touches frontend/visual code: load `visual-verification-gate` now, at implementation start. *Full protocol + per-leaf tier/effort: run the plan-handoff skill.*
-BALLAST_HANDOFF
-)"
+sid="$(printf '%s' "$payload" | grep -oE '"session_id"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]*)"$/\1/')"
+case "$sid" in
+  ''|*[!A-Za-z0-9_-]*) sid="" ;;
+esac
 
-# Extract .session_id via python. rc=1 on ANY parse failure (bad JSON, non-dict top level, etc.)
-# so the caller below can distinguish a clean-but-absent session_id (rc=0, empty string) from a
-# genuine parse failure (rc!=0, including "python not found" -> bash rc 127).
-# shellcheck disable=SC2086 -- intentional word-split for a two-word BALLAST_PYTHON ("py -3").
-sid="$($PY -c "
-import json, sys
-try:
-    data = json.load(sys.stdin)
-    s = data.get('session_id', '') if isinstance(data, dict) else ''
-    sys.stdout.write(s if isinstance(s, str) else '')
-except Exception:
-    sys.exit(1)
-" <<< "$payload" 2>/dev/null)"
-py_rc=$?
-
-if [ "$py_rc" -eq 0 ] && [ -n "$sid" ]; then
-  # Deterministic arm: plan approval IS the confirm, no pending phase (see CHIP LIFECYCLE above).
-  # Fail-quiet -- a state-write failure must never affect the injection that follows.
-  # shellcheck disable=SC2086
+if [ -n "$sid" ]; then
+  # shellcheck disable=SC2086 -- intentional word-split for a two-word BALLAST_PYTHON ("py -3").
   $PY "$DIR/../statusline/mode-state.py" raise exec --confirmed --session "$sid" >/dev/null 2>&1 || true
-
-  # Text passed via env var, sid via argv -- see MECHANICS above for why.
-  # shellcheck disable=SC2086
-  output="$(BALLAST_HANDOFF_TEXT="$handoff_text" $PY -c "
-import json, os, sys
-text = os.environ.get('BALLAST_HANDOFF_TEXT', '')
-sid = sys.argv[1]
-text = text + ' When the final wave is verified and you hand back, lower the exec chip: run \`ballast-mode clear exec --session ' + sid + '\`.'
-print(json.dumps({
-    'systemMessage': '📋 ballast: plan-handoff protocol injected (exec chip raised)',
-    'hookSpecificOutput': {
-        'hookEventName': 'PostToolUse',
-        'additionalContext': text,
-    }
-}))
-" "$sid" 2>/dev/null)"
-
-  if [ -n "$output" ]; then
-    printf '%s\n' "$output"
-    exit 0
-  fi
-  # json.dumps step itself failed unexpectedly -- fall through to the static fallback below.
+  text="$text When you hand back, lower the exec chip: run \`ballast-mode clear exec --session $sid\`."
+  msg="$msg (exec chip raised)"
 fi
 
-# --- DEGRADATION LADDER: python unavailable / parse failed / empty sid -----------------------
-# Today's static heredoc verbatim (canonical copy #2 of the handoff text -- see MECHANICS above).
-# No chip, no clear-instruction, no state write.
-cat <<'JSON'
-{
-  "systemMessage": "📋 ballast: plan-handoff protocol injected",
-  "hookSpecificOutput": {
-    "hookEventName": "PostToolUse",
-    "additionalContext": "PLAN APPROVED → EXECUTION HANDOFF. The main thread stays top-tier for orchestration, verification, and review — it does not type the implementation. Dispatch the mechanical build steps to `plan-executor` subagents (`-light` / default / `-hard` by batch difficulty); for one coherent fully-specifiable task, a git-tracked plan file → fresh cheap session also works. In-line editing is right only for tiny diffs or taste iteration that can't be spec'd. Executors get plan steps, deterministic checks, and a brief big-picture why (comment quality is bounded by it) — open-ended verification (live-driving, visual) and review adjudication stay top-tier. Plan touches frontend/visual code: load `visual-verification-gate` now, at implementation start. *Full protocol + per-leaf tier/effort: run the plan-handoff skill.*"
-  }
-}
-JSON
+printf '{"systemMessage":"%s","hookSpecificOutput":{"hookEventName":"PostToolUse","additionalContext":"%s"}}\n' "$msg" "$text"
 exit 0

@@ -1,9 +1,9 @@
 #!/usr/bin/env python
-"""Regression tests for process-lifecycle-guard.py.
+"""Regression tests for process_lifecycle_guard.py, run through the shell-guards.py dispatcher.
 
-The hook filename is hyphenated (not importable), so each case invokes it as a subprocess with
-the current interpreter, feeds a PreToolUse JSON payload on stdin, and asserts on the emitted
-decision.
+Each case invokes `hooks/shell-guards.py` as a subprocess with the current interpreter, feeds a
+PreToolUse JSON payload on stdin, and asserts on the merged decision (a lifecycle-only fire is
+byte-identical to the old standalone hook's output).
 
 Two corpora carry the weight, and neither is decoration:
 
@@ -23,7 +23,8 @@ the false-positive corpus, so the guard trades that coverage for corpus cleanlin
 hook header's residual 1.
 
 HERMETIC (hooks/CLAUDE.md rule): every invocation sets BALLAST_CLAUDE_HOME to a temp dir, so the
-valve marker directory is never the real ~/.claude. Production never sets that var.
+dispatcher's ballast_allow opt-in marker is never read from the real ~/.claude. Production never
+sets that var.
 
 Self-locating + standalone: `python hooks/tests/test_process_lifecycle_guard.py`.
 """
@@ -33,15 +34,20 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 
-HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "process-lifecycle-guard.py")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "shell-guards.py")
 
-# A stand-in transcript path: the guard derives the valve's session key from its filename stem.
 TRANSCRIPT = "/home/u/.claude/projects/proj/abc-123.jsonl"
-SESSION_KEY = "abc-123"
 LEAF = {"agent_type": "some-agent", "agent_id": "ag_1"}
+
+# The deny reason's leaf-facing half, pinned verbatim: it is the whole escape hatch.
+LEAF_ESCAPE = (
+    "Sub-agents never start, background, or signal a process — the orchestrator owns lifecycle. "
+    "Do not retry or route around this (another runner, a foreground variant, a wrapper, a "
+    "background flag): use the origin or service you were handed, or return `blocked` / a named "
+    "coverage gap naming what is missing and finish with what exists."
+)
 
 
 class GuardCase(unittest.TestCase):
@@ -50,22 +56,6 @@ class GuardCase(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="ballast-lifecycle-test-")
         self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
-
-    def valve_dir(self):
-        return os.path.join(self.home, ".cache", "ballast-lifecycle")
-
-    def valve_file(self, key=SESSION_KEY):
-        return os.path.join(self.valve_dir(), "valve-%s" % key)
-
-    def open_valve(self, key=SESSION_KEY, age_days=0):
-        d = self.valve_dir()
-        os.makedirs(d, exist_ok=True)
-        path = self.valve_file(key)
-        open(path, "w").close()
-        if age_days:
-            old = time.time() - age_days * 86400
-            os.utime(path, (old, old))
-        return path
 
     def run_hook(self, command="", tool="Bash", background=None, caller=LEAF,
                  transcript=TRANSCRIPT, raw=None):
@@ -447,16 +437,16 @@ class DenyTextContract(GuardCase):
         o = self.out(self.run_hook(**kw))
         return o["hookSpecificOutput"]["permissionDecisionReason"]
 
-    def test_names_the_escape_hatch(self):
-        r = self.reason(command="npm run dev")
-        self.assertIn("Do NOT retry", r)
-        self.assertIn("coverage gap", r)
-        self.assertIn("blocked verdict", r)
+    def test_pins_the_full_deny_text(self):
+        self.assertEqual(self.reason(command="npm run dev"),
+                         "Standing-service launch blocked ('npm run dev'): this is a sub-agent. "
+                         + LEAF_ESCAPE)
 
-    def test_names_the_valve_path(self):
+    def test_names_no_path_or_valve(self):
+        # There is no release valve: the leaf reports a false positive, it is handed no lever.
         r = self.reason(command="npm run dev")
-        self.assertIn(self.valve_file(), r)
-        self.assertIn("never creates it", r)
+        self.assertNotIn("valve", r)
+        self.assertNotIn(self.home, r)
 
     def test_is_domain_neutral(self):
         # A leaf in a project with no frontend must read this as ordinary lifecycle hygiene.
@@ -468,52 +458,6 @@ class DenyTextContract(GuardCase):
         o = self.out(self.run_hook(command="npm run dev"))
         self.assertIn("process-lifecycle-guard", o["systemMessage"])
 
-    def test_deny_does_not_create_the_valve(self):
-        self.run_hook(command="npm run dev")
-        self.assertFalse(os.path.exists(self.valve_file()),
-                         "the guard must never create its own release valve")
-
-
-class ReleaseValve(GuardCase):
-    def test_valve_allows_and_warns(self):
-        path = self.open_valve()
-        o = self.out(self.run_hook(command="npm run dev"))
-        self.assertIsNotNone(o)
-        self.assertNotIn("hookSpecificOutput", o)   # no permission decision at all
-        self.assertIn("⚠️", o["systemMessage"])
-        self.assertIn("release valve", o["systemMessage"])
-        self.assertIn(path, o["systemMessage"])
-
-    def test_valve_covers_every_deny_class(self):
-        self.open_valve()
-        for kw in ({"command": "taskkill /F /IM node.exe"},
-                   {"command": "ls", "background": True},
-                   {"command": "docker compose up"}):
-            o = self.out(self.run_hook(**kw))
-            self.assertIsNotNone(o, kw)
-            self.assertNotIn("hookSpecificOutput", o)
-
-    def test_valve_is_session_scoped(self):
-        # Another session's valve does not open this one's.
-        self.open_valve(key="other-session")
-        self.assertEqual(self.decision(self.run_hook(command="npm run dev")), "deny")
-
-    def test_stale_valve_is_pruned_and_does_not_allow(self):
-        path = self.open_valve(age_days=3)
-        self.assertEqual(self.decision(self.run_hook(command="npm run dev")), "deny")
-        self.assertFalse(os.path.exists(path), "a >2-day-old valve must be pruned")
-
-    def test_fresh_valve_survives_a_prune_pass(self):
-        stale = self.open_valve(key="ancient", age_days=5)
-        fresh = self.open_valve()
-        self.out(self.run_hook(command="npm run dev"))
-        self.assertTrue(os.path.exists(fresh))
-        self.assertFalse(os.path.exists(stale))
-
-    def test_valve_stays_silent_on_a_benign_command(self):
-        self.open_valve()
-        self.assertSilent(command="npm test")
-
 
 class FailOpen(GuardCase):
     """A guard bug must never block every Bash/PowerShell call — and never silently."""
@@ -522,7 +466,7 @@ class FailOpen(GuardCase):
         self.assertEqual(proc.returncode, 0)
         o = json.loads(proc.stdout.strip())
         self.assertIn("systemMessage", o)
-        self.assertIn("process-lifecycle-guard", o["systemMessage"])
+        self.assertIn("shell-guards", o["systemMessage"])
         self.assertNotIn("hookSpecificOutput", o)
 
     def test_malformed_payload(self):
@@ -553,7 +497,7 @@ class FailOpen(GuardCase):
         self.assertEqual(proc.stdout.strip(), "")
 
     def test_missing_transcript_path_still_denies(self):
-        # A missing session key must not disable the guard — it only coarsens the valve scope.
+        # The guard reads no session state: a sparse leaf payload still denies.
         proc = self.run_hook(command="npm run dev", transcript="")
         self.assertEqual(self.decision(proc), "deny")
 

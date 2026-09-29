@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Regression tests for bin/ballast-review -- the headless sidecar trampoline that restores
-# autonomous review-before-commit now that native /code-review is user-invoke-only (Claude Code
-# 2.1.215). Every case here goes through the BALLAST_REVIEW_ECHO=1 test seam, which prints the
+# autonomous review-before-commit from when native /code-review was user-invoke-only (Claude Code
+# 2.1.215; since re-opened behind a feature flag). Every case here goes through the BALLAST_REVIEW_ECHO=1 test seam, which prints the
 # exact command line the shim would exec instead of actually spawning a headless `claude -p`
 # session -- so this suite is fast, free, and needs no live account.
 #

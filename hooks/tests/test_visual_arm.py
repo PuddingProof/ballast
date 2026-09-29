@@ -319,9 +319,8 @@ class DegradedMode(ArmCase):
 
     def test_session_key_is_sanitized_before_becoming_a_path(self):
         # A payload field is not a trusted path component. The property that matters is that no
-        # SEPARATOR survives -- `.` stays in the allowed charset (same charset as
-        # process-lifecycle-guard's valve key), so a literal `..` may remain in the name, but
-        # without a separator it can never leave the state dir.
+        # SEPARATOR survives -- `.` stays in the allowed charset, so a literal `..` may remain in
+        # the name, but without a separator it can never leave the state dir.
         self.assertArmed(file_path="src/App.tsx", session="../../evil/../x y")
         names = os.listdir(self.state_dir())
         self.assertEqual(len(names), 1)

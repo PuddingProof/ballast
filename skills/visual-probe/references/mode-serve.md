@@ -10,10 +10,7 @@ not the next run's.
 
 ## Lifecycle: one origin, main session, handed down
 
-Origin doctrine — start once, record, hand down, tear down — is the visual-verification-gate
-skill's setup stage; this body owns the mechanism. Parallel reviewers share that single origin
-headlessly, so N instances are never needed, and a leaf never starts, stops, or signals a process:
-a caller-provided origin is the caller's to stop.
+Origin doctrine (start once, record, pin, tear down) lives in the visual-probe SKILL.md §1; this body owns the mechanism.
 
 **Never probe the user's live dev server.** An app under probe fires its own beacons at whatever
 origin served it: a tab-close beacon has armed a live server's shutdown and killed it under the

@@ -17,7 +17,7 @@ settings.json is always a refusal, never a best-effort merge.
 
 Settings path resolution: `<home>/settings.json`, where home is
 BALLAST_CLAUDE_HOME if set (hermetic-test override, mirrors the convention
-used by commit-review-gate.py / run.sh), else `~/.claude`.
+used by run.sh), else `~/.claude`.
 """
 
 import argparse

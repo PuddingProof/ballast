@@ -158,7 +158,7 @@ check "(f5) slash form after space arms"  '{"prompt":"do the fixes then /autopil
                                   yes "FREEHAND / AUTOPILOT"
 
 # (f6) backtick-quoted keyword -> NO arm: inline code is the user's declared mention syntax
-#      (same convention as subagent-fanout.sh's identical strip).
+#      (see MENTION MARKER in the hook header).
 check "(f6) backticked word, no arm"  '{"prompt":"the `freehand` hook is misfiring again"}' \
                                   no -
 
@@ -235,6 +235,19 @@ check "(j) fallback: notification-shell, no arm" '{prompt: this is not valid jso
 #     assertion deliberately, so this file's fallback-path coverage is self-contained and doesn't
 #     rely on reading case (e) to know the fallback still works).
 check "(k) fallback: plain keyword still arms" '{prompt: this is not valid json, but the user wants freehand mode enabled}' \
+                                  yes "FREEHAND / AUTOPILOT"
+
+# (k2) subagent hand-back delivered as a turn (<agent-message from=...>) is agent output, not a
+#      typed grant -> demoted even though the report mentions "freehand on" (observed 2026-09-24).
+check "(k2) agent-message hand-back, no arm" '{"prompt":"Another Claude session sent a message:\n<agent-message from=\"a3f334a260d5750a1\">\n[Subagent hand-back] The text below is the final report of a subagent. Tested freehand on as a fixture.\n</agent-message>"}' \
+                                  no -
+
+# (k3) sibling cross-session shape -> demoted the same way.
+check "(k3) cross-session-message, no arm" '{"prompt":"Another Claude session sent a message:\n<cross-session-message from=\"b12\">\nthe other session ran on autopilot\n</cross-session-message>"}' \
+                                  no -
+
+# (k4) control for (k2): the same "freehand on" text typed plainly still arms.
+check "(k4) plain freehand on still arms" '{"prompt":"Tested freehand on as a fixture."}' \
                                   yes "FREEHAND / AUTOPILOT"
 
 # =================================================================================================

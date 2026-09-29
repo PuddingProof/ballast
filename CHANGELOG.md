@@ -2,6 +2,40 @@
 
 Consumer-visible changes to the ballast plugin. Changes land under **[Unreleased]** in the same commit that makes them; a release rotates the section into a dated version heading (versions = `.claude-plugin/plugin.json`). Internal dev churn is not tracked here. **Bullets are terse one-liners — what changed, not why; rationale lives in the commit message** (style anchor: Claude Code's own CHANGELOG).
 
+## [Unreleased]
+
+## [2.0.0] — 2026-09-29
+
+- Added `lean-spec`: guidance for writing lean specs for agentic work: intent, key requirements, and constraints, with no implementation plan; durable-docs now covers only living specs
+- diff-review: the fork decides per angle whether to fan out, from diff size and its own model; `--medium` verifies in-context (no verifier leaves)
+- diff-review: leaves cap at Opus (never Fable); `--hard` batches verifiers 2–4 candidates per leaf, ≤4 leaves; `--medium` runs ≤6 angles; re-checks of fixes use `--light`
+- diff-review: the leaf collector reads a leaf's `SubagentHandback` report (auto mode) instead of its trailing recap
+- Added `diff-review-cap` guard: hard-caps diff-review leaves per review (verifiers 0/0/4, finders 0/6/11 at light/medium/hard) and denies Fable leaves
+- session-postmortem: subagent hand-backs and other agent-messages no longer count as user turns; the drift canary knows 21 newer transcript shapes; malformed tool inputs no longer crash the digest
+- session-postmortem: `claude remote-control` sessions (logged as `sdk-cli`) keep their user turns; a typed reason on a rejected tool call and built-in commands logged as system lines (`/context`, `/feedback`) count as turns; a digest with responses but no user turns is flagged under ANOMALIES
+- session-postmortem: digest prices Opus 5.5 at $4/$20
+- session-postmortem: files touched + commits come from git over the session window (catches shell edits and `git commit -q`); omitted when there is no repo
+- session-postmortem: the hook inventory counts PreToolUse hard blocks
+- session-postmortem: a leaf's `SubagentHandback` report and plain-string assistant replies show as assistant text
+- harness-sweep + nudge: drift-inbox lines close only on a literal `[registered]` tag, and `(first MM-DD)`-dated lines count again
+- Removed skills integration-gate, critical-analysis, and adhd, plus the `/documentation` alias
+- Removed hooks git-commit-guard, commit-review-gate, doc-write-guard, subagent-fanout, and plan-authoring
+- `ballast-allow` no longer auto-allows the retired `ballast-review` shim
+- Bash/PowerShell guards now run as one `shell-guards` hook that skips commands no guard can match
+- Session-start principles block rewritten at half the size
+- durable-docs: one short check (reusable class, one home, leaner) plus audit, with a section for prompts
+- adversarial-audit: `--light` (default) / `--medium` / `--hard` with lens caps; scope defaults to changes since the last audit
+- plan-handoff: shorter protocol ending in a combined-diff read; its hook injects a one-line pointer
+- refactor-fit: trimmed to its three steps
+- freehand: the contract closes out with review then commit, and reports deviations
+- visual-verification-gate merged into visual-probe; `ballast-visual-origin brief` prints the leaf's brief; `pin --check` removed
+- visual-glance and visual-reviewer: bodies and descriptions cut about in half, and both skip CLAUDE.md
+- visual-probe: fused verbs take `--ready <selector>`; `--urls` extras honor the states `readySignal`; crops no longer overwrite each other
+- process-lifecycle-guard: release valve removed, shorter deny text
+- Shorter injected text from freehand-mode, dev-process-nudge, visual-arm, and inline-churn-nudge; inline-churn-nudge's shadow log retired
+- harness-sweep: leaner skill, `--deep` runs in one context; its nudge is dev-only and no longer injects context
+- plan-executor agents renamed `leaf` / `leaf-light` / `leaf-hard`, with a role-neutral body and web search allowed
+
 ## [1.0.0] — 2026-08-20
 
 - Added `diff-review`: adversarial review of one diff — your uncommitted changes by default, or a commit range, branch, PR, or file — at `--light` / `--medium` / `--hard`. Runs in a backgrounded fork with a fresh context; `--medium` and `--hard` fan out one read-only finder per applicable angle, verify every candidate, and return ranked findings with concrete failure scenarios; `--hard` adds a gap sweep. Report-only — never edits or commits.

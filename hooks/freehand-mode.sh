@@ -45,8 +45,7 @@
 #
 # MENTION MARKER: inline-code (backtick) spans are replaced with a single space in the scan
 # target before the keyword match — a backtick-quoted keyword is the user's EXPLICIT typed
-# mention syntax (subagent-fanout.sh ships the identical strip; one convention across the
-# keyword sensors). This is the one sanctioned recall-layer rejection of a typed shape: it
+# mention syntax. This is the one sanctioned recall-layer rejection of a typed shape: it
 # encodes declared syntax with fixed semantics, not a heuristic guess at intent (those stay in
 # the stub), and it ships with failing-shape tests. The replacement is a SPACE, never empty:
 # deleting a span outright fuses its neighbors into one token, silencing a keyword with a
@@ -129,15 +128,17 @@ else
 fi
 
 # NOTIFICATION-SHELL DEMOTION: harness-generated turns (task-notifications, background-resume
-# replays) land in .prompt but are never a typed grant. Marker strings are harness-version-
-# volatile by nature; the stub's adjudication gate is the version-proof backstop if they drift.
+# replays, and agent output delivered as a turn -- subagent hand-backs in <agent-message from=...>,
+# <cross-session-message from=...>) land in .prompt but are never a typed grant. Marker strings
+# are harness-version-volatile by nature; the stub's adjudication gate is the version-proof
+# backstop if they drift.
 # Matched against $match_target so this also covers the fallback path (the raw payload contains
 # the .prompt text verbatim either way). This exit precedes BOTH the arm and the mirror -- a
 # synthetic turn is never a grant, so it must neither stub nor mirror.
 # ACCEPTED RESIDUAL: it also demotes a TYPED prompt that merely QUOTES a marker string (no arm,
 # no gate shown). Accepted as the rarer direction -- a real grant can be re-typed plainly.
 case "$match_target" in
-  *"[SYSTEM NOTIFICATION - NOT USER INPUT]"*|*"<task-notification>"*) exit 0 ;;
+  *"[SYSTEM NOTIFICATION - NOT USER INPUT]"*|*"<task-notification>"*|*"<agent-message from="*|*"<cross-session-message from="*) exit 0 ;;
 esac
 
 # Backtick-quoted spans are mentions by declared convention (see MENTION MARKER above) — replace
@@ -157,7 +158,7 @@ if printf '%s' "$scan_target" | grep -iqE '(^|[^[:alnum:]_/\-])(freehand|autopil
 {
   "hookSpecificOutput": {
     "hookEventName": "UserPromptSubmit",
-    "additionalContext": "FREEHAND / AUTOPILOT — keyword-armed injection. ADJUDICATE FIRST: a pattern matched the word 'freehand' or 'autopilot' in the typed prompt; a pattern cannot tell USING the keyword from MENTIONING it, so that call is yours.\n\nFreehand/autopilot is ballast's delegated-autonomy mode: a standing session grant handing Claude the design decisions the user left unspecified. The full standing contract lives in the freehand skill body — do NOT adopt the mode from this stub; the contract is not in force until the skill loads it. (If a genuine grant is already standing this session, its contract remains in force — this arm changes nothing.)\n\n- Genuine grant (the user is invoking delegated autonomy): run the freehand skill with argument `on` — it loads the contract.\n- Revoke (the user is turning the mode off): run the freehand skill with argument `off` — it clears every standing autonomy grant.\n- Mere mention (discussing or debugging this hook or the mode itself, quoting a past prompt, naming a file): a false-arm — disregard this block, do not adopt or announce the mode, and proceed with the request as written.\n- If genuinely ambiguous, say in one clause which reading you took."
+    "additionalContext": "FREEHAND / AUTOPILOT keyword matched. ADJUDICATE FIRST: a pattern can't tell using the word from mentioning it.\n- Genuine grant: run the freehand skill with argument `on`; do NOT adopt the mode from this note, the contract loads with the skill.\n- Revoke: run the freehand skill with argument `off`.\n- Mention (discussing the mode or this hook, quoting, a filename): ignore this and proceed. A mention never revokes a standing grant.\nIf ambiguous, say in one clause which reading you took."
   },
   "systemMessage": "✈️ ballast: freehand/autopilot keyword armed — Claude adjudicates use-vs-mention"
 }
@@ -185,7 +186,7 @@ else
         # additionalContext must OPEN with "MODE MIRROR —", NOT "FREEHAND / AUTOPILOT", so the
         # postmortem extractor never multi-counts one standing grant as a fresh arm every prompt.
         # No systemMessage BY DESIGN -- see VISIBILITY in the header.
-        printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"MODE MIRROR — %s ON (standing session grant). The contract is the freehand skill body — if it is not in your context (e.g. after a compact), re-run the freehand skill with argument on for %s. Otherwise no action needed."}}\n' "$modes_on" "$modes_on"
+        printf '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"MODE MIRROR — %s ON. If the freehand skill'\''s contract is not in your context (e.g. after a compact), re-run the freehand skill with argument on."}}\n' "$modes_on"
       fi
     fi
   fi

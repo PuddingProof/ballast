@@ -7,7 +7,7 @@ staged work, credited via any of THREE evidence channels -- (a) a review Skill t
 (code-review/simplify for code; for a docs/meta commit EITHER durable-docs OR a code review --
 see O3's one-way widening), (b) a COMPLETED sidecar review shelled
 out via Bash (`ballast-review ...`, or a raw `claude -p "/code-review ..."`) -- native /code-review
-went user-invoke-only in CC 2.1.215, so autonomy runs it in a headless sibling session; only a
+went user-invoke-only in CC 2.1.215 (re-opened behind a feature flag by 2.1.233), so autonomy could run it in a headless sibling session; only a
 FINISHED, NON-ERRORED one (tool_result paired, is_error absent) counts, and only for commits whose
 O3 route accepts code-review -- which since the O3 settle is BOTH code AND docs/meta commits (a
 code-review over a docs-only diff is a HEAVIER review than the docs gate, not a wrong one), a
@@ -212,7 +212,8 @@ def _looks_like_commit_call(cmd):
 # A sidecar review is a headless sibling `claude` session running the native /code-review engine,
 # launched EITHER via the `bin/ballast-review` shim (the sanctioned path) or raw as
 # `claude -p "/code-review ..."` typed directly. Native /code-review went user-invoke-only in
-# CC 2.1.215, so this Bash-transport is how an autonomous cycle still gets a real review pass.
+# CC 2.1.215 (re-opened behind a feature flag by 2.1.233); this Bash-transport is the dormant
+# sidecar path an autonomous cycle used to get a real review pass while it was locked out.
 # The negative lookbehind pins the name to INVOCATION position (start of command, or after a
 # space/separator): a path-qualified `bin/ballast-review` or `./ballast-review` is a file MENTION
 # (git add, cat, chmod ...), not the sanctioned bare-name launch (see the shim header's bare-name
@@ -816,7 +817,7 @@ def _scan_source(path):
 
         # O1 channel c: a user-typed `/code-review` lands as a user message whose STRING content is
         # a `<command-name>...</command-name>` echo (NOT a Skill tool_use -- native /code-review is
-        # user-invoke-only now, so it no longer emits one). Capture the raw command name via
+        # user-invoke-only at the time, so it stopped emitting one). Capture the raw command name via
         # extract.py's shared `_CMD_NAME_RE`; the cheap startswith() gates the search, and the
         # normalized name is filtered against the accepted set later in _o1_core.
         try:

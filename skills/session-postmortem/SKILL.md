@@ -1,7 +1,7 @@
 ---
 name: session-postmortem
 description: Produce a structured, evidence-cited post-mortem report of a Claude Code session — how it went, where the user had to steer, what tooling fired — from a deterministic transcript digest, in one pass.
-when_to_use: Use when wrapping up or closing out a session, before /compact at a natural boundary, or on any "retro", "post-mortem", "how did this session go", "session review" request — or when the user types /session-postmortem. Also for a PAST session via --id. A session self-state wrap — not docs-authoring or skill-craft (durable-docs / skill-forge), and not the cross-project sweep (harness-sweep consumes these reports; this skill produces one).
+when_to_use: Use when wrapping up or closing out a session, before /compact at a natural boundary, or on any "retro", "post-mortem", "how did this session go", "session review" request — or when the user types /session-postmortem. Also for a PAST session via --id. A session self-state wrap — not docs-authoring or skill-craft (durable-docs), and not the cross-project sweep (harness-sweep consumes these reports; this skill produces one).
 argument-hint: "[--id <session-id>] [--focus <topic>]"
 model: opus
 effort: medium

@@ -8,9 +8,9 @@ ENUM is pinned for the same reason from the other side: the gate's response tabl
 a verdict either rung can emit but the table does not name has no defined obligation.
 
 This pins literals, not quality: it fails when a heading or a verdict word moves, which is exactly
-when the gate skill's table and both agent bodies have to move together.
+when the visual-probe skill's table and both agent bodies have to move together.
 
-Self-locating, stdlib only. Run: python skills/visual-verification-gate/scripts/test_verdict_schema.py
+Self-locating, stdlib only. Run: python skills/visual-probe/scripts/test_verdict_schema.py
 """
 
 import os
@@ -21,7 +21,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
 GLANCE = os.path.join(ROOT, "agents", "visual-glance.md")
 REVIEWER = os.path.join(ROOT, "agents", "visual-reviewer.md")
-GATE = os.path.join(ROOT, "skills", "visual-verification-gate", "SKILL.md")
+GATE = os.path.join(ROOT, "skills", "visual-probe", "SKILL.md")
 
 # The block headings each body must carry, in the order a reader meets them.
 GLANCE_HEADINGS = ["VERDICT:", "SCOPE:", "INTENT:", "FINDINGS", "RUNG-0", "HOLES"]

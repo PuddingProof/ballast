@@ -12,7 +12,7 @@ on-disk format and its atomicity guarantee live in exactly one place.
 SECURITY RATIONALE -- validation is a security boundary, not a nicety: both
 `mode` and `--session <sid>` are interpolated directly into a filesystem path
 under `~/.claude/ballast/modes/` (the session id becomes the filename). This
-CLI is *also* on ballast-allow.py's permission self-allow list for the bare
+CLI is *also* on hooks/ballast_allow.py's permission self-allow list for the bare
 `ballast-mode ...` form, meaning a hook can invoke it with zero human
 confirmation. If either argument were allowed to contain path-traversal
 characters (forward slash, backslash, `..`) a crafted session id could escape the modes/
@@ -86,7 +86,7 @@ def validate_sid(sid):
 
 # =================================================================================================
 # Paths -- resolved under _claude_home() so tests can redirect every side effect (mirrors the
-# BALLAST_CLAUDE_HOME convention used by hooks/commit-review-gate.py and hooks/run.sh).
+# BALLAST_CLAUDE_HOME convention used by hooks/run.sh).
 # =================================================================================================
 
 def _claude_home():

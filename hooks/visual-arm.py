@@ -15,7 +15,7 @@ burning the once-per-session trigger. So a leaf touch records a PENDING-ARM flag
 injection. The state file is this hook's audit record in place of the ledger row a silent fire
 cannot produce.
 
-CALLER DISCRIMINATION is payload-only, ported from process-lifecycle-guard.py (`agent_type` OR
+CALLER DISCRIMINATION is payload-only, ported from process_lifecycle_guard.py (`agent_type` OR
 `agent_id`). Verified fire-side on PostToolUse (CC 2.1.220): both fields present on leaf fires,
 absent on main-loop fires, and `session_id` is PARENT-STABLE on a leaf fire -- which is why
 session_id is the ledger key. Never key on `prompt_id` (it rotates per turn).
@@ -73,6 +73,13 @@ import re
 import sys
 import time
 
+# is_subagent lives in the sibling hook_payload module; the hook runs as a script, so its own dir
+# is on sys.path already -- inserted explicitly so an importlib load from a test sees it too.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+from hook_payload import is_subagent  # noqa: E402
+
 HOOK_NAME = "visual-arm"
 
 STATE_DIRNAME = "ballast-arm"
@@ -111,26 +118,6 @@ def _announce_error(site, skipped):
 # --------------------------------------------------------------------------------------
 # Caller discrimination
 # --------------------------------------------------------------------------------------
-def is_subagent(payload):
-    """True when this fire originates anywhere other than the main loop.
-
-    Ported from process-lifecycle-guard.py, and re-verified fire-side on PostToolUse (CC 2.1.220):
-    both fields present on leaf fires, absent on main-loop fires. Deliberately the OR, not the AND
-    -- agent_type only is a main-thread agent persona, agent_id only is a forked query, and neither
-    is a context the user is watching.
-
-    Fails toward False. That is the wrong direction for arming, which is exactly why callers must
-    use caller_class() below rather than this predicate alone.
-    """
-    try:
-        return bool(
-            str(payload.get("agent_type") or "").strip()
-            or str(payload.get("agent_id") or "").strip()
-        )
-    except Exception:
-        return False
-
-
 def caller_class(payload, file_path, key):
     """'leaf' | 'ambiguous' | 'main' -- the degraded-mode guard around is_subagent().
 
@@ -190,10 +177,9 @@ def session_key(payload):
     measured-equivalent fallback; a payload field is never a trusted path component, hence the
     sanitize.
 
-    Deliberately NO `or "nosession"` fallback, unlike the siblings (process-lifecycle-guard's
-    valve, the origin ledger): those only need *a* filename and a shared one is harmless, while a
-    shared arm-state file would leak one session's armed flag into another's. Here an empty key
-    is a hard stop -- main() refuses to record or inject without one.
+    Deliberately NO `or "nosession"` fallback, unlike the origin ledger: it only needs *a*
+    filename and a shared one is harmless, while a shared arm-state file would leak one
+    session's armed flag into another's. Here an empty key is a hard stop -- main() refuses to record or inject without one.
     """
     key = ""
     try:
@@ -213,9 +199,8 @@ def state_path(key):
 
 
 def prune_state(d):
-    # Age-prune on dir touch (process-lifecycle-guard's valve precedent, longer cutoff: a session
-    # ledger is measurement data, not a permission marker). Best-effort -- an unremovable file
-    # must never break the read/write below.
+    # Age-prune on dir touch. Best-effort -- an unremovable file must never break the read/write
+    # below.
     cutoff = time.time() - PRUNE_AFTER_SECONDS
     try:
         names = os.listdir(d)
@@ -289,9 +274,8 @@ def save_state(key, state, prune=True):
 # The trailing sentence is the hooks/CLAUDE.md mis-fire rule: a false arm must cost one ignorable
 # line, never an argument.
 INJECTION = (
-    "frontend touched — load the visual workflow skill now (ballast:visual-verification-gate), "
-    "before building rather than at done-time: it owns the session origin, the see-and-fix "
-    "loop, and the done gate. Not doing frontend work, or matched by accident? Ignore this."
+    "frontend touched — load the visual workflow skill now (ballast:visual-probe): it owns the "
+    "session origin and the done gate. Not doing frontend work, or matched by accident? Ignore this."
 )
 
 

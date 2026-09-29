@@ -2,8 +2,9 @@
 """Collect diff-review leaf verdicts from the leaves' own sidecar transcripts.
 
 Polls <home>/projects/*/<session>/subagents/agent-<id>.jsonl (+ .meta.json) until
-each leaf's last record shows it finished, prints that leaf's final text under a
-header, then names whatever is still pending. Read-only; never writes; exit 0 always.
+each leaf's last record shows it finished, prints that leaf's report (its
+SubagentHandback message if it made one, else its final text) under a header, then
+names whatever is still pending. Read-only; never writes; exit 0 always.
 """
 import argparse
 import glob
@@ -50,6 +51,42 @@ def last_assistant_record(path):
     return None
 
 
+def handback_block(block):
+    # input.message of a SubagentHandback tool_use block, else None.
+    if (isinstance(block, dict) and block.get("type") == "tool_use"
+            and block.get("name") == "SubagentHandback"):
+        msg = (block.get("input") or {}).get("message")
+        return msg if isinstance(msg, str) and msg.strip() else None
+    return None
+
+
+def handback_message(path):
+    # A leaf in auto mode reports through a SubagentHandback tool call, and its
+    # trailing text is only a recap/LEAF-DONE — so the latest hand-back is the report.
+    # Whole-file read, once per finished leaf: a long report can predate the tail
+    # window. Fails open (None -> the caller keeps the trailing text).
+    try:
+        with open(path, "rb") as fh:
+            lines = fh.read().decode("utf-8", "replace").split("\n")
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if "SubagentHandback" not in line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("type") != "assistant":
+            continue
+        content = (rec.get("message") or {}).get("content") or []
+        for b in reversed(content if isinstance(content, list) else []):
+            msg = handback_block(b)
+            if msg is not None:
+                return msg
+    return None
+
+
 def leaf_done(rec):
     # (final_text, is_error) for a finished assistant turn, else None.
     if not isinstance(rec, dict) or rec.get("type") != "assistant":
@@ -60,6 +97,9 @@ def leaf_done(rec):
         return next((b.get("text") or "" for b in reversed(content)
                      if isinstance(b, dict) and b.get("type") == "text"), ""), True
     last = content[-1] if content else None
+    hb = handback_block(last)
+    if hb is not None:                  # the hand-back itself delivers the report
+        return hb, False
     if not isinstance(last, dict) or last.get("type") != "text":
         return None
     text = last.get("text") or ""
@@ -109,6 +149,7 @@ def main(argv=None):
             if result is None:
                 continue
             text, is_error = result
+            text = handback_message(path) or text
             done.add(leaf_id)
             print("%s\n\n%s\n" % (header(path, leaf_id, is_error), text))
             sys.stdout.flush()

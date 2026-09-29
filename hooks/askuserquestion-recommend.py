@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Global PreToolUse hook on the AskUserQuestion tool (matcher "AskUserQuestion" in settings.json).
+# Global PreToolUse hook on the AskUserQuestion tool (matcher "AskUserQuestion" in hooks.json).
 #
 # HARD enforcement (exit 2) of the standing rule: every AskUserQuestion must LEAD with the recommended
 # option AND mark it "(Recommended)" in the option LABEL the user reads -- not only in prose / the

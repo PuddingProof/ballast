@@ -4,7 +4,7 @@
 # This file lives in plugins/ballast/bin/, which Claude Code puts on PATH
 # for any Bash tool call while the ballast plugin is enabled. That makes
 # "ballast-extract" a bare, machine-independent literal — both the
-# session-postmortem SKILL.md docs and the ballast-allow.py self-allow hook
+# session-postmortem SKILL.md docs and the hooks/ballast_allow.py self-allow hook
 # key off this exact name, so it must never be invoked through a wrapper,
 # alias, or path prefix (see SKILL.md's Common-mistakes entry).
 #

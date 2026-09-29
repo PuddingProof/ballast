@@ -2,7 +2,7 @@
 name: diff-finder
 description: Read-only finder leaf for the diff-review skill — runs one review angle over one diff and returns candidates; not for direct user invocation.
 tools: Read, Glob, Grep, Bash
-model: inherit
+model: opus
 effort: medium
 color: cyan
 ---

@@ -1,34 +1,29 @@
 #!/usr/bin/env python
-"""Regression tests for inline-churn-nudge.py -- the PostToolUse context-economy hook that logs
-how long runs of in-line Edit/Write/MultiEdit/NotebookEdit tool calls get between subagent
-(Task/Agent) dispatches, and nudges once per session when a MAIN-session run crosses 20 untainted.
+"""Regression tests for inline-churn-nudge.py -- the PostToolUse context-economy hook that counts
+runs of in-line Edit/Write/MultiEdit/NotebookEdit tool calls between subagent (Task/Agent)
+dispatches, and nudges once per session when a MAIN-session run crosses 20 untainted.
 
 The hook filename is hyphenated (not importable via a normal statement), so each case invokes
 it as a subprocess with the current interpreter, feeds a hook JSON payload on stdin, and asserts
-on returncode + stdout/stderr -- matching test_doc_write_guard.py's convention.
+on returncode + stdout/stderr.
 
 HERMETIC (hooks/CLAUDE.md rule): the hook's state_home() honors BALLAST_CLAUDE_HOME as a
 hermetic-test override. Every test here runs the subprocess with BALLAST_CLAUDE_HOME pointed at
-a fresh per-test tmp dir, so per-session counters and shadow.log never touch the real ~/.claude.
+a fresh per-test tmp dir, so per-session counters never touch the real ~/.claude.
 
 Decision logic under test (derived from the hook's own code, not from its header prose):
   - EDIT-CLASS (Edit/Write/MultiEdit/NotebookEdit) increments a per-session state file at
     <state-home>/.cache/ballast-churn/<session_id>, persisted across calls. The file holds
     "<count> <tainted> <nudged>"; a LEGACY bare-integer file must parse as the count with both
     flags false, and unparseable content must read as a fresh run.
-  - Every exact multiple-of-5 crossing appends one line to shadow.log carrying the correct
-    run=<count>. These log formats are the accumulated dataset's schema -- pinned byte-shape here.
-  - DISPATCH-CLASS (Task/Agent) resets the counter to 0 unconditionally; it additionally
-    appends a "reset run=<count> via=<tool_name>" line to shadow.log, but ONLY when the run
-    being reset was >= 3 (a shorter run resets silently). A reset also clears `tainted`, but
-    never `nudged` (once per session, not once per run).
+  - DISPATCH-CLASS (Task/Agent) resets the counter to 0 unconditionally. A reset also clears
+    `tainted`, but never `nudged` (once per session, not once per run).
   - Different session_ids track fully independent counters.
   - The ONE emitting path is the nudge: a MAIN-class edit taking the count to >= 20, on a run no
     leaf/ambiguous edit has tainted, once per session. Everything else is byte-silent (stdout AND
     stderr empty, exit 0) -- including every fail-open path (malformed JSON, empty stdin, a
     non-dict JSON payload, a missing tool_name, an unrecognized tool_name) and EVERY leaf fire.
-  - prune() reaps counter files untouched for 2+ days, but explicitly never reaps shadow.log
-    itself (the accumulating dataset).
+  - prune() reaps counter files untouched for 2+ days.
 
 Self-locating + standalone: `python hooks/tests/test_inline_churn_nudge.py`.
 """
@@ -89,8 +84,8 @@ def dispatch_payload(session_id="s1", tool_name="Task"):
 
 
 class HermeticTestCase(unittest.TestCase):
-    """Base class: every test gets its own BALLAST_CLAUDE_HOME tmp dir so counters and
-    shadow.log can never leak across tests or touch the real ~/.claude."""
+    """Base class: every test gets its own BALLAST_CLAUDE_HOME tmp dir so counters can never
+    leak across tests or touch the real ~/.claude."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="churn-test-")
@@ -121,13 +116,6 @@ class HermeticTestCase(unittest.TestCase):
         with open(self.counter_path(session_id), "w", encoding="utf-8") as f:
             f.write(text)
 
-    def shadow_log_lines(self):
-        path = os.path.join(self.cache_dir(), "shadow.log")
-        if not os.path.exists(path):
-            return []
-        with open(path, "r", encoding="utf-8") as f:
-            return [ln for ln in f.read().splitlines() if ln]
-
     def _assert_silent_zero(self, proc):
         self.assertEqual(proc.returncode, 0, "expected exit 0, got %s stderr=%r" % (proc.returncode, proc.stderr))
         self.assertEqual(proc.stdout, "", "expected empty stdout, got %r" % proc.stdout)
@@ -145,13 +133,6 @@ class OutputAlwaysSilent(HermeticTestCase):
 
     def test_dispatch_class_silent(self):
         self._assert_silent_zero(run_payload(dispatch_payload(), self.env))
-
-    def test_fifth_edit_crossing_still_silent(self):
-        for _ in range(5):
-            p = run_payload(edit_payload(session_id="silent5"), self.env)
-            self._assert_silent_zero(p)
-        # A shadow.log line was written, but the HOOK PROCESS itself never emits anything.
-        self.assertEqual(len(self.shadow_log_lines()), 1)
 
     def test_reset_with_long_run_still_silent(self):
         for _ in range(3):
@@ -190,81 +171,25 @@ class EditClassCounting(HermeticTestCase):
 
 
 # =================================================================================================
-# Multiple-of-5 crossings append a correctly-valued shadow.log line.
-# =================================================================================================
-
-class MultipleOfFiveLogging(HermeticTestCase):
-    def test_no_log_line_before_fifth_edit(self):
-        for _ in range(4):
-            run_payload(edit_payload(session_id="pre5"), self.env)
-        self.assertEqual(self.shadow_log_lines(), [])
-
-    def test_fifth_edit_logs_run_5(self):
-        for _ in range(5):
-            run_payload(edit_payload(session_id="hit5"), self.env)
-        lines = self.shadow_log_lines()
-        self.assertEqual(len(lines), 1)
-        self.assertIn("run=5", lines[0])
-        self.assertIn("sid=hit5", lines[0])  # "hit5" is under 8 chars so the full id appears verbatim
-        self.assertNotIn("reset", lines[0])
-
-    def test_tenth_edit_appends_second_line_with_run_10(self):
-        for _ in range(10):
-            run_payload(edit_payload(session_id="hit10"), self.env)
-        lines = self.shadow_log_lines()
-        self.assertEqual(len(lines), 2)
-        self.assertIn("run=5", lines[0])
-        self.assertIn("run=10", lines[1])
-
-    def test_session_id_truncated_to_first_eight_chars(self):
-        long_sid = "abcdefghijklmnop"
-        for _ in range(5):
-            run_payload(edit_payload(session_id=long_sid), self.env)
-        lines = self.shadow_log_lines()
-        self.assertEqual(len(lines), 1)
-        self.assertIn("sid=abcdefgh", lines[0])
-        self.assertNotIn("sid=abcdefghi", lines[0])
-
-    def test_log_line_carries_proj_field(self):
-        for _ in range(5):
-            run_payload(edit_payload(session_id="proj-chk"), self.env)  # exactly 8 chars, no truncation surprises
-        lines = self.shadow_log_lines()
-        self.assertRegex(lines[0], r"^\S+ proj=\S+ sid=proj-chk run=5$")
-
-
-# =================================================================================================
-# DISPATCH-CLASS reset behavior: always resets to 0; logs a "reset" line only when run >= 3.
+# DISPATCH-CLASS reset behavior: always resets to 0.
 # =================================================================================================
 
 class DispatchClassReset(HermeticTestCase):
-    def test_dispatch_with_run_ge_3_logs_reset_line(self):
+    def test_task_dispatch_resets_the_run(self):
         for _ in range(3):
             run_payload(edit_payload(session_id="reset3"), self.env)
         run_payload(dispatch_payload(session_id="reset3", tool_name="Task"), self.env)
-        lines = self.shadow_log_lines()
-        self.assertEqual(len(lines), 1)
-        self.assertIn("reset run=3 via=Task", lines[0])
         self.assertEqual(self.read_counter("reset3"), 0)
 
-    def test_dispatch_with_run_below_3_resets_silently(self):
-        for _ in range(2):
-            run_payload(edit_payload(session_id="reset2"), self.env)
-        run_payload(dispatch_payload(session_id="reset2", tool_name="Agent"), self.env)
-        self.assertEqual(self.shadow_log_lines(), [])  # no reset line -- run was too short
-        self.assertEqual(self.read_counter("reset2"), 0)  # but still reset
-
-    def test_dispatch_with_zero_run_resets_silently(self):
+    def test_dispatch_with_zero_run_resets(self):
         run_payload(dispatch_payload(session_id="reset0", tool_name="Task"), self.env)
-        self.assertEqual(self.shadow_log_lines(), [])
         self.assertEqual(self.read_counter("reset0"), 0)
 
     def test_agent_tool_name_treated_same_as_task(self):
         for _ in range(4):
             run_payload(edit_payload(session_id="agentreset"), self.env)
         run_payload(dispatch_payload(session_id="agentreset", tool_name="Agent"), self.env)
-        lines = self.shadow_log_lines()
-        self.assertEqual(len(lines), 1)
-        self.assertIn("via=Agent", lines[0])
+        self.assertEqual(self.read_counter("agentreset"), 0)
 
     def test_run_continues_after_a_short_reset(self):
         # Reset below 3, then edit again -- the new run starts fresh from 1, not carried over.
@@ -306,10 +231,9 @@ class StateFileFormat(HermeticTestCase):
 # =================================================================================================
 
 NUDGE_TEXT = (
-    "INLINE-EDIT RUN: 20+ consecutive in-line edits this session without a dispatch. If this is "
-    "implementation churn, it is executor-shaped — batch the remaining work to a plan-executor "
-    "leaf (see the plan-handoff skill); the write/edit churn belongs in a disposable context, not "
-    "the main window. A deliberate mechanical sweep or a tiny-diff series? Carry on."
+    "INLINE-EDIT RUN: 20+ in-line edits this session without a dispatch. If this is "
+    "implementation churn, hand the rest to a leaf agent (see the plan-handoff skill). A "
+    "deliberate mechanical sweep or a run of tiny diffs? Carry on."
 )
 
 
@@ -340,7 +264,7 @@ class ThresholdNudge(HermeticTestCase):
 
     def test_nudge_fires_only_once_per_session(self):
         self.edits(20, "once")           # nudged here
-        for _ in range(20):              # 21..40, incl. the 25/30/35/40 log crossings
+        for _ in range(20):              # 21..40
             self._assert_silent_zero(self.edits(1, "once"))
 
     def test_a_leaf_edit_taints_the_run_and_suppresses_the_nudge(self):
@@ -381,15 +305,6 @@ class ThresholdNudge(HermeticTestCase):
         self.write_raw_state("legacy20", "19")
         self.assert_nudged(self.edits(1, "legacy20"))
 
-    def test_shadow_log_format_unchanged_across_the_nudge(self):
-        # The dataset's schema must not drift: the crossing lines stay `run=` shaped even on the
-        # very fire that emits the nudge.
-        self.edits(20, "logfmt")
-        lines = self.shadow_log_lines()
-        self.assertEqual(len(lines), 4)  # 5, 10, 15, 20
-        self.assertRegex(lines[-1], r"^\S+ proj=\S+ sid=logfmt run=20$")
-
-
 # =================================================================================================
 # Fail-open paths -- must NEVER block/crash, and must NEVER emit anything, on any malformed or
 # unrecognized input.
@@ -404,7 +319,7 @@ class FailOpenPaths(HermeticTestCase):
 
     def test_list_json_payload_fails_open_silently(self):
         # Valid JSON that isn't an object -- the isinstance guard must prevent an AttributeError
-        # (the exact bug class fixed twice elsewhere in this repo today).
+        # (a bug class this repo's hooks have hit before).
         self._assert_silent_zero(run_hook("[]", self.env))
 
     def test_missing_tool_name_fails_open_silently(self):
@@ -423,8 +338,7 @@ class FailOpenPaths(HermeticTestCase):
 
 
 # =================================================================================================
-# prune(): counter files untouched for 2+ days are reaped on the next touch, but shadow.log is
-# NEVER reaped even if it is equally stale (it is the accumulating dataset).
+# prune(): counter files untouched for 2+ days are reaped on the next touch.
 # =================================================================================================
 
 class PruneOldFiles(HermeticTestCase):
@@ -450,20 +364,12 @@ class PruneOldFiles(HermeticTestCase):
         run_payload(edit_payload(session_id="other-session"), self.env)
         self.assertTrue(os.path.exists(fresh_path), "a file touched moments ago must not be pruned")
 
-    def test_stale_shadow_log_is_never_pruned(self):
-        # Build up a real shadow.log entry, then age the FILE itself (not its content) past the
-        # 2-day cutoff, and confirm a later touch does not delete it.
-        for _ in range(5):
-            run_payload(edit_payload(session_id="logbuilder"), self.env)
-        log_path = os.path.join(self.cache_dir(), "shadow.log")
-        self.assertTrue(os.path.exists(log_path))
-        stale_time = time.time() - 3 * 86400
-        os.utime(log_path, (stale_time, stale_time))
-        run_payload(edit_payload(session_id="another-touch"), self.env)
-        self.assertTrue(os.path.exists(log_path), "shadow.log must survive prune regardless of its own mtime")
-        # Its prior content must also still be there -- prune must not truncate it either.
-        with open(log_path, "r", encoding="utf-8") as f:
-            self.assertIn("run=5", f.read())
+    def test_retired_shadow_log_is_never_pruned(self):
+        # The retired shadow-log dataset is user-recycled, never agent-deleted, however old.
+        shadow_path = self.counter_path("shadow.log")
+        self._make_stale(shadow_path, days=30)
+        run_payload(edit_payload(session_id="fresh-session"), self.env)
+        self.assertTrue(os.path.exists(shadow_path), "prune must leave the retired shadow.log alone")
 
 
 if __name__ == "__main__":

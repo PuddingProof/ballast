@@ -38,7 +38,7 @@ CONTRACTS THIS FILE IS BOUND BY:
     harness-sweep-nudge hook included — honors this env var, and the test suite depends on
     it to keep real watermarks/ledgers untouched.
   - SWEEP-STATE bytes: `<name> · <dir> · last=<basename|NONE>`, separator the literal 3
-    bytes space + U+00B7 + space. hooks/harness-sweep-nudge.sh parses it with bash
+    bytes space + U+00B7 + space. .claude/hooks/harness-sweep-nudge.sh parses it with bash
     parameter expansion on that literal, so `advance` preserves it exactly, emits LF
     endings with a final newline, and copies every non-registry line through byte-for-byte.
   - INCLUSIVE watermark rule: a report is new when its 10-char date prefix is >= the
@@ -124,7 +124,7 @@ CITATION_HUB_THRESHOLD = 6
 # ---------------------------------------------------------------------------
 
 def home_root():
-    # Same name, same idiom as doc-write-guard.py / ballast-allow.py: BALLAST_CLAUDE_HOME is the
+    # Same name, same idiom as hooks/run.sh: BALLAST_CLAUDE_HOME is the
     # hermetic-test override (production never sets it), else the real ~/.claude. Kept in sync
     # deliberately rather than shared, since each of these ships standalone.
     home = os.environ.get('BALLAST_CLAUDE_HOME')
@@ -1058,7 +1058,9 @@ def cmd_digest(args):
     drift_active = []
     if ledgers['DRIFT-SIGHTINGS.md']:
         for ln in ledgers['DRIFT-SIGHTINGS.md'].split('\n'):
-            if re.match(r'^\d{4}-\d{2}-\d{2}' + re.escape(SEP), ln) and 'registered' not in ln:
+            # Same contract as the nudge hook: a date-led line (plain ` · ` or `(first MM-DD)` form)
+            # is live until tagged `[registered]` — a bare substring would match "unregistered".
+            if re.match(r'^\d{4}-\d{2}-\d{2} ', ln) and '[registered]' not in ln:
                 drift_active.append(ln.strip())
 
     sid8_index = build_sid8_index(entries, listings)

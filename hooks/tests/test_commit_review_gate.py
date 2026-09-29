@@ -686,7 +686,7 @@ class O1SidecarAndEchoChannels(GateTestCase):
 
     def test_user_command_echo_code_review_allow(self):
         """O1 channel c: a user-typed `/code-review` lands as a `<command-name>` echo in a user
-        message (NOT a Skill event, since native /code-review is user-invoke-only now). Its
+        message (NOT a Skill event, since native /code-review was user-invoke-only at the time). Its
         normalized name ('code-review') is in the accepted code set, so it credits the pass. The
         echo's own user turn is AT the review ts (not strictly after), so condition (c) is fine."""
         edit_path = write_and_stage(self.repo, "app.py", _REAL_CODE)

@@ -5,11 +5,12 @@ description: >-
   `--light` (cheap and fast), `--medium` (default), or `--hard` (thorough) depth. Reviews your
   uncommitted changes unless you pass a commit range, branch, PR, or file.
 when_to_use: >-
-  Before a commit, or when handed a range/branch/PR to review. Not a whole-codebase audit
-  (adversarial-audit) or the seam check (integration-gate).
+  Before a commit, or when handed a range/branch/PR to review. Re-checking fixes from an earlier
+  review? `--light` on the fix diff — never re-run `--medium`/`--hard` over the whole change.
+  Not a whole-codebase audit (adversarial-audit).
 argument-hint: "[--light|--medium|--hard] [<target>]"
-allowed-tools: Read, Glob, Grep, Bash, Task, Agent
-disallowed-tools: Edit, Write, NotebookEdit, PowerShell, Skill, ReportFindings, ToolSearch, SendMessage, Monitor, TaskOutput, TaskStop, EnterWorktree, ExitWorktree, WebFetch, WebSearch
+allowed-tools: Read, Glob, Grep, Bash, Agent
+disallowed-tools: Edit, Write, PowerShell, Skill, EnterWorktree, ExitWorktree, WebFetch, WebSearch
 context: fork
 background: true
 disable-model-invocation: false

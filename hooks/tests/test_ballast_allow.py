@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Regression tests for ballast-allow.py -- the self-scoped PreToolUse permission-allow hook.
+"""Regression tests for ballast_allow.py -- the self-scoped permission-allow guard -- run through
+the shell-guards.py dispatcher.
 
-This hook auto-approves exactly four command shapes (a bare, unmodified `ballast-extract`,
-`ballast-mode`, `ballast-review`, or `ballast-sweep`) and MUST defer everything else to the normal
-permission prompt. A regression here is a standing auto-approval hole on every Bash call, so the
-bypass vectors below are pinned as tests.
+The guard auto-approves exactly three command shapes (a bare, unmodified `ballast-extract`,
+`ballast-mode`, or `ballast-sweep`) and MUST defer everything else to the normal permission
+prompt. A regression here is a standing auto-approval hole on every Bash call, so the bypass
+vectors below are pinned as tests.
 
-OPT-IN GATE (governance review item): the hook now emits NOTHING for ANY input unless
+OPT-IN GATE: the guard decides NOTHING for ANY input unless
 `<home_root>/ballast/allow-standing-grants` exists. HERMETIC (hooks/CLAUDE.md rule): every test
 runs with BALLAST_CLAUDE_HOME pointed at a fresh per-test tmp dir, so the marker file never
-touches the real ~/.claude. `AllowLegitInvocations` cases create the marker (today's behavior,
-opted in); the new `OptInGate` class covers the no-marker / marker-error deferrals.
+touches the real ~/.claude. `AllowLegitInvocations` cases create the marker (opted in); the
+`OptInGate` class covers the no-marker / marker-error deferrals.
 
-Runs with the plain stdlib unittest (no pytest dependency) so dev/check.sh can invoke it with the
-same resolved interpreter it uses for the extractor suite. Self-locating: finds ballast-allow.py one
-directory up (hooks/), so there are no absolute paths and it runs wherever the plugin is checked out.
+Stdlib unittest only (no pytest dependency). Self-locating: finds shell-guards.py one directory up
+(hooks/), so it runs wherever the plugin is checked out.
 """
 import json
 import os
@@ -24,7 +24,7 @@ import sys
 import tempfile
 import unittest
 
-HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ballast-allow.py")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "shell-guards.py")
 
 
 def run(payload, env):
@@ -102,13 +102,6 @@ class AllowLegitInvocations(HermeticTestCase):
         allowed, rc, err = self.run_hermetic(bash("ballast-mode raise autopilot --session abc123def456 --pending"))
         self.assertEqual(allowed, True)
 
-    def test_review_bare(self):
-        self.assertEqual(self.run_hermetic(bash("ballast-review"))[0], True)
-
-    def test_review_with_args(self):
-        allowed, rc, err = self.run_hermetic(bash("ballast-review high abc123..HEAD two-phase shutdown fix"))
-        self.assertEqual(allowed, True)
-
     def test_sweep_bare(self):
         self.assertEqual(self.run_hermetic(bash("ballast-sweep"))[0], True)
 
@@ -130,11 +123,6 @@ class OptInGate(HermeticTestCase):
 
     def test_no_marker_mode_defers_silently(self):
         allowed, rc, err = self.run_hermetic(bash("ballast-mode confirm freehand --session abc123def456"))
-        self.assertFalse(allowed)
-        self.assertEqual(rc, 0)
-
-    def test_no_marker_review_defers_silently(self):
-        allowed, rc, err = self.run_hermetic(bash("ballast-review"))
         self.assertFalse(allowed)
         self.assertEqual(rc, 0)
 
@@ -240,30 +228,14 @@ class RejectSmuggledSecondCommand(HermeticTestCase):
     def test_statusline_bare_not_allowed(self):
         self._assert_deferred("ballast-statusline")
 
+    def test_retired_review_shim_not_allowed(self):
+        # The ballast-review grant is retired with its shim; the name must not auto-allow.
+        self._assert_deferred("ballast-review high abc123..HEAD")
+
     def test_chaining_two_allowed_names_still_chained(self):
         # Each name alone would auto-allow; chaining them together must not, since the ENTIRE
         # command string is what re.fullmatch must consume, and `;` is excluded from that class.
         self._assert_deferred("ballast-extract; ballast-mode clear exec --session abc123def456")
-
-    def test_review_name_prefix_confusion(self):
-        # `ballast-reviewer` merely STARTS WITH `ballast-review` -- the trailing `er` must leave
-        # unconsumed input under fullmatch, same prefix-hazard rule as ballast-modes.
-        self._assert_deferred("ballast-reviewer high abc123..HEAD")
-
-    def test_review_embedded_newline(self):
-        self._assert_deferred("ballast-review high\nrm -rf ~")
-
-    def test_review_semicolon(self):
-        self._assert_deferred("ballast-review high; rm -rf /")
-
-    def test_review_pipe(self):
-        self._assert_deferred("ballast-review high | cat")
-
-    def test_review_backtick_in_args(self):
-        self._assert_deferred("ballast-review high `whoami`")
-
-    def test_review_path_qualified(self):
-        self._assert_deferred("./bin/ballast-review high")
 
     def test_sweep_name_prefix_confusion(self):
         # `ballast-sweeper` merely STARTS WITH `ballast-sweep` -- same prefix-hazard rule.
@@ -283,9 +255,9 @@ class RejectSmuggledSecondCommand(HermeticTestCase):
 
 
 class FailOpenNeverCrashes(HermeticTestCase):
-    """The docstring promises: on ANY error/odd shape, exit 0, emit nothing, no traceback.
-    Opted IN (marker present) so these exercise the payload-shape handling inside _decide, not
-    just the opt-in gate short-circuiting before payload parsing is ever reached."""
+    """On ANY error/odd shape: exit 0, no allow, no traceback (a malformed payload is announced by
+    the dispatcher). Opted IN (marker present) so these exercise the payload-shape handling inside
+    decide(), not just the opt-in gate short-circuiting before the payload is ever read."""
 
     def setUp(self):
         super().setUp()
@@ -317,13 +289,6 @@ class FailOpenNeverCrashes(HermeticTestCase):
         self._assert_silent_defer({
             "tool_name": "PowerShell",
             "tool_input": {"command": "ballast-mode confirm freehand --session abc123def456"},
-        })
-
-    def test_powershell_review_deferred(self):
-        # Bash-only gating must hold for ballast-review too, not just ballast-extract/-mode.
-        self._assert_silent_defer({
-            "tool_name": "PowerShell",
-            "tool_input": {"command": "ballast-review high abc123..HEAD"},
         })
 
     def test_non_dict_payload(self):

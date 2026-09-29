@@ -16,14 +16,7 @@ cell — measured per-cell runs spent most of their time re-booting.
 
 ## Plan the matrix before you shoot
 
-A green matrix is only as strong as its worst-covered cell, and the defects that ship are the ones
-no cell ever forced. So shoot the composed worst corner — every overlay OPEN × non-default theme ×
-worst/empty/error content × the viewport extremes, composed *simultaneously*, because a bug needing
-three stressors at once never shows when you vary one axis at a time.
-
-Both the derivation rule and the mandatory native-resolution cell (`viewport.native`, which no
-nearby size substitutes for) live in `state-contract.md`; the mechanical path to those states is
-the `states` mode body.
+Compose the worst corner (overlay open × non-default theme × worst content × viewport extremes) — derivation rule and the mandatory native cell live in `state-contract.md`.
 
 ## `--cdp` attach trades enumeration for the real compositor
 

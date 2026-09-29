@@ -57,6 +57,15 @@ export async function main(argv, timing = {}) {
     return Math.round(n);
   })();
 
+  // --ready SEL: the selector the fused verbs wait to see before every cell's shutter, so no cell
+  // fires before an app that renders after `load` is ready. Validated like --settle: a bare flag
+  // parses as `true`, and waiting on the selector "true" would time every cell out.
+  const READY = (() => {
+    if (opts.ready === undefined) return null;
+    if (opts.ready === true || !String(opts.ready).trim()) throw new Error('--ready expects a CSS selector (got (no value))');
+    return String(opts.ready);
+  })();
+
   const log = (...a) => console.error('[visual-probe]', ...a); // stderr; stdout reserved for the manifest path
 
   // Rung-0 geometry assertions run on by default (they are ~free and SHADOW-LOGGED — see
@@ -260,7 +269,7 @@ export async function main(argv, timing = {}) {
   // their own pipeline (lib/fused.mjs) but must not re-derive the flag semantics that every other
   // verb already agreed on (settle validation, out-dir resolution, the Edge launch options).
   const ctx = {
-    opts, positional, OUT, EDGE, MAGNIFY, TIMEOUT, THRESHOLD, SETTLE, RUNG0_ON,
+    opts, positional, OUT, EDGE, MAGNIFY, TIMEOUT, THRESHOLD, SETTLE, READY, RUNG0_ON,
     flagSuppressions, log, timing, resolveTarget,
   };
 

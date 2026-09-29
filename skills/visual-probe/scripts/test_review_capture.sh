@@ -70,7 +70,7 @@ cat > "$tmp/quiet.html" <<'EOF'
   body { font: 14px/1.5 system-ui, sans-serif; color: #1a1a1a; }
   .band { height: 300px; border-bottom: 1px solid #d8dee6; padding: 12px; }
 </style></head><body>
-  <div class="band">one</div><div class="band">two</div><div class="band">three</div><div class="band" id="target">four</div>
+  <div class="band" id="ready">one</div><div class="band">two</div><div class="band">three</div><div class="band" id="target">four</div>
 </body></html>
 EOF
 

@@ -4,14 +4,17 @@ Standalone + self-locating — both of these must pass:
     python skills/session-postmortem/scripts/test_extract.py
     (cd skills/session-postmortem/scripts && python test_extract.py)
 
-Coverage: the drift-canary census tripwire (the extend-never-delete pin), the compat surface a live
-hook imports (`load_lines` / `_user_prompt` / `_CMD_NAME_RE`), the six user-turn kinds, and the
+Coverage: the drift-canary census tripwire (the extend-never-delete pin), the v4 user-turn gate
+(`load_lines` / `_user_prompt` / `_CMD_NAME_RE`), the six user-turn kinds, and the
 digest's contracts (sections, manifest, budget ceiling, bounded-write refusal, usage dedup,
 fail-open sections, transcript resolution).
 """
+import datetime
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -108,7 +111,9 @@ class DriftCanaryTest(unittest.TestCase):
         for t in ['user', 'assistant', 'attachment', 'last-prompt', 'ai-title',
                   'file-history-snapshot', 'permission-mode', 'queue-operation', 'mode', 'started',
                   'result', 'system', 'agent-name', 'bridge-session', 'worktree-state',
-                  'custom-title', 'summary', 'pr-link', 'file-history-delta']:
+                  'custom-title', 'summary', 'pr-link', 'file-history-delta',
+                  # sighted live 2026-08-05 → 2026-09-23, registered 2026-09-23
+                  'atis-latch', 'cost-state', 'relocated']:
             self.assertIn(t, extract.KNOWN_LINE_TYPES, f'censused line type {t} must be known')
         for s in ['turn_duration', 'away_summary', 'local_command', 'api_error', 'compact_boundary',
                   'bridge_status', 'stop_hook_summary', 'model_refusal_fallback', 'informational',
@@ -125,7 +130,13 @@ class DriftCanaryTest(unittest.TestCase):
                   'plan_file_reference', 'hook_non_blocking_error', 'hook_system_message',
                   'task_status', 'mcp_instructions_delta',
                   # sighted live 2026-07-30 (v5 bench run, rain-proof transcript): Read token-cap banner
-                  'read_truncation_notice']:
+                  'read_truncation_notice',
+                  # 2026-09-23 census (575 transcripts): injected nudges, context snapshots, telemetry
+                  'batching_reminder_sent', 'bash_output_audience_note', 'silent_turn_reminder',
+                  'prompt_snapshot', 'date', 'model', 'environment', 'instructions',
+                  'session_context', 'deferred_tools_record', 'credential_org',
+                  'remote_session_change', 'thinking_drop', 'inlined_image_paths',
+                  'structured_output']:
             self.assertIn(a, extract.KNOWN_ATTACHMENT_TYPES, f'censused attachment type {a} must be known')
         # `mcp_instructions_delta` history: characterized PHANTOM 2026-07-07 (zero structural
         # occurrences then; an assertNotIn pinned the decision) → REAL 2026-07-21 (×3 structural
@@ -135,10 +146,11 @@ class DriftCanaryTest(unittest.TestCase):
             self.assertIn(m, extract.KNOWN_COMMAND_MODES)
         for p in ['sdk', 'typed', 'system', 'queued']:
             self.assertIn(p, extract.KNOWN_PROMPT_SOURCES)
-        for o in ['task-notification', 'auto-continuation', 'human']:
+        for o in ['task-notification', 'auto-continuation', 'human', 'peer', 'coordinator']:
             self.assertIn(o, extract.KNOWN_ORIGIN_KINDS)
         for c in ['ide_opened_file', 'command-name', 'ide_selection', 'command-message', 'bash-input',
-                  'bash-stdout', 'system-reminder', 'local-command-stdout', 'local-command-caveat']:
+                  'bash-stdout', 'system-reminder', 'local-command-stdout', 'local-command-caveat',
+                  'pasted_content']:
             self.assertIn(c, extract.KNOWN_USER_CONTENT_TAGS, f'censused content tag {c} must be known')
         for f in ['isSidechain', 'isMeta', 'isCompactSummary', 'isVisibleInTranscriptOnly']:
             self.assertIn(f, extract.KNOWN_USER_FLAGS)
@@ -168,6 +180,12 @@ class DriftCanaryTest(unittest.TestCase):
                                                                'commandMode': 'prompt',
                                                                'origin': {'kind': 'auto-resumption'}}}])
         self.assertEqual(d.get(('origin_kind', 'auto-resumption')), 1)
+        # Every origin the human-origin gate drops must surface — including malformed shapes.
+        for origin, value in (('garbage', '<non-dict>'), ({'kind': 5}, '<non-str-kind>')):
+            self.assertEqual(self._drift([user_line('x', origin=origin)]).get(
+                ('origin_kind', value)), 1, value)
+        self.assertEqual(self._drift([user_line('x', origin={'kind': 'human'}),
+                                      user_line('y', origin=None)]), {})
         self.assertEqual(self._drift([user_line('<= 5 should pass')]), {},
                          'prose opening with < is not a tag')
 
@@ -185,7 +203,7 @@ class DriftCanaryTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 3. Compat surface — `hooks/commit-review-gate.py` imports these three by name
+# 3. User-turn gate — `load_lines`, `_user_prompt`, `_CMD_NAME_RE` (ported verbatim from v4)
 # ---------------------------------------------------------------------------
 
 class CompatSurfaceTest(unittest.TestCase):
@@ -213,11 +231,29 @@ class CompatSurfaceTest(unittest.TestCase):
             'compact summary': user_line('This session is being continued…', isCompactSummary=True),
             'tool_result': tool_result('output'),
             'task-notification': user_line('bg task done', origin={'kind': 'task-notification'}),
-            'sdk-cli probe': user_line('eval probe', entrypoint='sdk-cli'),
+            'novel machine origin': user_line('from elsewhere', origin={'kind': 'telepathy'}),
             'bash output echo': user_line('<bash-stdout>hi</bash-stdout>'),
         }
         for label, line in cases.items():
             self.assertIsNone(extract._user_prompt(line), f'{label} is not a user turn')
+
+    def test_sdk_cli_entrypoint_is_not_a_machine_signal(self):
+        # `claude remote-control` sessions log entrypoint "sdk-cli", like a headless `claude -p` run;
+        # gating on it dropped every turn of a phone-started session.
+        cases = {
+            'remote-control prompt': user_line('fix the tooltip', entrypoint='sdk-cli',
+                                               origin={'kind': 'human'}, turnOrigin='human',
+                                               promptSource='sdk'),
+            'origin-less slash echo': user_line('<command-name>/model</command-name>',
+                                                entrypoint='sdk-cli'),
+            'headless prompt': user_line('eval probe', entrypoint='sdk-cli', turnOrigin='sdk'),
+        }
+        for label, line in cases.items():
+            self.assertIsNotNone(extract._user_prompt(line), f'{label} is a user turn')
+        answer = user_line('', entrypoint='sdk-cli', toolUseResult={'answers': {'Q?': 'A'}},
+                           message={'role': 'user', 'content': [
+                               {'type': 'tool_result', 'tool_use_id': 'tu_a', 'content': 'ok'}]})
+        self.assertEqual(extract._user_turn(answer)[0], 'ask_answer')
 
     def test_cmd_name_re_group_one_is_the_command_name(self):
         m = extract._CMD_NAME_RE.search('<command-name>/code-review</command-name>')
@@ -226,7 +262,7 @@ class CompatSurfaceTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 4. User-turn kinds — the six-kind ladder layered on the ported gate
+# 4. User-turn kinds — the kind ladder layered on the ported gate
 # ---------------------------------------------------------------------------
 
 class UserTurnKindTest(unittest.TestCase):
@@ -247,15 +283,54 @@ class UserTurnKindTest(unittest.TestCase):
         raw = '<command-name>code-review</command-name><command-args>high</command-args>'
         self.assertEqual(extract._user_turn(user_line(raw)), ('slash_command', '/code-review high'))
 
+    def test_local_command_system_line_is_a_slash_turn(self):
+        sysline = lambda content, **kw: {'type': 'system', 'subtype': 'local_command',  # noqa: E731
+                                         'timestamp': TS % 3, 'content': content, **kw}
+        raw = '<command-name>/context</command-name>\n<command-message>context</command-message>'
+        self.assertEqual(extract._user_turn(sysline(raw)), ('slash_command', '/context'))
+        self.assertIsNone(extract._user_turn(sysline('<local-command-stdout>ok</local-command-stdout>')))
+        self.assertIsNone(extract._user_turn(sysline(raw, isMeta=True)))
+
     def test_queued_steer_via_attachment(self):
         att = {'type': 'attachment', 'timestamp': TS % 3,
                'attachment': {'type': 'queued_command', 'commandMode': 'prompt',
                               'prompt': 'no, do X instead'}}
         self.assertEqual(extract._user_turn(att), ('queued_steer', 'no, do X instead'))
 
+    def test_queued_steer_gate_admits_only_human_origin(self):
+        # A subagent hand-back / cross-session send / orchestrator steer arrives as a
+        # commandMode=="prompt" queued_command with a non-human origin — never the user speaking.
+        steer = lambda origin: {'type': 'attachment', 'timestamp': TS % 3,  # noqa: E731
+                                'attachment': {'type': 'queued_command', 'commandMode': 'prompt',
+                                               'prompt': 'body', 'origin': origin}}
+        for origin in (None, {'kind': 'human'}):
+            self.assertEqual(extract._user_turn(steer(origin)), ('queued_steer', 'body'), origin)
+        for kind in ('peer', 'coordinator', 'auto-continuation', 'telepathy'):
+            self.assertIsNone(extract._user_turn(steer({'kind': kind})), kind)
+        self.assertIsNone(extract._user_turn(steer('garbage')), 'non-dict origin fails closed')
+
     def test_queued_steer_via_prompt_source(self):
         kind, _ = extract._user_turn(user_line('type-ahead', promptSource='queued'))
         self.assertEqual(kind, 'queued_steer')
+
+    def test_rejection_note_keeps_only_the_typed_reason(self):
+        def rejected(said, tur="Error: The user doesn't want to proceed with this tool use."):
+            text = ("The user doesn't want to proceed with this tool use. The tool use was rejected. "
+                    "To tell you how to proceed, the user said:\n" + said +
+                    "\n\nNote: The user's next message may contain a correction or preference.")
+            line = tool_result(text, is_error=True)
+            line['toolUseResult'] = tur
+            return line
+        self.assertEqual(extract._user_turn(rejected('start the dev server first')),
+                         ('rejection_note', 'start the dev server first'))
+        clarify = rejected('The user wants to clarify these questions.\n    Questions asked: …')
+        self.assertIsNone(extract._user_turn(clarify), 'the chat-about-this template is not typed')
+        self.assertIsNone(extract._user_turn(rejected('x', tur={'type': 'text'})),
+                          'a dict toolUseResult quoting the phrase is a tool output')
+        failed = tool_result('Exit code 1\nTo tell you how to proceed, the user said:\nquoted',
+                             is_error=True)
+        failed['toolUseResult'] = 'Error: Exit code 1'
+        self.assertIsNone(extract._user_turn(failed), 'a failed command quoting the phrase')
 
     def test_ask_answer_renders_question_and_choice(self):
         line = user_line('', toolUseResult={
@@ -384,6 +459,18 @@ class DigestTest(unittest.TestCase):
                              'reported digest_bytes must equal the file on disk')
             self.assertEqual(m['git_window'], {'since': m['first_ts'], 'until': m['last_ts']})
 
+    def test_zero_user_turns_is_flagged_as_a_parser_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = [user_line('bg task done', origin={'kind': 'task-notification'}),
+                     assistant_line([{'type': 'text', 'text': 'noted'}], usage=usage())]
+            tpath = write_transcript(lines, os.path.join(tmp, 's.jsonl'))
+            out = os.path.join(tmp, 'out')
+            run_digest(out_dir=out, transcript=tpath)
+            self.assertIn('**No user turns captured** across 1 responses', read_digest(out)[0])
+            tpath = write_transcript(synthetic_session(), os.path.join(tmp, 's.jsonl'))
+            run_digest(out_dir=out, transcript=tpath)
+            self.assertNotIn('No user turns captured', read_digest(out)[0])
+
     def test_u_numbering_is_consistent_between_sections(self):
         with tempfile.TemporaryDirectory() as tmp:
             tpath = write_transcript(synthetic_session(), os.path.join(tmp, 's.jsonl'))
@@ -412,7 +499,6 @@ class DigestTest(unittest.TestCase):
             self.assertIn('plan-executor', text)                # agent dispatch
             self.assertIn('gmail', text)                        # MCP server table
             self.assertIn('doc-write-guard', text)              # hook fire
-            self.assertIn('1a2b3c4', text)                      # git commit sha
             self.assertIn('a.py', text)                         # files touched
             self.assertIn('--- COMPACT ---', text)
             self.assertIn('[interrupted]', text)
@@ -580,6 +666,8 @@ class UsageTest(unittest.TestCase):
     def test_pricing_families_and_the_unknown_model_null(self):
         self.assertEqual(extract._price_for('claude-opus-4-8[1m]')[:2], (5.0, 25.0))
         self.assertEqual(extract._price_for('claude-opus-4-1-20250805')[:2], (15.0, 75.0))
+        self.assertEqual(extract._price_for('claude-opus-5-5'), (4.0, 20.0, 5.0, 0.2))
+        self.assertEqual(extract._price_for('claude-opus-5')[:2], (5.0, 25.0))
         self.assertEqual(extract._price_for('claude-fable-5')[:2], (10.0, 50.0))
         self.assertEqual(extract._price_for('claude-sonnet-4-5')[:2], (3.0, 15.0))
         self.assertEqual(extract._price_for('claude-haiku-4-5')[:2], (1.0, 5.0))
@@ -627,6 +715,21 @@ class FailOpenTest(unittest.TestCase):
                         '## ANOMALIES'):
             self.assertIn(section, text, f'{section} survives a sibling failure')
         self.assertIn('first ask: build the thing', text, 'the other sections keep their content')
+
+    def test_scan_survives_non_string_tool_inputs(self):
+        lines = [user_line('go'), assistant_line([
+            tool_use('Agent', {'subagent_type': {'x': 1}, 'model': ['m']}, 'tu_a'),
+            tool_use('Skill', {'skill': ['s'], 'args': {'a': 1}}, 'tu_s'),
+            tool_use('Edit', {'file_path': 7}, 'tu_e'),
+            tool_use('Bash', 'not-a-dict', 'tu_b')])]
+        path = write_transcript(lines)
+        try:
+            scan = extract._scan(path)
+        finally:
+            os.remove(path)
+        self.assertEqual(scan['agent_dispatch'], {'?': 1})
+        self.assertEqual(scan['skills'], {'Skill': 1})
+        self.assertEqual(scan['tools']['Bash'], 1)
 
 
 # ---------------------------------------------------------------------------
@@ -794,31 +897,148 @@ class PairingRegressionTest(unittest.TestCase):
         self.assertEqual(scan['unpaired_tools'], 0)
 
 
-class GitDetectionRegressionTest(unittest.TestCase):
-    def test_git_commit_past_the_arg_cap_is_still_detected(self):
-        # A real compound: `git add <many paths> && git commit -m …`, with the commit verb sitting
-        # well past the 400-char rendered arg cap. Detection reads the RAW input, never the cut.
-        cmd = 'git add ' + ' '.join(f'src/path/number-{i}.py' for i in range(20)) + \
-              ' && git commit -m "engine: land the batch"'
-        self.assertGreater(len(cmd), 450, 'the fixture must exceed the 400-char arg cap')
-        lines = [assistant_line([tool_use('Bash', {'command': cmd}, 'tu_git')], mid='m1'),
-                 tool_result('[main 9f8e7d6] engine: land the batch\n 3 files changed', 'tu_git')]
-        path = write_transcript(lines)
-        try:
-            scan = extract._scan(path)
-        finally:
-            os.remove(path)
-        self.assertEqual(scan['commits'], [('9f8e7d6', 'engine: land the batch')])
+class GitFootprintTest(unittest.TestCase):
+    """FILES TOUCHED comes from git over the session window, not from tool-call scraping."""
 
-    def test_a_non_commit_bash_call_is_not_flagged(self):
-        lines = [assistant_line([tool_use('Bash', {'command': 'git status'}, 'tu_s')], mid='m1'),
-                 tool_result('[main 1234567] not a commit line', 'tu_s')]
+    def _git(self, repo, *args):
+        subprocess.run(['git', '-C', repo, *args], check=True, capture_output=True)
+
+    def _repo_with_commit(self, repo, subject):
+        self._git(repo, 'init', '-q')
+        for name in ('a.py', 'b.py'):
+            with open(os.path.join(repo, name), 'w') as f:
+                f.write('x\n')
+        self._git(repo, 'add', 'a.py')
+        # `-q` prints nothing -- the shape the old Bash-output scrape missed.
+        self._git(repo, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', subject)
+
+    @unittest.skipUnless(shutil.which('git'), 'git not on PATH')
+    def test_window_commits_and_the_uncommitted_tree(self):
+        with tempfile.TemporaryDirectory() as repo:
+            self._repo_with_commit(repo, 'engine: land the batch')
+            now = datetime.datetime.now(datetime.timezone.utc)
+            iso = lambda d: d.strftime('%Y-%m-%dT%H:%M:%S.000Z')  # noqa: E731
+            lines = [user_line('go', ts=iso(now - datetime.timedelta(minutes=5)), cwd=repo),
+                     user_line('done', ts=iso(now + datetime.timedelta(minutes=5)), cwd=repo)]
+            path = write_transcript(lines)
+            try:
+                scan = extract._scan(path)
+            finally:
+                os.remove(path)
+            g = scan['git']
+            self.assertEqual([subj for _, subj in g['commits']], ['engine: land the batch'])
+            self.assertEqual(dict(g['files']), {'a.py': 1})
+            self.assertEqual(g['dirty'], {'b.py'})
+            section = extract._sec_files(scan, {})
+            self.assertIn('engine: land the batch', section)
+            self.assertIn('| b.py | 0 | yes |', section)
+
+    @unittest.skipUnless(shutil.which('git'), 'git not on PATH')
+    def test_commits_outside_the_window_are_excluded(self):
+        with tempfile.TemporaryDirectory() as repo:
+            self._repo_with_commit(repo, 'old')
+            g = extract._git_footprint(repo, '2020-01-01T00:00:00.000Z', '2020-01-01T01:00:00.000Z')
+            self.assertEqual((g['commits'], dict(g['files'])), ([], {}))
+
+    def test_no_repo_omits_the_footprint_without_crashing(self):
+        with tempfile.TemporaryDirectory() as not_a_repo:
+            self.assertIsNone(extract._git_footprint(not_a_repo, TS % 0, TS % 9))
+        self.assertIsNone(extract._git_footprint('', TS % 0, TS % 9))
+        path = write_transcript([user_line('hi')])
+        try:
+            scan = extract._scan(path)
+        finally:
+            os.remove(path)
+        self.assertIsNone(scan['git'])
+        self.assertIn('Omitted', extract._sec_files(scan, {}))
+
+    def test_missing_git_binary_fails_open(self):
+        original = extract.subprocess.run
+
+        def no_git(*a, **kw):
+            raise FileNotFoundError('git')
+
+        extract.subprocess.run = no_git
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                self.assertIsNone(extract._git_footprint(d, TS % 0, TS % 9))
+        finally:
+            extract.subprocess.run = original
+
+
+class HookBlockTallyTest(unittest.TestCase):
+    """A PreToolUse hard block is tallied in the hook inventory from BOTH real shapes."""
+
+    def test_both_block_shapes_are_tallied(self):
+        run_sh = ('PreToolUse:Bash hook error: [bash "${CLAUDE_PLUGIN_ROOT}/hooks/run.sh" '
+                  'git-commit-guard]: BLOCKED (compound bypass): x')
+        legacy = 'PreToolUse:Edit hook error: [python ~/.claude/hooks/doc-write-guard.py]: BLOCKED'
+        bare = 'PreToolUse:Bash hook error: Detached (background) execution blocked'
+        lines = [assistant_line([tool_use('Bash', {'command': 'x'}, 'tu_1'),
+                                 tool_use('Edit', {'file_path': 'y'}, 'tu_2'),
+                                 tool_use('Bash', {'command': 'z'}, 'tu_3'),
+                                 tool_use('Bash', {'command': 'w'}, 'tu_4')], mid='m1'),
+                 tool_result(run_sh, 'tu_1', is_error=True),
+                 tool_result(legacy, 'tu_2', is_error=True),
+                 tool_result(bare, 'tu_3', is_error=True),
+                 tool_result(run_sh, 'tu_4'),        # not is_error: output that merely quotes one
+                 {'type': 'attachment', 'timestamp': TS % 3,
+                  'attachment': {'type': 'hook_blocking_error', 'hookName': 'PreToolUse:Bash',
+                                 'hookEvent': 'PreToolUse', 'toolUseID': 'tu_9',
+                                 'blockingError': {'blockingError': 'Compound command detected',
+                                                   'command': 'Checking for compound commands...'}}}]
         path = write_transcript(lines)
         try:
             scan = extract._scan(path)
         finally:
             os.remove(path)
-        self.assertEqual(scan['commits'], [])
+        self.assertEqual(dict(scan['hooks']), {'git-commit-guard (block)': 1,
+                                               'doc-write-guard (block)': 1,
+                                               'PreToolUse:Bash (block)': 2})
+
+    def test_merged_banner_message_tallies_every_named_guard(self):
+        # shell-guards joins its guards' banners with ` · ` into one systemMessage.
+        merged = ('⚠️ ballast: process-lifecycle-guard — x · '
+                  '📦 ballast: package-install-guard — y')
+        lines = [{'type': 'attachment', 'timestamp': TS % 3,
+                  'attachment': {'type': 'hook_system_message', 'content': merged,
+                                 'hookName': 'H', 'hookEvent': 'PreToolUse'}}]
+        path = write_transcript(lines)
+        try:
+            scan = extract._scan(path)
+        finally:
+            os.remove(path)
+        self.assertEqual(dict(scan['hooks']), {'process-lifecycle-guard': 1,
+                                               'package-install-guard': 1})
+
+
+class AssistantShapeTest(unittest.TestCase):
+    def test_plain_string_assistant_content_is_text(self):
+        path = write_transcript([assistant_line('a stored plain-string reply')])
+        try:
+            scan = extract._scan(path)
+        finally:
+            os.remove(path)
+        self.assertEqual([e['s'] for e in scan['events'] if e['k'] == 'text'],
+                         ['a stored plain-string reply'])
+
+    def test_subagent_handback_message_is_the_leafs_report(self):
+        # Census pin (2026-09-23): 258 sidecars on CLI 2.1.276-2.1.281 carry `SubagentHandback`
+        # with input {message}, then a success tool_result, then a short end_turn text; drift-silent.
+        lines = [assistant_line([tool_use('SubagentHandback', {'message': 'report: all green'},
+                                          'tu_hb')], mid='m1'),
+                 tool_result('{"success":true,"message":"Report delivered"}', 'tu_hb'),
+                 assistant_line([{'type': 'text', 'text': 'Done.'}], ts=TS % 3, mid='m2')]
+        path = write_transcript(lines)
+        try:
+            scan = extract._scan(path)
+        finally:
+            os.remove(path)
+        self.assertEqual([e['s'] for e in scan['events'] if e['k'] == 'text'],
+                         ['[handback] report: all green', 'Done.'])
+        self.assertEqual(scan['tools']['SubagentHandback'], 1)
+        self.assertEqual(scan['unpaired_tools'], 0)
+        self.assertEqual(scan['drift'], {})
 
 
 class CleanProseRegressionTest(unittest.TestCase):

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Regression tests for hooks/visual_origin_ledger.py -- the visual-stack origin ledger library
-and its bin/ CLI (record | list | teardown).
+and its bin/ CLI (record | list | teardown | pin | brief).
 
 WHAT IS PINNED HERE is the kill decision, from both directions: an entry is reaped ONLY when the
 recorded process still verifies (pid + start_time + command-line fingerprint) AND its recording
@@ -269,7 +269,7 @@ class ReadEntryTests(LedgerTestCase):
 
 
 class WindowsEnumeratorParseTests(unittest.TestCase):
-    """The Windows parse half, fed synthetic tool output.
+    """The Windows CIM parse half, fed synthetic tool output.
 
     Every other test here drives the BALLAST_VISUAL_PROC_FAKE seam, which replaces
     enumerate_processes() wholesale -- so on the one platform this ledger actually kills processes
@@ -308,28 +308,6 @@ class WindowsEnumeratorParseTests(unittest.TestCase):
         with self.assertRaises(vol.ProcessProbeError):
             vol._parse_cim("[]")
 
-    def test_wmic_rejoins_a_command_line_containing_commas(self):
-        # The whole reason the row is parsed from both ends: the four fixed fields sit at known
-        # positions and everything between them is the command line, commas included.
-        csv = ("Node,CommandLine,CreationDate,ParentProcessId,ProcessId\n"
-               "BOX,node serve.mjs --flags a,b,c,20260728100000.000000+000,9000,4242\n")
-        out = vol._parse_wmic(csv)
-        self.assertEqual(len(out), 1)
-        self.assertEqual(out[0]["pid"], 4242)
-        self.assertEqual(out[0]["ppid"], 9000)
-        self.assertEqual(out[0]["cmdline"], "node serve.mjs --flags a,b,c")
-
-    def test_wmic_skips_the_header_and_short_rows(self):
-        csv = ("Node,CommandLine,CreationDate,ParentProcessId,ProcessId\n"
-               "\n"
-               "BOX,truncated,row\n"
-               "BOX,pwsh.exe,20260728080000.000000+000,1,8000\n")
-        out = vol._parse_wmic(csv)
-        self.assertEqual([p["pid"] for p in out], [8000])
-
-    def test_wmic_empty_result_raises(self):
-        with self.assertRaises(vol.ProcessProbeError):
-            vol._parse_wmic("Node,CommandLine,CreationDate,ParentProcessId,ProcessId\n")
 
 
 class SweepTests(LedgerTestCase):
@@ -551,8 +529,8 @@ class CliTests(LedgerTestCase):
 
 
 class PinTests(LedgerTestCase):
-    """The dispatch pin: frozen context in, re-stated liveness out. Nothing here can kill anything --
-    the pin is context, and `--check` is a SHADOW report that must never change an exit code."""
+    """The dispatch pin and the brief printed from it. Nothing here can kill anything -- the pin is
+    context, and `brief` only reads it."""
 
     def out_dir(self):
         d = os.path.join(self.tmp, "vp-out")
@@ -562,110 +540,119 @@ class PinTests(LedgerTestCase):
     def test_pin_round_trip_carries_every_brief_field(self):
         out = self.out_dir()
         vol.write_pin("s1", "http://127.0.0.1:5233", out, states="/p/.claude/visual-states.json",
-                      matrix="1440x900@1,390x844@1", settle=250, frontend_root=self.tmp)
+                      matrix="1440x900@1,390x844@1", settle=250)
         pin = vol.read_pin(out)
         self.assertEqual(pin["origin"], "http://127.0.0.1:5233")
         self.assertEqual(pin["out_dir"], out)
-        self.assertEqual(pin["states_manifest"], "/p/.claude/visual-states.json")
+        self.assertEqual(pin["states_manifest"], os.path.abspath("/p/.claude/visual-states.json"))
         self.assertEqual(pin["matrix"], "1440x900@1,390x844@1")
         self.assertEqual(pin["settle"], 250)
         self.assertTrue(pin["pinned_at"])
 
     def test_re_pin_overwrites_rather_than_merging(self):
         out = self.out_dir()
-        vol.write_pin("s1", "http://a", out, matrix="1440x900@1", frontend_root=self.tmp)
-        vol.write_pin("s1", "http://b", out, frontend_root=self.tmp)
+        vol.write_pin("s1", "http://a", out, matrix="1440x900@1")
+        vol.write_pin("s1", "http://b", out)
         pin = vol.read_pin(out)
         self.assertEqual(pin["origin"], "http://b")
         self.assertIsNone(pin["matrix"])  # a stale field must not survive a re-pin
 
-    def test_demurrage_stamp_finds_the_newest_frontend_file(self):
-        root = os.path.join(self.tmp, "app")
-        os.makedirs(os.path.join(root, "node_modules"), exist_ok=True)
-        old = os.path.join(root, "old.css")
-        new = os.path.join(root, "new.tsx")
-        vendored = os.path.join(root, "node_modules", "vendor.js")
-        for p in (old, vendored):
-            with open(p, "w", encoding="utf-8") as f:
-                f.write("x")
-        os.utime(old, (1, 1))
-        os.utime(vendored, (10 ** 9, 10 ** 9))  # far newer, but excluded by the walk
-        with open(new, "w", encoding="utf-8") as f:
-            f.write("y")
-        os.utime(new, (10 ** 8, 10 ** 8))
-        path, _ = vol.newest_frontend_mtime(root)
-        self.assertEqual(os.path.basename(path), "new.tsx")
-
-    def test_check_flags_evidence_older_than_the_newest_edit(self):
-        root = os.path.join(self.tmp, "app2")
-        os.makedirs(root, exist_ok=True)
-        out = self.out_dir()
-        vol.write_pin("s1", "http://127.0.0.1:5233", out, frontend_root=root)
-        manifest = os.path.join(out, "manifest.json")
-        with open(manifest, "w", encoding="utf-8") as f:
-            f.write("{}")
-        os.utime(manifest, (10 ** 8, 10 ** 8))
-        edit = os.path.join(root, "late.css")
-        with open(edit, "w", encoding="utf-8") as f:
-            f.write("x")
-        os.utime(edit, (10 ** 8 + 500, 10 ** 8 + 500))
-        rows = {r["check"]: r for r in vol.check_pin(out)}
-        self.assertFalse(rows["evidence"]["ok"])
-        # Fresh evidence is the other direction of the same check.
-        os.utime(manifest, (10 ** 8 + 900, 10 ** 8 + 900))
-        rows = {r["check"]: r for r in vol.check_pin(out)}
-        self.assertTrue(rows["evidence"]["ok"])
-
-    def test_check_verifies_the_origin_against_the_ledger(self):
-        out = self.out_dir()
-        vol.write_pin("s1", "http://127.0.0.1:5173", out, frontend_root=self.tmp)
-        rows = {r["check"]: r for r in vol.check_pin(out)}
-        self.assertFalse(rows["origin"]["ok"])          # nothing recorded yet
-        self.write_ledger("s1", [self.entry()])
-        rows = {r["check"]: r for r in vol.check_pin(out)}
-        self.assertTrue(rows["origin"]["ok"])
-
-    def test_check_never_borrows_another_session_s_ledger_row(self):
-        # Same URL, another session's ledger: a cross-session match would report "origin verified"
-        # for a process THIS session never recorded (and may well have outlived).
-        out = self.out_dir()
-        vol.write_pin("s1", "http://127.0.0.1:5173", out, frontend_root=self.tmp)
-        self.write_ledger("s2", [self.entry()])
-        rows = {r["check"]: r for r in vol.check_pin(out)}
-        self.assertFalse(rows["origin"]["ok"])
-
     def test_pin_carries_the_native_cell_and_suppressions_slots(self):
         out = self.out_dir()
         vol.write_pin("s1", "http://127.0.0.1:5233", out, matrix="1440x900@1,390x844@1",
-                      native="1440x900@1", suppressions="/p/.claude/vp-suppressions.json",
-                      frontend_root=self.tmp)
+                      native="1440x900@1", suppressions="/p/.claude/vp-suppressions.json")
         pin = vol.read_pin(out)
         self.assertEqual(pin["native"], "1440x900@1")
-        self.assertEqual(pin["suppressions"], "/p/.claude/vp-suppressions.json")
+        self.assertEqual(pin["suppressions"], os.path.abspath("/p/.claude/vp-suppressions.json"))
 
-    def test_check_of_a_missing_pin_is_a_single_named_row(self):
-        rows = vol.check_pin(os.path.join(self.tmp, "nope"))
-        self.assertEqual([r["check"] for r in rows], ["pin"])
-        self.assertFalse(rows[0]["ok"])
-
-    def test_cli_pin_then_check_is_shadow_only(self):
+    def test_pin_carries_ready(self):
         out = self.out_dir()
-        env = dict(os.environ)
+        vol.write_pin("s1", "http://127.0.0.1:5233", out, ready="[data-app-ready]")
+        self.assertEqual(vol.read_pin(out)["ready"], "[data-app-ready]")
 
-        def cli(*args):
-            return subprocess.run([sys.executable, vol.__file__] + list(args),
-                                  capture_output=True, text=True, timeout=60, env=env)
+    def brief_cli(self, *args):
+        return subprocess.run([sys.executable, vol.__file__, "brief"] + list(args),
+                              capture_output=True, encoding="utf-8", timeout=60, env=dict(os.environ))
 
-        r = cli("pin", "--session-key", "s1", "--url", "http://127.0.0.1:5233", "--out-dir", out,
-                "--matrix", "1440x900@1", "--frontend-root", self.tmp)
+    def test_brief_prints_every_slot_from_the_pin(self):
+        out = self.out_dir()
+        vol.write_pin("s1", "http://127.0.0.1:5233", out, states="/p/.claude/visual-states.json",
+                      matrix="1440x900@1,390x844@1", settle=800, native="1440x900@1",
+                      suppressions="/p/.claude/vp-suppressions.json", ready='[data-state="ready"]')
+        r = self.brief_cli("--out-dir", out, "--rung", "glance", "--intent", "the hero fits",
+                           "--holes", "dark theme -- unchanged", "--urls", "/a,/b")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("pinned", r.stdout)
+        text = r.stdout
+        for slot in ("Origin (REQUIRED): http://127.0.0.1:5233", "Out-dir: %s" % os.path.abspath(out),
+                     "Epoch: SELF-EPOCH", "Target + intent: http://127.0.0.1:5233, /a, /b — the hero fits",
+                     "Declared holes (not shot): dark theme -- unchanged", "Native cell: 1440x900@1",
+                     "Run this first, exactly as written, alone:", "Expected budget: 1 invocation",
+                     "Exit codes:", "Load no skill"):
+            self.assertIn(slot, text)
+        cmd = [ln for ln in text.splitlines() if ln.startswith("  node ")]
+        self.assertEqual(len(cmd), 1, text)
+        for part in ('"%s" glance' % vol.PROBE_PATH, '--url "http://127.0.0.1:5233"', '--urls "/a,/b"',
+                     "--matrix 1440x900@1,390x844@1",
+                     '--states "%s" --skip-drive-hooks' % os.path.abspath("/p/.claude/visual-states.json"),
+                     "--ready '[data-state=\"ready\"]'",
+                     '--suppressions "%s"' % os.path.abspath("/p/.claude/vp-suppressions.json"),
+                     "--settle 800",
+                     '--out "%s"' % os.path.abspath(out)):
+            self.assertIn(part, cmd[0])
+        self.assertNotIn("Mode:", text)   # a glance has no review mode
 
-        r = cli("pin", "--check", "--out-dir", out)
-        # The origin is unrecorded, so this run HAS a stale claim -- and still exits 0.
+    def test_pin_stores_states_and_suppressions_absolute(self):
+        # A relative path resolves against the pin-time cwd, not the leaf's.
+        out = self.out_dir()
+        vol.write_pin("s1", "http://127.0.0.1:5233", out, states="rel/visual-states.json",
+                      suppressions="rel/vp-suppressions.json")
+        pin = vol.read_pin(out)
+        self.assertEqual(pin["states_manifest"], os.path.abspath("rel/visual-states.json"))
+        self.assertEqual(pin["suppressions"], os.path.abspath("rel/vp-suppressions.json"))
+        self.assertTrue(os.path.isabs(pin["states_manifest"]))
+        self.assertTrue(os.path.isabs(pin["suppressions"]))
+
+    def test_brief_command_splits_back_to_the_exact_values(self):
+        # The leaf runs the printed line through bash: an origin with `&`/`?` and a selector with
+        # both quote kinds must each survive as one word, byte-exact.
+        import shlex
+        origin = "http://127.0.0.1:5233/?a=1&b=2"
+        ready = """[data-x="it's"]"""
+        out = self.out_dir()
+        vol.write_pin("s1", origin, out, ready=ready)
+        text = self.brief_cli("--out-dir", out, "--rung", "glance", "--intent", "x").stdout
+        cmd = [ln for ln in text.splitlines() if ln.startswith("  node ")]
+        self.assertEqual(len(cmd), 1, text)
+        argv = shlex.split(cmd[0])
+        self.assertEqual(argv[argv.index("--url") + 1], origin)
+        self.assertEqual(argv[argv.index("--ready") + 1], ready)
+        self.assertEqual(argv[1], vol.PROBE_PATH)
+
+    def test_brief_omits_unpinned_flags(self):
+        out = self.out_dir()
+        vol.write_pin("s1", "http://127.0.0.1:5233", out, matrix="800x600@1")
+        text = self.brief_cli("--out-dir", out, "--rung", "glance", "--intent", "x").stdout
+        for flag in ("--urls", "--states", "--skip-drive-hooks", "--ready", "--suppressions", "--settle"):
+            self.assertNotIn(flag + " ", [ln for ln in text.splitlines() if ln.startswith("  node ")][0])
+        self.assertIn("Declared holes (not shot): NONE", text)
+        self.assertIn("Native cell: 800x600@1", text)   # no native pinned: the matrix's first cell
+
+    def test_brief_review_rung_uses_review_capture(self):
+        out = self.out_dir()
+        vol.write_pin("s1", "http://127.0.0.1:5233", out, matrix="1440x900@1")
+        r = self.brief_cli("--out-dir", out, "--rung", "review", "--intent", "x", "--mode", "delta",
+                           "--facet", "typography", "--prior", "F1 clipped label")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("WOULD-BLOCK", r.stdout)
-        self.assertIn("WOULD-BLOCK", self.read_file(vol.shadow_log_path()))
+        self.assertIn('" review-capture --url', r.stdout)
+        for line in ("Mode: delta", "Facet: typography", "Prior findings: F1 clipped label", "~120s"):
+            self.assertIn(line, r.stdout)
+
+    def test_brief_without_pin_is_a_usage_error(self):
+        r = self.brief_cli("--out-dir", os.path.join(self.tmp, "nope"), "--rung", "glance",
+                           "--intent", "x")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("pin first", r.stderr)
+        self.assertEqual(r.stdout, "")
 
     def test_cli_pin_without_url_is_a_usage_error(self):
         r = subprocess.run([sys.executable, vol.__file__, "pin", "--session-key", "s1",

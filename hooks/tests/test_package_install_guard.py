@@ -1,20 +1,19 @@
 #!/usr/bin/env python
-"""Regression tests for package-install-guard.py.
+"""Regression tests for package_install_guard.py, run through the shell-guards.py dispatcher.
 
-The hook filename is hyphenated (not importable), so each case invokes it as a
-subprocess with the current interpreter, feeds a PreToolUse JSON payload on
-stdin, and asserts on the emitted decision:
+Each case invokes `hooks/shell-guards.py` as a subprocess with the current interpreter, feeds a
+PreToolUse JSON payload on stdin, and asserts on the emitted decision (a single-guard fire is
+byte-identical to the old standalone hook's output):
 
   - an install / remote-exec verb in REAL command position -> permissionDecision "ask"
   - the same verb from a SUB-AGENT payload (agent_type and/or agent_id present)
     -> permissionDecision "deny"
   - a verb inside quoted text OR a heredoc body -> silent pass (no output)
   - allowlisted local dev-tool runs -> silent pass (both callers)
-  - a malformed payload -> silent pass, exit 0 (fail open)
+  - a malformed payload -> announced, exit 0 (fail open)
 
-The heredoc cases pin R2 (2026-07-08): a `git commit -F - <<'EOF' ... EOF`
-message that merely DESCRIBES an install must not false-fire the gate — the hole
-this report's own commit tripped.
+The heredoc cases pin that a `git commit -F - <<'EOF' ... EOF` message that merely DESCRIBES an
+install must not false-fire the gate.
 
 Self-locating + standalone: `python hooks/tests/test_package_install_guard.py`.
 """
@@ -24,7 +23,7 @@ import subprocess
 import sys
 import unittest
 
-HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "package-install-guard.py")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "shell-guards.py")
 
 
 def _run(command, **caller):
@@ -115,8 +114,8 @@ class SubagentGetsDeniedNotAsked(unittest.TestCase):
 class ShellWrapperDoesNotLaunderTheVerb(unittest.TestCase):
     """A wrapper's quoted body IS command text, so it must survive the quote stripper.
 
-    Back-ported from process-lifecycle-guard.py, which hit this class first: without the UNWRAP
-    step the whole body is erased as a quoted literal and the install verb never reaches INSTALL.
+    Without shell_text's UNWRAP step the whole body is erased as a quoted literal and the install
+    verb never reaches INSTALL.
     """
 
     def test_bash_c_install(self):
@@ -159,15 +158,14 @@ class NeutralizedTextDoesNotFire(unittest.TestCase):
 
 class FailOpenAndBenign(unittest.TestCase):
     def test_malformed_payload(self):
-        # Governance review item: the fail-open path is announce-on-error, not silent -- exit
-        # code is unchanged (still 0), but a systemMessage now marks the internal error visible.
+        # The fail-open path is announce-on-error, not silent: exit 0, plus a systemMessage.
         proc = subprocess.run(
             [sys.executable, HOOK], input="not json", capture_output=True, text=True
         )
         self.assertEqual(proc.returncode, 0)
         out = json.loads(proc.stdout.strip())
         self.assertIn("systemMessage", out)
-        self.assertIn("package-install-guard", out["systemMessage"])
+        self.assertIn("shell-guards", out["systemMessage"])
 
     def test_benign_command(self):
         self.assertIsNone(_decision(_run("ls -la && git status")))

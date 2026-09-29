@@ -4,7 +4,8 @@
 # WHY a dispatcher: hooks.json's command string is fixed at plugin-load time and can't branch on
 # OS or probe for a working Python. One script gives one place to resolve an interpreter, fail
 # open, and record the fire ledger. Usage: `bash "${CLAUDE_PLUGIN_ROOT}/hooks/run.sh" <hook-name>`;
-# stdin (the hook JSON payload) is never read or buffered here -- the child inherits the same fd.
+# stdin (the hook JSON payload) is never read here -- the child inherits the same fd -- except for
+# shell-guards, whose payload the SHELL-GUARDS PREFILTER below screens and then feeds to the child.
 #
 # DISPATCH: the child is CAPTURED (command substitution), not exec'd, so stdout can be forwarded
 # unchanged AND the exit code inspected for the ledger; stderr passes straight through. The ledger
@@ -25,7 +26,7 @@ unset MSYS_NO_PATHCONV MSYS2_ARG_CONV_EXCL
 # Own directory via BASH_SOURCE -- independent of caller cwd and of hooks.json's path substitution.
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# arg1 = the logical hook name from hooks.json (e.g. "git-commit-guard", "doc-write-guard").
+# arg1 = the logical hook name from hooks.json (e.g. "shell-guards", "freehand-mode").
 name="${1:-}"
 
 # Name -> filename map for exactly the hooks registered in hooks.json. Deliberately a static list
@@ -34,22 +35,15 @@ name="${1:-}"
 case "$name" in
   ballast-principles)            file="ballast-principles.sh" ;;
   freehand-mode)                 file="freehand-mode.sh" ;;
-  subagent-fanout)                file="subagent-fanout.sh" ;;
   askuserquestion-recommend)      file="askuserquestion-recommend.py" ;;
-  package-install-guard)          file="package-install-guard.py" ;;
-  git-commit-guard)                file="git-commit-guard.sh" ;;
-  commit-review-gate)               file="commit-review-gate.py" ;;
-  ballast-allow)                   file="ballast-allow.py" ;;
-  doc-write-guard)                 file="doc-write-guard.py" ;;
-  plan-authoring)                  file="plan-authoring.sh" ;;
+  shell-guards)                    file="shell-guards.py" ;;
   plan-handoff)                     file="plan-handoff.sh" ;;
   mode-state-cleanup)               file="mode-state-cleanup.sh" ;;
-  harness-sweep-nudge)              file="harness-sweep-nudge.sh" ;;
   inline-churn-nudge)               file="inline-churn-nudge.py" ;;
   dev-process-nudge)                file="dev-process-nudge.py" ;;
-  process-lifecycle-guard)          file="process-lifecycle-guard.py" ;;
   origin-sweep)                     file="origin-sweep.py" ;;
   visual-arm)                       file="visual-arm.py" ;;
+  diff-review-cap)                  file="diff-review-cap.py" ;;
   *)
     # Unknown hook name -- fail open silently (see contract above).
     exit 0
@@ -57,6 +51,28 @@ case "$name" in
 esac
 
 target="$DIR/$file"
+
+# SHELL-GUARDS PREFILTER -- the one hook whose stdin is read here. shell-guards fires on EVERY
+# Bash/PowerShell call, but only a payload containing one of these literals can match any of its
+# guards, so a non-matching call exits here with zero forks (builtin read + case), no python, and
+# no ledger row. SUPERSET ARGUMENT (pinned by hooks/tests/test_shell_guards.py): package-install's
+# INSTALL and EXEC regexes each require install / npm (covers pnpm) / yarn / bun (covers bunx,
+# `bun x`) / npx / add (`uv add`, `mcp add`), case-insensitively; ballast-allow needs "ballast-";
+# process-lifecycle is a no-op outside a leaf (agent_id / agent_type present). The raw JSON payload
+# is a superset of every string the guards scan, `bash -c` bodies included (JSON never escapes
+# ASCII letters). A guard joining shell-guards adds its literal anchors here. ACCEPTED RESIDUAL:
+# `read -d ''` reads a pipe byte by byte -- slower than $(cat) on a very large payload (a 20 KB
+# heredoc), but fork-free on the typical <2 KB one.
+payload=""
+if [ "$name" = shell-guards ]; then
+  IFS= read -r -d '' payload || true   # to EOF; the non-zero status at EOF is expected
+  shopt -s nocasematch
+  case "$payload" in
+    *install*|*npm*|*yarn*|*bun*|*npx*|*add*|*ballast-*|*'"agent_id"'*|*'"agent_type"'*) ;;
+    *) exit 0 ;;
+  esac
+  shopt -u nocasematch
+fi
 
 # Ballast's per-user state dir, resolved ONCE for both consumers (interpreter cache, fire ledger)
 # so they can never drift: BALLAST_CLAUDE_HOME (hermetic-test override) -> $HOME/.claude -> empty
@@ -80,13 +96,12 @@ resolve_ballast_home
 # .sh hooks never receive it). Hooks needing no Python skip the probe entirely.
 needs_python=0
 case "$file" in *.py) needs_python=1 ;; esac
-case "$name" in git-commit-guard|ballast-principles|freehand-mode|harness-sweep-nudge|plan-handoff|mode-state-cleanup) needs_python=1 ;; esac
+case "$name" in ballast-principles|freehand-mode|plan-handoff|mode-state-cleanup) needs_python=1 ;; esac
 
 if [ "$needs_python" -eq 1 ]; then
   # ===== THREE-TIER INTERPRETER RESOLUTION (fast paths in front of the cold probe) ==============
   # The cold probe is expensive (up to three candidate executions plus per-candidate forks,
-  # re-derived identically four times per Bash tool call under the shared Bash|PowerShell
-  # matcher) -- cache the constant instead of re-deriving it. Tiers, cheapest first: (1) an
+  # re-derived on every python-backed fire) -- cache the constant instead of re-deriving it. Tiers, cheapest first: (1) an
   # interpreter already exported into this process tree, (2) the on-disk cache written by a
   # previous cold probe, (3) the cold probe itself.
   #
@@ -228,7 +243,11 @@ case "$file" in
       exit 0
     fi
     # shellcheck disable=SC2086 -- intentional word-split for the two-word "py -3" candidate.
-    out="$(${BALLAST_PYTHON} "$target")"; rc=$?
+    if [ "$name" = shell-guards ]; then
+      out="$(${BALLAST_PYTHON} "$target" <<< "$payload")"; rc=$?   # stdin was consumed above
+    else
+      out="$(${BALLAST_PYTHON} "$target")"; rc=$?
+    fi
     ;;
 esac
 

@@ -1,7 +1,7 @@
-#!/usr/bin/env python
 """
-PreToolUse guard (Bash|PowerShell): in a SUB-AGENT, hard-deny any command that takes
-ownership of a PROCESS LIFECYCLE. Main session: pure no-op (exit 0, no output).
+shell-guards module (Bash|PowerShell PreToolUse): in a SUB-AGENT, hard-deny any command that
+takes ownership of a PROCESS LIFECYCLE. Main session: pure no-op (no decision). Run by
+shell-guards.py, which merges its decision with the other guards'.
 
 WHY IT EXISTS. A leaf that stands up its own service is the orphan factory: it detaches a
 process nothing will reap (a leaf has no close-out), or foregrounds one, wedges its own command
@@ -19,8 +19,8 @@ the test suite's bypass matrix is where new shapes get pinned.
       leaf it only wedges the command until timeout, origin still unobtained.
   (c) ALL PROCESS SIGNALLING, WITH NO OWN-CHILD CARVE-OUT -- `kill`, `pkill`, `killall`,
       `taskkill`, `Stop-Process`, `kill-port`, `docker stop`. A stateless guard cannot verify
-      ownership, a foregrounded child dies with the leaf's own command anyway, and the valve
-      covers the remainder. The carve-out is absent BY DESIGN -- do not add one.
+      ownership, and a foregrounded child dies with the leaf's own command anyway. The
+      carve-out is absent BY DESIGN -- do not add one.
 
 EXPLICITLY NOT THE DENY SURFACE: transient port binds inside foreground test/build runs
 (`vitest`, `playwright test`, an `npm test` that spawns and reaps an internal server,
@@ -39,20 +39,18 @@ shadow window. The compensating control for skipping that window is the false-po
 `test_process_lifecycle_guard.py` -- not optional, and first-class in rows from projects outside
 any one domain.
 
-RELEASE VALVE: a session-scoped marker at <ballast-home>/.cache/ballast-lifecycle/valve-<key>
-(key = the transcript filename stem). Present -> the command is allowed with a ledgered warning
-naming the valve instead of denied. It is the ATTENDED main session's lever: the orchestrator
-creates it after a false positive is surfaced, and a leaf can never actuate its own (denied the
-means, and told to report instead). Markers older than 2 days are pruned on any dir touch.
+NO RELEASE VALVE: a genuine false positive costs one leaf round-trip -- the leaf reports it, and
+the attended main session runs the command itself. A new false-positive shape gets pinned in the
+test suite's corpus.
 
-FAIL-OPEN GUARANTEE. Every path is wrapped: a malformed payload, an unreadable state dir, a
-regex or parse surprise -> exit 0 with no decision, so a bug here can never block every
-Bash/PowerShell call. The fail-open is ANNOUNCED (systemMessage), never silent; the announce is
-wrapped in its own try/except and can never change the exit code.
+FAIL-OPEN GUARANTEE. decide() does no I/O; a regex or parse surprise raises into shell-guards.py,
+which announces it and skips this guard, so a bug here can never block every Bash/PowerShell call.
 
 CALLER DISCRIMINATION is payload-only (no env-var discriminator exists on the hook path):
-`agent_type` / `agent_id`, OR'd -- see is_subagent(). Any parse surprise resolves False = main
-session = no-op, failing toward the native permission flow, never toward denying an attended user.
+`agent_type` / `agent_id`, OR'd -- see hook_payload.is_subagent(). Any parse surprise resolves
+False = main session = no-op, failing toward the native permission flow, never toward denying an
+attended user. The prefilter in run.sh passes any payload carrying either field name, so leaf
+calls always reach this guard.
 
 NAMED RESIDUAL RISKS (accepted, not bugs -- do not "fix" them silently):
   1. `npm start` / `npm run start` are NOT denied: `start` is overloaded across ecosystems (dev
@@ -71,127 +69,16 @@ NAMED RESIDUAL RISKS (accepted, not bugs -- do not "fix" them silently):
      design (rung 2 is opt-in and orchestrator-adjudicated -- see the probe skill's mode-states
      reference). Read this guard as neither total coverage nor "closed elsewhere".
   4. Verb corpora are heuristics: a launcher nobody has improvised yet is missed until the
-     bypass matrix names it, and an exotic project alias could false-fire (valve + report).
+     bypass matrix names it, and an exotic project alias could false-fire (the leaf reports it).
 """
 
-import sys
-import json
 import os
 import re
-import glob
-import time
 
-HOOK_NAME = "process-lifecycle-guard"
+from hook_payload import is_subagent
+from shell_text import neutralize
 
-
-def _announce_error(site, skipped):
-    """Best-effort announce for a fail-open path (announce-on-error contract, hooks/CLAUDE.md).
-
-    Silent on its own failure; never raises; never affects the exit code."""
-    try:
-        print(json.dumps({
-            "systemMessage": "⚠️ ballast: %s — internal error (%s), %s; deferred to native "
-                             "permission flow" % (HOOK_NAME, site, skipped),
-        }))
-    except Exception:
-        pass
-
-
-# --------------------------------------------------------------------------------------
-# Caller discrimination (verbatim port from package-install-guard.py)
-# --------------------------------------------------------------------------------------
-def is_subagent(payload):
-    """True when this call originates anywhere other than the main loop.
-
-    Two payload fields carry the origin (binary-verified on PreToolUse, CC v2.1.220):
-      - `agent_type` — the subagent_type string of a dispatched agent.
-      - `agent_id`   — ABSENT on the main loop, present on any nested agent at any depth.
-
-    Deliberately the OR, not the AND: both present = a real Task sub-agent; agent_type only =
-    a main-thread agent persona; agent_id only = a forked query. All three are contexts the
-    user is not watching, which is exactly the set that must not own a process.
-
-    Any parse surprise -> False -> main session -> no-op. If upstream renames these fields the
-    predicate goes False everywhere and the guard degrades to inert -- fail-open by
-    construction, with the prose prohibition (agent bodies, dispatch briefs) as the backstop.
-    """
-    try:
-        return bool(
-            str(payload.get("agent_type") or "").strip()
-            or str(payload.get("agent_id") or "").strip()
-        )
-    except Exception:
-        return False
-
-
-# --------------------------------------------------------------------------------------
-# Release-valve state (marker precedent: doc-write-guard.py)
-# --------------------------------------------------------------------------------------
-def home_root():
-    # BALLAST_CLAUDE_HOME is the hermetic-test override (hooks/CLAUDE.md rule); production
-    # never sets it, so the valve lives under the real ~/.claude. NEVER the plugin dir --
-    # that is replaced wholesale on plugin update (standing repo rule).
-    return os.environ.get("BALLAST_CLAUDE_HOME") or os.path.join(os.path.expanduser("~"), ".claude")
-
-
-def valve_dir():
-    return os.path.join(home_root(), ".cache", "ballast-lifecycle")
-
-
-def session_key(payload):
-    """Stem of the transcript filename -- the session-scoping key for the valve marker.
-
-    `transcript_path` is the PARENT session's on a PreToolUse leaf fire (verified for the
-    install guard), and that is exactly what this needs: the orchestrator creates the valve in
-    the attended main session, and the leaf it re-dispatches reads the same key. Falls back to
-    `session_id`, then a constant -- a fallback key still works, it just scopes the valve more
-    coarsely, and the age-prune bounds it either way.
-
-    Sanitized to a filename-safe charset: the key is concatenated into a path, and a payload
-    field is not a trusted path component.
-    """
-    key = ""
-    try:
-        base = os.path.basename(str(payload.get("transcript_path") or "").replace("\\", "/"))
-        if base.endswith(".jsonl"):
-            base = base[:-len(".jsonl")]
-        key = base.strip()
-        if not key:
-            key = str(payload.get("session_id") or "").strip()
-    except Exception:
-        key = ""
-    key = re.sub(r"[^A-Za-z0-9._-]", "_", key)
-    return key or "nosession"
-
-
-def valve_path(payload):
-    return os.path.join(valve_dir(), "valve-%s" % session_key(payload))
-
-
-def prune_valves(d):
-    # Age-prune markers older than 2 days (doc-write-guard's prune, same cutoff). Session
-    # scoping lives in the key; this is the backstop that stops a forgotten valve living
-    # forever. Best-effort: an unremovable file must never break the check below.
-    cutoff = time.time() - 2 * 86400
-    for f in glob.glob(os.path.join(d, "*")):
-        try:
-            if os.path.getmtime(f) < cutoff:
-                os.remove(f)
-        except OSError:
-            pass
-
-
-def valve_open(payload):
-    """True iff this session's valve marker exists. Never CREATES the dir or the marker --
-    creation is the attended orchestrator's act alone. Any error -> False (guard stays on)."""
-    try:
-        d = valve_dir()
-        if not os.path.isdir(d):
-            return False
-        prune_valves(d)          # prune first: an expired marker must not still open the valve
-        return os.path.exists(valve_path(payload))
-    except Exception:
-        return False
+NAME = "process-lifecycle-guard"
 
 
 # --------------------------------------------------------------------------------------
@@ -302,32 +189,8 @@ LAUNCH = re.compile(
     re.IGNORECASE,
 )
 
-# Shell wrappers whose quoted body IS the real command. Unwrapped before quote-stripping so
-# `bash -c "npm run dev"` does not launder the verb away (residual 2 covers what this misses).
-UNWRAP = re.compile(
-    r"\b(?:bash|sh|zsh|dash|pwsh|powershell(?:\.exe)?|cmd(?:\.exe)?)\b"
-    r"[^'\"]{0,40}?\s(?:-c|-Command|/c|/C)\s+(['\"])(.*?)\1",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def neutralize(cmd):
-    """Strip text that is DATA, not command: heredoc bodies, quoted strings, $() subshells.
-
-    Mirrors package-install-guard.py's stripper (and block-compound-commands.sh before it): a
-    verb inside a commit message, an echoed string, or a grep pattern must not fire. Shell
-    wrappers are unwrapped FIRST so their quoted body survives as command text. Heredocs are
-    stripped before the quote strippers, because a quoted delimiter (<<'EOF') would otherwise
-    be mangled and the closing-delimiter match would break.
-    """
-    s = UNWRAP.sub(lambda m: " " + m.group(2) + " ", cmd)
-    s = re.sub(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1.*?^[ \t]*\2[ \t]*$", "", s,
-               flags=re.DOTALL | re.MULTILINE)
-    s = re.sub(r'""".*?"""', "", s, flags=re.DOTALL)
-    s = re.sub(r"\$\(.*?\)", "", s, flags=re.DOTALL)
-    s = re.sub(r'"[^"]*"', "", s)
-    s = re.sub(r"'[^']*'", "", s)
-    return s
+# Literal stripping lives in shell_text.neutralize: it unwraps `bash -c "npm run dev"` before
+# quote-stripping so the wrapper cannot launder the verb away (residual 2 covers what it misses).
 
 
 def head_and_rest(segment):
@@ -403,93 +266,44 @@ def classify(cmd, background):
 
 
 # --------------------------------------------------------------------------------------
-# Output
+# Decision
 # --------------------------------------------------------------------------------------
 # The leaf-facing half of the deny: what to do INSTEAD. Without a stated escape hatch a blocked
 # leaf improvises one (a different runner, a foreground variant, a wrapper) and spins -- the
 # exact loop this guard exists to end. The domain-neutral wording is deliberate: every leaf must
-# read this as ordinary lifecycle hygiene, not as some other domain's policy. %s = this session's
-# valve path.
+# read this as ordinary lifecycle hygiene, not as some other domain's policy. The reason reaches
+# the calling model verbatim, so it is written as an instruction to the leaf.
 LEAF_ESCAPE = (
-    "Sub-agents do not own process lifecycle — starting, backgrounding, or signalling a "
-    "process is the main-session orchestrator's call, made once and attended. "
-    "Do NOT retry, reword, or route around this (another runner, a foreground variant, a "
-    "wrapper, a background flag) — every form is denied. Instead: use the service or origin "
-    "the orchestrator handed you; absent one, report the missing origin/service as a blocked "
-    "verdict or a named coverage gap and finish with what exists. A genuine false positive is "
-    "reportable, not routable: say so, and the attended main session can open a one-session "
-    "release valve (touch %s) and re-dispatch you — a leaf never creates it."
+    "Sub-agents never start, background, or signal a process — the orchestrator owns lifecycle. "
+    "Do not retry or route around this (another runner, a foreground variant, a wrapper, a "
+    "background flag): use the origin or service you were handed, or return `blocked` / a named "
+    "coverage gap naming what is missing and finish with what exists."
 )
 
-
-def emit_deny(kind, token, valve):
-    print(json.dumps({
-        "systemMessage": "⛔ ballast: %s — sub-agent process lifecycle denied (orchestrator-only)"
-                         % HOOK_NAME,
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            # permissionDecision must sit INSIDE hookSpecificOutput (a top-level copy is inert),
-            # and the reason is delivered verbatim to the calling model -- so it is written as
-            # an instruction to the leaf, not a note to the user.
-            "permissionDecision": "deny",
-            "permissionDecisionReason": "%s blocked ('%s'): this is a sub-agent. %s"
-                                        % (kind, token, LEAF_ESCAPE % valve),
-        },
-    }))
+BANNER = "⛔ ballast: %s — sub-agent process lifecycle denied (orchestrator-only)" % NAME
 
 
-def emit_valve(kind, token, valve):
-    # systemMessage ONLY -- deliberately no permissionDecision. An "allow" here would
-    # short-circuit the native permission flow and every other guard sharing this matcher; the
-    # valve's job is only to withhold THIS guard's deny, visibly and on the record (run.sh
-    # ledgers any non-empty stdout, so the valve fire stays auditable).
-    print(json.dumps({
-        "systemMessage": "⚠️ ballast: %s — release valve active, %s ('%s') allowed this session "
-                         "(valve: %s)" % (HOOK_NAME, kind.lower(), token, valve),
-    }))
+def decide(payload):
+    """Return a deny {"decision", "reason", "banner"} for a leaf lifecycle action, else None."""
+    if not is_subagent(payload):
+        return None  # main session: pure no-op
 
+    ti = payload.get("tool_input")
+    if not isinstance(ti, dict):
+        ti = {}
+    cmd = ti.get("command") or ""
+    bg = ti.get("run_in_background")
+    # Tolerate a string-valued flag ("true"): the two matched tools' payload shapes are not
+    # guaranteed identical, and a stringly-typed true must not read as false.
+    background = bg is True or (isinstance(bg, str) and bg.strip().lower() == "true")
 
-def main():
-    try:
-        payload = json.load(sys.stdin)
-    except Exception:
-        _announce_error("payload parse", "lifecycle check skipped")
-        return 0
-    if not isinstance(payload, dict):
-        # Valid JSON that is not an object: same fail-open contract (a .get() below would
-        # AttributeError and exit non-zero -- which PreToolUse reads as a block).
-        _announce_error("payload parse", "lifecycle check skipped")
-        return 0
-
-    try:
-        if not is_subagent(payload):
-            return 0  # main session: pure no-op -- no output, no state touched
-
-        ti = payload.get("tool_input")
-        if not isinstance(ti, dict):
-            ti = {}
-        cmd = ti.get("command") or ""
-        bg = ti.get("run_in_background")
-        # Tolerate a string-valued flag ("true"): the two matched tools' payload shapes are not
-        # guaranteed identical, and a stringly-typed true must not read as false.
-        background = bg is True or (isinstance(bg, str) and bg.strip().lower() == "true")
-
-        hit = classify(str(cmd), background)
-        if not hit:
-            return 0
-        kind, token = hit
-        token = token.strip()[:60]
-        valve = valve_path(payload)
-        if valve_open(payload):
-            emit_valve(kind, token, valve)
-            return 0
-        emit_deny(kind, token, valve)
-    except Exception:
-        # Fail open on this guard's own bugs -- but announced, never silent.
-        _announce_error("classify", "lifecycle check skipped")
-        return 0
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    hit = classify(str(cmd), background)
+    if not hit:
+        return None
+    kind, token = hit
+    token = token.strip()[:60]
+    return {
+        "decision": "deny",
+        "reason": "%s blocked ('%s'): this is a sub-agent. %s" % (kind, token, LEAF_ESCAPE),
+        "banner": BANNER,
+    }

@@ -177,6 +177,8 @@ Flags:
   --timeout MS        per-action timeout                              [default: 30000 run/shot; 4000 session do]
   --settle MS         post-ready dwell before each shutter — for a project animation/crossfade that
                       completes AFTER load / readySignal. Per capture (per state), not per run  [default: 0]
+  --ready SEL         fused verbs: wait for SEL to be visible before every cell's shutter. With --states,
+                      the manifest's readySignal gates every cell, --urls extras included  [default: none]
   --suppressions F    JSON file of rung-0 suppressions (a bare array, or a state manifest carrying
                       a top-level "suppressions": [{assert, selector, reason}])
   --no-rung0          skip the in-page geometry assertions (on by default; findings are advisory)

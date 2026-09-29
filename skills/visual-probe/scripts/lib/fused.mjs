@@ -30,7 +30,7 @@ import { buildEntries } from './capture.mjs';
 import { makeHelper } from './helpers.mjs';
 import { aggregateRung0 } from './assertions.mjs';
 import { sourcesFromManifest, placeholderSource, renderSheets } from './compose.mjs';
-import { budgetBlock, writeManifestAtomic } from './budget.mjs';
+import { budgetBlock, readBudget, writeManifestAtomic } from './budget.mjs';
 import { MEASURE_PAGE_FN, MEASURE_THRESHOLDS, pixelPair, nextMeasureFile, parseChecks, parseSelectors } from './measure.mjs';
 
 // How many rung-0 rows per check kind the MANIFEST inlines. The complete set always lands in
@@ -173,6 +173,14 @@ async function loadStatesScenario(ctx) {
   return mod;
 }
 
+// The state manifest's readySignal, read here because it gates EVERY cell of a state run: --urls
+// extras are plain captures the scenario never touches, so without it they fire on `load`, before an
+// app that renders after load is ready. An unreadable manifest is the scenario's error to report.
+function statesReadySignal(ctx) {
+  try { return JSON.parse(fs.readFileSync(path.resolve(String(ctx.opts.states)), 'utf8')).readySignal || null; }
+  catch { return null; }
+}
+
 // `--epoch ISO` — the dispatch window this run belongs to (the gate stamps the same value into the
 // leaf's brief). Absent, the run IS its own epoch: process start.
 function parseEpoch(opts, t0) {
@@ -197,7 +205,7 @@ function parseDeadline(opts) {
 // the fused capture → post-process → compose → manifest pipeline
 // ---------------------------------------------------------------------------------------------
 async function fusedRun(ctx, cfg) {
-  const { opts, OUT, EDGE, TIMEOUT, MAGNIFY, THRESHOLD, SETTLE, RUNG0_ON, flagSuppressions, log, timing } = ctx;
+  const { opts, OUT, EDGE, TIMEOUT, MAGNIFY, THRESHOLD, SETTLE, READY, RUNG0_ON, flagSuppressions, log, timing } = ctx;
   const t0 = timing.t0 || Date.now();
   const stage = { import: timing.importMs || 0, launch: 0, capture: 0, flush: 0, compose: 0 };
 
@@ -214,6 +222,8 @@ async function fusedRun(ctx, cfg) {
 
   const scenarioModule = opts.states && opts.states !== true ? await loadStatesScenario(ctx) : null;
   const scenario = scenarioModule ? scenarioModule.default : null;
+  // One readiness gate for every plain cell: --ready wins, else a state run's readySignal.
+  const readySel = READY || (scenarioModule ? statesReadySignal(ctx) : null);
   // A state sweep enumerates its OWN routes out of the manifest, so running it once per --urls
   // target would re-shoot every state under a colliding label. The sweep belongs to the base --url;
   // extra targets are captured as plain cells beside it.
@@ -288,9 +298,19 @@ async function fusedRun(ctx, cfg) {
           page, cell, url: target.url, allowRemote: opts['allow-remote'],
           collector, rung0, settle: SETTLE, viewportOnly: cfg.viewportOnly,
         });
-        if (scenario && target === targets[0]) await scenario(page, h);
-        else {
+        if (scenario && target === targets[0]) {
+          // An explicit --ready also gates the state sweep: each state waits for it right after
+          // navigating, before its drive calls and marker (readySignal is already each state's
+          // default marker, so it needs no wrapper).
+          if (READY) {
+            const go = h.goto;
+            h.goto = async (u) => { const p = await go(u); await page.waitForSelector(READY, { state: 'visible' }); return p; };
+          }
+          await scenario(page, h);
+        } else {
           await page.goto(target.url, { waitUntil: 'load' });
+          // A marker that never shows times out into a capture-error hole, never a pre-ready frame.
+          if (readySel) await page.waitForSelector(readySel, { state: 'visible' });
           await h.dwell();
           await h.snapshot(target.label, {});
         }
@@ -706,7 +726,13 @@ export async function runCrop(ctx) {
   fs.mkdirSync(OUT, { recursive: true });
   const targets = resolveTargets(ctx);
   const cells = parseMatrix(opts.matrix).map(cellObj);
-  const label = `crop-${selector.replace(/[^\w.@-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'sel'}`;
+  // Filenames carry the budget ledger's invocation index (the bootstrap has already counted this
+  // run), so a second crop of the same selector never overwrites the first. Bumped past any prefix
+  // already on disk: the ledger is trimmed to its last 200 entries, so its count can repeat.
+  let n = readBudget(OUT)?.invocations.length || 1;
+  const onDisk = (() => { try { return fs.readdirSync(OUT); } catch { return []; } })();
+  while (onDisk.some((f) => f.startsWith(`crop-${n}-`))) n++;
+  const label = `crop-${n}-${selector.replace(/[^\w.@-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'sel'}`;
 
   const snapshots = [];
   const holes = [];

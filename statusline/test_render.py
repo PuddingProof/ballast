@@ -56,8 +56,6 @@ EXEC_EMOJI = "\U0001F4CB"
 # change has to be a deliberate test edit rather than a silent drift.
 FREEHAND_LABEL = "freehand"
 EXEC_LABEL = "plan-handoff"
-CRITICAL_RGB = (255, 135, 215)
-CRITICAL_EMOJI = "\U0001F9E0"
 
 
 class RenderTestCase(unittest.TestCase):
@@ -283,10 +281,10 @@ class RenderTestCase(unittest.TestCase):
         now = int(time.time())
         self.write_state(sid, [
             "zzz-unknown confirmed %d" % now,
-            "critical-analysis confirmed %d" % now,
+            "exec confirmed %d" % now,
         ])
         line = self.run_render(self.payload(session_id=sid, pct=10)).stdout.rstrip("\n")
-        self.assertLess(line.index("critical-analysis"), line.index("zzz-unknown"))
+        self.assertLess(line.index(EXEC_LABEL), line.index("zzz-unknown"))
 
     def test_shared_label_renders_one_chip(self):
         """Both autonomy keys armed (two keywords, neither cleared) must still render ONE chip --
@@ -317,18 +315,6 @@ class RenderTestCase(unittest.TestCase):
         self.assertIn(solid, line)
         self.assertNotIn("⋯", line)  # no pending form anywhere on the row
         self.assertEqual(line.count(FREEHAND_LABEL), 1)
-
-    def test_critical_analysis_chip(self):
-        """The stance chip. Its mode key doubles as its label, but it is a REGISTERED style --
-        assert the magenta/brain styling rather than the gray `● name` unknown-mode fallback,
-        which is what a missing MODE_STYLES entry would silently produce."""
-        sid = "sess-critical"
-        now = int(time.time())
-        self.write_state(sid, ["critical-analysis confirmed %d" % now])
-        line = self.run_render(self.payload(session_id=sid, pct=10)).stdout.rstrip("\n")
-        expected = CRITICAL_EMOJI + " " + BOLD + fg(CRITICAL_RGB) + "critical-analysis" + RESET
-        self.assertIn(expected, line)
-        self.assertNotIn(fg(UNKNOWN_GRAY), line)
 
     def test_chips_without_baseline_have_no_dangling_separator(self):
         """Degenerate payload -- no project dir AND no context % -- must render the chips alone.

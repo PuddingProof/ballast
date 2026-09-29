@@ -24,6 +24,9 @@
 #      it is absent) a leaf reviews the build its dispatch was meant to replace — a silent false
 #      pass. The budget block splits the same way: `invocations` is the dispatch's own count,
 #      `invocations_total` the out-dir's whole ledger.
+#   6. NO CELL FIRES BEFORE READY. `--ready SEL` (or, with --states, the manifest's readySignal)
+#      gates every cell's shutter, --urls extras included; a pre-ready frame reads as a false
+#      needs_work or blocked.
 #
 # Self-locating: lives in the real skill's scripts/ dir, next to probe.mjs. Parts A and B are pure
 # node (no browser, no node_modules). Part C drives the real capture path and needs
@@ -426,6 +429,38 @@ else
       check "n) blocked exits 1"                                      "$rcN"                    "1"
       check "n) the hole carries the failure reason verbatim"         "$(getN HOLE_REASONED)"   "1"
     fi
+
+    # ---- (o) no cell fires before the app is ready -------------------------------------------
+    # The fixture paints its top half black 1.5s after `load`, and adds the ready marker with it; a
+    # pre-ready frame is uniform white, so its aHash has no 0 bit. The control proves the delay
+    # beats a plain capture, so the two gated rows can't pass vacuously.
+    cat > "$tmp/late.html" <<'EOF'
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>late</title><style>
+  html, body { margin: 0; height: 100%; background: #fff; }
+  #ready { position: fixed; left: 0; top: 0; width: 100%; height: 50%; background: #000; }
+</style></head><body>
+  <script>setTimeout(() => { const d = document.createElement('div'); d.id = 'ready'; document.body.appendChild(d); }, 1500);</script>
+</body></html>
+EOF
+    printf '%s' '{"readySignal":"#ready","routes":{"home":"late.html"}}' > "$tmp/late-states.json"
+    cat > "$tmp/ready-state.mjs" <<'EOF'
+import fs from 'fs';
+const m = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const s = (m.snapshots || []).find((x) => x.label === process.argv[3]);
+console.log(!s ? `missing(${(m.snapshots || []).map((x) => x.label).join('|')})`
+  : s.entries.every((e) => e.aHash && e.aHash.includes('0')) ? 'ready' : 'early');
+EOF
+    readiness() { node "$WINTMP/ready-state.mjs" "$WINTMP/$1/manifest.json" "$2" 2>&1; }
+    node "$WINDIR/probe.mjs" glance --url "file:///$WINTMP/late.html?c=1" --matrix "800x600@1" \
+        --out "$WINTMP/out-early" >/dev/null 2>&1
+    check "o) control: an ungated capture fires before the late marker" "$(readiness out-early late-c-1)" "early"
+    node "$WINDIR/probe.mjs" glance --url "file:///$WINTMP/late.html" --urls "file:///$WINTMP/late.html?extra=1" \
+        --states "$WINTMP/late-states.json" --skip-drive-hooks --matrix "800x600@1" \
+        --out "$WINTMP/out-ready-states" >/dev/null 2>&1
+    check "o) with --states, readySignal gates the --urls extra cell"  "$(readiness out-ready-states late-extra-1)" "ready"
+    node "$WINDIR/probe.mjs" glance --url "file:///$WINTMP/late.html" --ready "#ready" --matrix "800x600@1" \
+        --out "$WINTMP/out-ready-flag" >/dev/null 2>&1; rcO=$?
+    check "o) --ready gates a plain cell, exit 0"                       "$(readiness out-ready-flag late):$rcO" "ready:0"
   fi
 fi
 
