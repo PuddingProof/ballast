@@ -1,6 +1,6 @@
 {
   "name": "ballast",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Verification-first agentic harness: docs discipline, session postmortems, plan-execution handoff, adversarial audits, secure-by-default guards.",
   "author": {
     "name": "PuddingProof"

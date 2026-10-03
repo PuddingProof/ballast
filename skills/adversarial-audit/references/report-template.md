@@ -1,14 +1,14 @@
 # Audit report template — `.claude/adversarial-audit/YYYY-MM-DD-<scope>-audit.md`
 
-Fill top-down; write the BLUF last. Drop any section that didn't happen.
+Opened at step 3 with the Findings table; the rest fills in as it happens, BLUF last. Drop any section that didn't happen.
 
 ```markdown
 # <Project> <scope> audit — YYYY-MM-DD
 
-**Level:** --light · **Scope:** <paths, or base..head> · **Base:** <sha the next audit starts from>
+**Level:** --light · **Scope:** <paths, or base..head> · **Base:** <sha the fixes landed on>
 
 ## BLUF
-<3–6 lines: what was audited, findings raw → merged → confirmed, what shipped, 🎨 items waiting on the user.>
+<3–6 lines: high-altitude impressions and overall feedback on the codebase, what was audited, and what shipped.>
 
 ## Findings
 | ID | Sev | Check | Finding | Anchor | Disposition |
@@ -23,8 +23,13 @@ Severity 🔴 critical · 🟠 high · 🟡 medium · ⚪ nit. Check ✅ confirm
 | ID | Why |
 <Every 🚫 with its reason. Future audits treat these as settled.>
 
+## Commits
+| Checkpoint | Commit | Scope | Gate |
+|---|---|---|---|
+| A — <area> | c1a2b3 | <paths> | <tests · review> |
+
 ## Method
-<Lenses and leaf types · verifier count and kill rate · diff-review result on the fixes · commits.>
+<Lenses and leaf types · verifier count and kill rate · diff-review result on the fixes.>
 ```
 
-IDEAS.md stub for a 📥 item: `- [ ] **Title** — rationale. Seed: [report](.claude/adversarial-audit/YYYY-MM-DD-<scope>-audit.md) F##`
+If BACKLOG.md, IDEAS.md, or similar files exist, follow project conventions to add stubs for 📥 items.

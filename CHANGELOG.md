@@ -4,6 +4,11 @@ Consumer-visible changes to the ballast plugin. Changes land under **[Unreleased
 
 ## [Unreleased]
 
+## [2.0.1] — 2026-10-03
+
+- adversarial-audit: default fix scope ships 🔴/🟠 and local 🟡/⚪, with `--fix-all` for every survivor; the report opens as a live tracker at step 3; fix briefs carry a regression test per finding; Fable leaves allowed where the reasoning step is named; Commits table back in the report template
+- adversarial-audit: default scope is the whole project (no longer the diff since the last audit's `Base:`); the Ground step surveys the codebase and states baseline-quality impressions before the lens fan-out
+
 ## [2.0.0] — 2026-09-29
 
 - Added `lean-spec`: guidance for writing lean specs for agentic work: intent, key requirements, and constraints, with no implementation plan; durable-docs now covers only living specs
